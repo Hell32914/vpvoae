@@ -40,10 +40,7 @@ async def main():
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-extensions',
-                    '--single-process'
+                    '--disable-extensions'
                 ]
             )
             
