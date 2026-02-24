@@ -40,7 +40,10 @@ async def main():
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
-                    '--disable-extensions'
+                    '--disable-extensions',
+                    '--use-gl=swiftshader',
+                    '--enable-features=UseOzonePlatform',
+                    '--ozone-platform=x11'
                 ]
             )
             
