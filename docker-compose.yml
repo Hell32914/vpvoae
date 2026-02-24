@@ -14,37 +14,23 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - ./output:/app/output
+      - ./entrypoint.sh:/entrypoint.sh:ro
     cpu_shares: 1024
     mem_limit: 2G
     memswap_limit: 3G
-    # Логирование - не заполняет диск
     logging:
       driver: "json-file"
       options:
         max-size: "100m"
         max-file: "3"
-    # Если нужно взаимодействие с другими контейнерами
     networks:
       - shared-network
-    # Стартовая задержка для стабильности
     healthcheck:
       test: ["CMD", "test", "-d", "/app/output"]
       interval: 30s
       timeout: 10s
       retries: 3
-    # Команда запуска: сначала Xvfb, затем приложение
-    entrypoint: |
-      bash -c "
-        echo 'Starting Xvfb on :99...'
-        Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
-        XVF_PID=\$!
-        echo 'Waiting for Xvfb to start...'
-        sleep 2
-        echo 'Starting application...'
-        python /app/main.py
-        echo 'Application finished'
-        kill \$XVF_PID 2>/dev/null || true
-      "
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
 
 networks:
   shared-network:
