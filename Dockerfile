@@ -1,10 +1,9 @@
 # Официальный образ Playwright с нужными системными зависимостями
 FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
 
-# Устанавливаем Xvfb и все необходимые для WebGL зависимости
+# Устанавливаем зависимости для WebGL (xvfb-run входит в xvfb)
 RUN apt-get update && apt-get install -y \
     xvfb \
-    xvfb-run \
     libglib2.0-0 \
     libglvnd0 \
     libglvnd-dev \
@@ -23,6 +22,15 @@ WORKDIR /app
 
 # Копируем код скрипта
 COPY main.py .
+
+# Устанавливаем Python-библиотеку
+RUN pip install --no-cache-dir playwright
+
+# Создаем директорию для результатов
+RUN mkdir -p /app/output
+
+# Команда запуска - используем уже запущенный Xvfb на хосте через DISPLAY переменную
+CMD ["python", "main.py"]
 
 # Устанавливаем Python-библиотеку
 RUN pip install --no-cache-dir playwright
