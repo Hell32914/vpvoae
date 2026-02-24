@@ -5,15 +5,15 @@ echo "=========================================="
 echo "🚀 VPVoAe Renderer Entrypoint"
 echo "=========================================="
 
-# Запуск Xvfb в фоне
-echo "🖥️  Starting Xvfb on :99..."
-Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+# Запуск Xvfb в фоне с поддержкой GLX
+echo "🖥️  Starting Xvfb on :99 with GLX support..."
+Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset -dpi 96 > /tmp/xvfb.log 2>&1 &
 XVF_PID=$!
 echo "   Xvfb PID: $XVF_PID"
 
 # Ждем пока Xvfb запустится
 echo "⏳ Waiting for Xvfb to initialize..."
-sleep 3
+sleep 4
 
 # Проверяем что Xvfb работает
 if ! kill -0 $XVF_PID 2>/dev/null; then
@@ -22,7 +22,7 @@ if ! kill -0 $XVF_PID 2>/dev/null; then
     exit 1
 fi
 
-echo "✅ Xvfb is running"
+echo "✅ Xvfb is running on :99"
 
 # Запуск основного приложения
 echo ""
