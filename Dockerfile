@@ -4,6 +4,7 @@ FROM mcr.microsoft.com/playwright/python:v1.41.0-jammy
 # Устанавливаем зависимости для WebGL (xvfb-run входит в xvfb)
 RUN apt-get update && apt-get install -y \
     xvfb \
+    bash \
     libglib2.0-0 \
     libglvnd0 \
     libglvnd-dev \
@@ -29,7 +30,7 @@ RUN pip install --no-cache-dir playwright
 # Создаем директорию для результатов
 RUN mkdir -p /app/output
 
-# Команда запуска - используем уже запущенный Xvfb на хосте через DISPLAY переменную
+# Команда запуска переопределяется в docker-compose.yml
 CMD ["python", "main.py"]
 
 # Устанавливаем Python-библиотеку

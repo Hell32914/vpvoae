@@ -8,13 +8,12 @@ services:
     container_name: vpvoae-renderer
     restart: on-failure:3
     environment:
-      DISPLAY: :100
-      XVFB_DISPLAY: :100
+      DISPLAY: :99
+      XVFB_DISPLAY: :99
       XVFB_SCREEN: '0 1920x1080x24'
       LOG_LEVEL: INFO
     volumes:
       - ./output:/app/output
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     cpu_shares: 1024
     mem_limit: 2G
     memswap_limit: 3G
@@ -33,10 +32,20 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # Команда запуска: сначала Xvfb, затем приложение
+    entrypoint: |
+      bash -c "
+        echo 'Starting Xvfb on :99...'
+        Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+        XVF_PID=\$!
+        echo 'Waiting for Xvfb to start...'
+        sleep 2
+        echo 'Starting application...'
+        python /app/main.py
+        echo 'Application finished'
+        kill \$XVF_PID 2>/dev/null || true
+      "
 
 networks:
   shared-network:
     driver: bridge
-    # Опционально - подключиться к существующей сети if needed
-    # external: true
-    # name: existing_network_name
