@@ -41,9 +41,7 @@ async def main():
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
                     '--disable-extensions',
-                    '--use-gl=swiftshader',
-                    '--enable-features=UseOzonePlatform',
-                    '--ozone-platform=x11'
+                    '--disable-web-resources'
                 ]
             )
             
@@ -73,14 +71,14 @@ async def main():
             # Создаем директорию для результатов
             os.makedirs(output_path, exist_ok=True)
             
-            # Сохраняем полноразмерный скриншот с временной меткой
+            # Сохраняем скриншот с временной меткой (без full_page для совместимости с Xvfb)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(output_path, f"screenshot_{timestamp}.png")
-            await page.screenshot(path=screenshot_path, full_page=True)
+            await page.screenshot(path=screenshot_path, full_page=False, omit_background=False)
             
             # Также сохраняем последний скриншот для быстрого доступа
             latest_path = os.path.join(output_path, "screenshot_latest.png")
-            await page.screenshot(path=latest_path, full_page=True)
+            await page.screenshot(path=latest_path, full_page=False, omit_background=False)
 
             await context.close()
             
