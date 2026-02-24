@@ -1,7 +1,7 @@
-# Официальный образ Playwright с нужными системными зависимостями
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# Используем более новый образ Playwright compatible со всеми зависимостями
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
-# Устанавливаем зависимости для WebGL (xvfb-run входит в xvfb)
+# Устанавливаем зависимости для WebGL
 RUN apt-get update && apt-get install -y \
     xvfb \
     bash \
@@ -21,17 +21,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Копируем код скрипта
+# Копируем требуемые файлы
+COPY requirements.txt .
 COPY main.py .
 
-# Копируем requirements
-COPY requirements.txt .
-
-# Устанавливаем Python-библиотеку
+# Устанавливаем зависимости из requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Устанавливаем browser binaries
-RUN playwright install chromium
 
 # Создаем директорию для результатов
 RUN mkdir -p /app/output
