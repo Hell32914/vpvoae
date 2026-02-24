@@ -33,9 +33,9 @@ async def main():
         logger.info(f"Display: {os.getenv('DISPLAY', 'не установлена')}")
         
         async with async_playwright() as p:
-            logger.info("🌐 Запуск браузера в headless режиме...")
+            logger.info("🌐 Запуск браузера на виртуальном дисплее...")
             browser = await p.chromium.launch(
-                headless=True,
+                headless=False,
                 args=[
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
