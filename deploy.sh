@@ -24,12 +24,19 @@ cd "$DEPLOY_DIR"
 # 3. Клонирование репозитория (если еще не клонирован)
 if [ ! -d ".git" ]; then
    echo "📥 Клонирование репозитория..."
-   git clone --branch "$BRANCH" "$PROJECT_URL" .
+   git clone --branch "$BRANCH" "$PROJECT_URL" . 2>/dev/null || {
+      echo "⚠️  Не удалось клонировать (возможно уже в проекте). Пропускаем..."
+   }
 else
    echo "📤 Обновление репозитория..."
    git fetch origin
    git checkout "$BRANCH"
    git pull origin "$BRANCH"
+fi
+
+# Если в .git нет - значит мы уже в проекте, не нужно гит операции
+if [ ! -d ".git" ]; then
+   echo "✅ Используем существующие файлы проекта"
 fi
 
 # 4. Создание .env файла
