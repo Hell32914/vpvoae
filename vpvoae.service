@@ -1,0 +1,38 @@
+[Unit]
+Description=VPVoAe Web Renderer - Playwright-based headless browser
+Documentation=file:///srv/projects/vpvoae/DEPLOYMENT.md
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/vpvoae
+User=root
+Group=root
+
+# Главная команда
+ExecStart=/usr/bin/docker-compose up
+
+# Команда остановки
+ExecStop=/usr/bin/docker-compose down
+
+# Автоматический перезапуск
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=60s
+StartLimitBurst=3
+
+# Лимиты ресурсов
+TasksMax=infinity
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vpvoae
+
+# Environment variables
+EnvironmentFile=/srv/projects/vpvoae/.env.production
+
+[Install]
+WantedBy=multi-user.target
