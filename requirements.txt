@@ -1,2 +1,1 @@
-playwright==1.41.0
-# Note: Version должна совпадать с версией в Dockerfile
+playwright>=1.41.0,<1.42.0
