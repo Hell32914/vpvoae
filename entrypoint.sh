@@ -24,7 +24,7 @@ fi
 
 echo "✅ Xvfb is running on :99"
 
-# Запуск FFmpeg для видеозаписи
+# Запускаем FFmpeg для видеозаписи
 echo ""
 echo "=========================================="
 echo "🎥 Starting FFmpeg video capture"
@@ -34,11 +34,13 @@ OUTPUT_PATH=${OUTPUT_PATH:-/app/output}
 VIDEO_OUTPUT_FILE="${OUTPUT_PATH}/recording_$(date +%Y%m%d_%H%M%S).mp4"
 
 # Запускаем FFmpeg в фоне для захвата видео с виртуального дисплея
-# Используем x11grab источник для захвата Xvfb с высоким качеством
+# Используем crop фильтр чтобы убрать интерфейс браузера сверху
+# crop=width:height:x:y -> crop=1920:980:0:100 (убираем первые 100px сверху для UI браузера)
 ffmpeg -f x11grab \
   -video_size 1920x1080 \
   -framerate 30 \
   -i :99 \
+  -vf "crop=1920:980:0:100" \
   -c:v libx264 \
   -preset veryfast \
   -crf 18 \
@@ -48,6 +50,7 @@ ffmpeg -f x11grab \
 FFMPEG_PID=$!
 echo "   FFmpeg PID: $FFMPEG_PID"
 echo "   Recording to: $VIDEO_OUTPUT_FILE"
+echo "   Area: 1920x980 (обрезаны верхние 100px интерфейса браузера)"
 
 sleep 2
 
