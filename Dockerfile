@@ -1,9 +1,10 @@
 # Используем более новый образ Playwright compatible со всеми зависимостями
 FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
-# Устанавливаем зависимости для WebGL
+# Устанавливаем зависимости для WebGL и видеозаписи
 RUN apt-get update && apt-get install -y \
     xvfb \
+    ffmpeg \
     bash \
     libglib2.0-0 \
     libglvnd0 \
@@ -31,14 +32,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Создаем директорию для результатов
 RUN mkdir -p /app/output
 
-# Команда запуска переопределяется в docker-compose.yml
+# Команда запуска переопределяется в docker-compose.yml через entrypoint.sh
 CMD ["python", "main.py"]
-
-# Устанавливаем Python-библиотеку
-RUN pip install --no-cache-dir playwright
-
-# Создаем директорию для результатов
-RUN mkdir -p /app/output
-
-# Команда запуска: создаем монитор 1920x1080 и внутри него запускаем скрипт
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "python", "main.py"]

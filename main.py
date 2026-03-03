@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    """Главная функция для рендеринга веб-сайта на сервере с Xvfb."""
+    """Главная функция для рендеринга веб-сайта на сервере с Xvfb и FFmpeg видеозаписью."""
     browser = None
     try:
         # Получение конфигурации из переменных окружения
@@ -30,7 +30,8 @@ async def main():
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
         logger.info(f"Viewport: {viewport_width}x{viewport_height}")
-        logger.info(f"Display: {os.getenv('DISPLAY', 'не установлена')}")
+        logger.info(f"Display: {os.getenv('DISPLAY', ':99')}")
+        logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         
         async with async_playwright() as p:
             logger.info("🌐 Запуск браузера на виртуальном дисплее...")
@@ -85,7 +86,8 @@ async def main():
             file_size = os.path.getsize(screenshot_path) / (1024 * 1024)  # MB
             logger.info(f"✅ Скриншот сохранен: {screenshot_path} ({file_size:.2f}MB)")
             logger.info(f"✅ Latest: {latest_path}")
-            logger.info("✨ Серверное ядро готово к использованию")
+            logger.info("✨ Рендеринг завершен успешно")
+            logger.info("📹 FFmpeg продолжает запись (будет остановлен в entrypoint.sh)")
             sys.exit(0)
 
     except Exception as e:
@@ -98,6 +100,7 @@ async def main():
                 logger.info("🛑 Браузер закрыт")
             except Exception as e:
                 logger.warning(f"Ошибка при закрытии браузера: {e}")
+
 
 if __name__ == "__main__":
     logger.info("=" * 60)

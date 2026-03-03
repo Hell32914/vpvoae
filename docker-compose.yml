@@ -9,8 +9,12 @@ services:
     restart: on-failure:3
     environment:
       DISPLAY: :99
-      XVFB_DISPLAY: :99
-      XVFB_SCREEN: '0 1920x1080x24'
+      OUTPUT_PATH: /app/output
+      TARGET_URL: ${TARGET_URL:-https://sleep-well-creatives.com}
+      VIEWPORT_WIDTH: ${VIEWPORT_WIDTH:-1920}
+      VIEWPORT_HEIGHT: ${VIEWPORT_HEIGHT:-1080}
+      RENDER_TIMEOUT: ${RENDER_TIMEOUT:-5000}
+      LOAD_TIMEOUT: ${LOAD_TIMEOUT:-60000}
       LOG_LEVEL: INFO
     volumes:
       - ./output:/app/output
@@ -18,6 +22,7 @@ services:
     cpu_shares: 1024
     mem_limit: 2G
     memswap_limit: 3G
+    shm_size: 2G
     logging:
       driver: "json-file"
       options:
