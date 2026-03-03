@@ -17,7 +17,7 @@ services:
       LOAD_TIMEOUT: ${LOAD_TIMEOUT:-60000}
       LOG_LEVEL: INFO
     volumes:
-      - ./output:/app/output
+      - vpvoae-output:/app/output
     cpu_shares: 1024
     mem_limit: 2G
     memswap_limit: 3G
@@ -39,3 +39,7 @@ services:
 networks:
   shared-network:
     driver: bridge
+
+volumes:
+  vpvoae-output:
+    driver: local
