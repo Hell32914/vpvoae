@@ -25,12 +25,16 @@ WORKDIR /app
 # Копируем требуемые файлы
 COPY requirements.txt .
 COPY main.py .
+COPY entrypoint.sh /entrypoint.sh
 
 # Устанавливаем зависимости из requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Создаем директорию для результатов
 RUN mkdir -p /app/output
+
+# Делаем entrypoint.sh исполняемым
+RUN chmod +x /entrypoint.sh
 
 # Команда запуска переопределяется в docker-compose.yml через entrypoint.sh
 CMD ["python", "main.py"]
