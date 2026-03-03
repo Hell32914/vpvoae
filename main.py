@@ -38,11 +38,13 @@ async def main():
             browser = await p.chromium.launch(
                 headless=False,
                 args=[
+                    '--kiosk',  # Полнооконный режим без интерфейса браузера
                     '--disable-blink-features=AutomationControlled',
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
                     '--disable-extensions',
-                    '--disable-web-resources'
+                    '--disable-web-resources',
+                    '--hide-scrollbars'  # Скрыть scrollbars
                 ]
             )
             
