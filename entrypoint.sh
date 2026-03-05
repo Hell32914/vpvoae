@@ -36,6 +36,13 @@ FFMPEG_FRAMERATE=${FFMPEG_FRAMERATE:-24}
 FFMPEG_PRESET=${FFMPEG_PRESET:-ultrafast}
 FFMPEG_CRF=${FFMPEG_CRF:-23}
 FFMPEG_CROP_TOP=${FFMPEG_CROP_TOP:-0}
+FFMPEG_AUTO_CROP_BROWSER_UI=${FFMPEG_AUTO_CROP_BROWSER_UI:-true}
+
+# На некоторых окружениях X11 браузерные панели остаются видимыми даже в kiosk/fullscreen.
+# Включаем безопасный автокроп верхней полосы, если явный crop не задан.
+if [ "$FFMPEG_CROP_TOP" -eq 0 ] && [ "$FFMPEG_AUTO_CROP_BROWSER_UI" = "true" ]; then
+  FFMPEG_CROP_TOP=96
+fi
 
 FILTER_ARGS=()
 if [ "$FFMPEG_CROP_TOP" -gt 0 ]; then
@@ -67,6 +74,7 @@ if [ "$FFMPEG_CROP_TOP" -gt 0 ]; then
 else
   echo "   Crop top: disabled"
 fi
+echo "   Auto crop browser UI: ${FFMPEG_AUTO_CROP_BROWSER_UI}"
 
 sleep 2
 

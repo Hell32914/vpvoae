@@ -851,6 +851,99 @@ async def force_scroll_to_page_end(
     return False
 
 
+async def collect_top_nav_targets(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+    allow_internal_nav_click: bool,
+    visited_nav_keys: Set[str],
+) -> List[Dict[str, Any]]:
+    """Собирает кандидатов верхней навигации и сортирует слева направо."""
+    targets = await collect_interactive_targets(page, viewport_width, viewport_height, 80)
+    current_url = str(page.url or "")
+
+    candidates = [
+        item for item in targets
+        if is_probable_top_nav_target(item, viewport_height)
+        and nav_signature(item) not in visited_nav_keys
+        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+    ]
+
+    candidates.sort(key=lambda item: (float(item.get("x", 0.0)), -float(item.get("score", 0.0))))
+    return candidates[:12]
+
+
+async def visit_top_navigation_tabs(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+    allow_internal_nav_click: bool,
+    visited_nav_keys: Set[str],
+    max_nav_tabs_to_visit: int,
+    per_tab_scroll_timeout_ms: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+) -> Tuple[Tuple[float, float], int]:
+    """Проходит по вкладкам верхней навигации последовательно, а не случайно."""
+    visited_count = 0
+    if max_nav_tabs_to_visit <= 0:
+        return cursor_pos, visited_count
+
+    for _ in range(max_nav_tabs_to_visit):
+        nav_targets = await collect_top_nav_targets(
+            page,
+            viewport_width,
+            viewport_height,
+            allow_internal_nav_click,
+            visited_nav_keys,
+        )
+
+        if not nav_targets:
+            break
+
+        target = nav_targets[0]
+        tx = float(target.get("x", viewport_width * 0.5))
+        ty = float(target.get("y", viewport_height * 0.12))
+
+        cursor_pos = await move_mouse_human_like(
+            page,
+            cursor_pos,
+            (tx, ty),
+            viewport_width,
+            viewport_height,
+            random.randint(280, 760),
+        )
+        await page.wait_for_timeout(random.randint(60, 180))
+        await page.mouse.click(tx, ty, delay=random.randint(28, 90))
+        await page.wait_for_timeout(random.randint(350, 900))
+
+        signature = nav_signature(target)
+        visited_nav_keys.add(signature)
+        visited_count += 1
+
+        cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
+
+        await force_scroll_to_page_end(
+            page,
+            viewport_height,
+            scroll_speed_factor,
+            scroll_pause_min_ms,
+            scroll_pause_max_ms,
+            per_tab_scroll_timeout_ms,
+        )
+
+        # Возвращаемся к верху, чтобы снова видеть вкладки.
+        try:
+            await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+            await page.wait_for_timeout(random.randint(180, 420))
+        except Exception:
+            pass
+
+    return cursor_pos, visited_count
+
+
 async def perform_forced_activation_clicks(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -977,6 +1070,9 @@ async def run_smart_cursor(
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
     scroll_finish_timeout_ms: int,
+    nav_tabs_visit_enabled: bool,
+    nav_tabs_max_visits: int,
+    nav_tab_scroll_timeout_ms: int,
     inpage_click_enabled: bool,
     inpage_click_probability: float,
     allow_internal_nav_click: bool,
@@ -1015,6 +1111,44 @@ async def run_smart_cursor(
                 clicked_entry_keys.add(clicked_key)
 
     logger.info("🧭 Smart cursor: старт обхода интерактивных элементов")
+
+    # Приоритет 1: гарантированно пройти главную страницу до конца.
+    if scroll_to_end:
+        main_scroll_timeout = max(6000, min(scroll_finish_timeout_ms, int(total_time_ms * 0.32)))
+        reached_main_end = await force_scroll_to_page_end(
+            page,
+            viewport_height,
+            scroll_speed_factor,
+            scroll_pause_min_ms,
+            scroll_pause_max_ms,
+            main_scroll_timeout,
+        )
+        if reached_main_end:
+            logger.info("🧭 Smart cursor: главная страница прокручена до конца")
+
+        try:
+            await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+            await page.wait_for_timeout(random.randint(180, 420))
+        except Exception:
+            pass
+
+    # Приоритет 2: пройти верхние вкладки последовательно (универсально, если они есть).
+    if nav_tabs_visit_enabled and inpage_click_enabled:
+        cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
+            page,
+            cursor_pos,
+            viewport_width,
+            viewport_height,
+            allow_internal_nav_click,
+            clicked_nav_keys,
+            nav_tabs_max_visits,
+            nav_tab_scroll_timeout_ms,
+            scroll_speed_factor,
+            scroll_pause_min_ms,
+            scroll_pause_max_ms,
+        )
+        if visited_nav_count > 0:
+            logger.info(f"🧭 Smart cursor: последовательно пройдено вкладок {visited_nav_count}")
 
     try:
         last_scroll_y = int((await get_scroll_metrics(page)).get("scrollY", 0))
@@ -1071,7 +1205,7 @@ async def run_smart_cursor(
         ]
 
         target: Optional[Dict[str, Any]] = None
-        if not scroll_priority_mode and inpage_click_enabled and top_nav_candidates and round_index <= 14:
+        if not scroll_priority_mode and inpage_click_enabled and top_nav_candidates and round_index <= 10:
             nav_pool = sorted(top_nav_candidates, key=target_sort_score, reverse=True)[: min(10, len(top_nav_candidates))]
             target = random.choice(nav_pool[: min(5, len(nav_pool))])
         elif not scroll_priority_mode and inpage_click_enabled and media_candidates and random.random() < 0.60:
@@ -1260,10 +1394,14 @@ async def main():
         scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '25'))
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
         scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '22000'))
+        nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', True)
+        nav_tabs_max_visits = int(os.getenv('SMART_CURSOR_NAV_TABS_MAX_VISITS', '10'))
+        nav_tab_scroll_timeout_ms = int(os.getenv('SMART_CURSOR_NAV_TAB_SCROLL_TIMEOUT_MS', '17000'))
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', True)
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
+        browser_app_mode = env_bool('BROWSER_APP_MODE', True)
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
@@ -1274,6 +1412,8 @@ async def main():
         scroll_pause_min_ms = max(10, min(scroll_pause_min_ms, 400))
         scroll_pause_max_ms = max(scroll_pause_min_ms + 5, min(scroll_pause_max_ms, 800))
         scroll_finish_timeout_ms = max(0, min(scroll_finish_timeout_ms, 90000))
+        nav_tabs_max_visits = max(0, min(nav_tabs_max_visits, 18))
+        nav_tab_scroll_timeout_ms = max(1500, min(nav_tab_scroll_timeout_ms, 60000))
         inpage_click_probability = clamp(inpage_click_probability, 0.0, 1.0)
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
@@ -1283,23 +1423,30 @@ async def main():
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
+        logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
         
         async with async_playwright() as p:
             logger.info("🌐 Запуск браузера на виртуальном дисплее...")
+            browser_args = [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-extensions',
+                '--disable-web-resources',
+                '--kiosk',
+                '--start-fullscreen',
+                '--start-maximized',
+                '--window-position=0,0',
+                f'--window-size={viewport_width},{viewport_height}',
+                '--hide-crash-restore-bubble',
+                '--disable-infobars',
+            ]
+            if browser_app_mode:
+                browser_args.append('--app=data:,')
+
             browser = await p.chromium.launch(
                 headless=False,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--disable-extensions',
-                    '--disable-web-resources',
-                    '--kiosk',
-                    '--start-fullscreen',
-                    '--start-maximized',
-                    '--hide-crash-restore-bubble',
-                    '--disable-infobars'
-                ]
+                args=browser_args,
             )
             
             context = await browser.new_context(
@@ -1353,6 +1500,9 @@ async def main():
                     scroll_pause_min_ms=scroll_pause_min_ms,
                     scroll_pause_max_ms=scroll_pause_max_ms,
                     scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                    nav_tabs_visit_enabled=nav_tabs_visit_enabled,
+                    nav_tabs_max_visits=nav_tabs_max_visits,
+                    nav_tab_scroll_timeout_ms=nav_tab_scroll_timeout_ms,
                     inpage_click_enabled=inpage_click_enabled,
                     inpage_click_probability=inpage_click_probability,
                     allow_internal_nav_click=allow_internal_nav_click,
