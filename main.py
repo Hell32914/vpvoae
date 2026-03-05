@@ -494,7 +494,22 @@ def is_navigation_like_href(href: str, current_url: str) -> bool:
     return (resolved_parts.path != current_parts.path) or (resolved_parts.query != current_parts.query)
 
 
-def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str) -> bool:
+def is_external_href(href: str, current_url: str) -> bool:
+    clean = href.strip().lower()
+    if not clean or clean.startswith("#") or clean.startswith("javascript:"):
+        return False
+
+    resolved = urljoin(current_url, href)
+    current_parts = urlparse(current_url)
+    resolved_parts = urlparse(resolved)
+
+    if resolved_parts.scheme not in {"http", "https"}:
+        return False
+
+    return resolved_parts.netloc != current_parts.netloc
+
+
+def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_internal_nav_click: bool) -> bool:
     """Разрешаем клик только по элементам, которые не уводят на другую страницу."""
     text = str(target.get("text", "")).strip().lower()
     href = str(target.get("href", "")).strip().lower()
@@ -510,7 +525,10 @@ def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str) -> boo
     if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
         return False
 
-    if href and is_navigation_like_href(href, current_url):
+    if href and is_external_href(href, current_url):
+        return False
+
+    if href and is_navigation_like_href(href, current_url) and not allow_internal_nav_click:
         return False
 
     width = float(target.get("width", 0.0))
@@ -650,19 +668,18 @@ async def run_smart_cursor(
     scroll_pause_max_ms: int,
     inpage_click_enabled: bool,
     inpage_click_probability: float,
+    allow_internal_nav_click: bool,
 ) -> int:
-    """Автоматически обходит интерактивные блоки, вызывая hover-эффекты без ручной разметки."""
+    """Скроллит страницу до конца, параллельно ховерит и кликает безопасные in-page интерактивы."""
     start_time = time.monotonic()
     visited_keys: Set[str] = set()
     clicked_entry_keys: Set[str] = set()
     clicked_inpage_keys: Set[str] = set()
     hovered_count = 0
-    empty_rounds = 0
-    no_targets_logged = False
+    round_index = 0
+    bottom_stable_rounds = 0
     last_scroll_y = -1
     stagnant_scroll_rounds = 0
-    bottom_stable_rounds = 0
-    round_index = 0
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -671,8 +688,6 @@ async def run_smart_cursor(
     await page.mouse.move(cursor_pos[0], cursor_pos[1])
 
     if entry_click_enabled:
-        before_snapshot = await get_page_activity_snapshot(page)
-        activation_changed = False
         for _ in range(max(entry_click_attempts, 0)):
             cursor_pos, clicked, clicked_key = await try_click_entry_element(
                 page=page,
@@ -683,26 +698,8 @@ async def run_smart_cursor(
             )
             if not clicked:
                 break
-
             if clicked_key:
                 clicked_entry_keys.add(clicked_key)
-
-            after_snapshot = await get_page_activity_snapshot(page)
-            changed = page_state_changed(before_snapshot, after_snapshot)
-            before_snapshot = after_snapshot
-            if changed:
-                logger.info("🖱️ Smart cursor: страница изменилась после активационного клика")
-                activation_changed = True
-                break
-
-        if not activation_changed:
-            logger.info("🖱️ Smart cursor: запускаем fallback-активацию страницы")
-            cursor_pos, _ = await perform_forced_activation_clicks(
-                page=page,
-                cursor_pos=cursor_pos,
-                viewport_width=viewport_width,
-                viewport_height=viewport_height,
-            )
 
     logger.info("🧭 Smart cursor: старт обхода интерактивных элементов")
 
@@ -710,6 +707,8 @@ async def run_smart_cursor(
         last_scroll_y = int((await get_scroll_metrics(page)).get("scrollY", 0))
     except Exception:
         last_scroll_y = -1
+
+    nav_keywords = ("list", "grid", "stills", "motion", "culture", "information", "journal")
 
     while (time.monotonic() - start_time) * 1000 < total_time_ms:
         round_index += 1
@@ -725,37 +724,91 @@ async def run_smart_cursor(
             if clicked and clicked_key:
                 clicked_entry_keys.add(clicked_key)
 
-        targets = await collect_interactive_targets(page, viewport_width, viewport_height, max_targets)
-        candidates = [item for item in targets if item["key"] not in visited_keys]
-        can_hover = max_targets > 0 and hovered_count < max_targets
+        scan_limit = max(40, max_targets if max_targets > 0 else 40)
+        targets = await collect_interactive_targets(page, viewport_width, viewport_height, scan_limit)
+        candidates = [item for item in targets if str(item.get("key", "")) not in visited_keys]
 
-        if not candidates or not can_hover:
-            empty_rounds += 1
+        current_url = str(page.url or "")
+        safe_click_candidates = [
+            item for item in candidates
+            if is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+        ]
 
-            if empty_rounds > 1:
-                drift_x = clamp(viewport_width * random.uniform(0.2, 0.8), 1, viewport_width - 1)
-                drift_y = clamp(viewport_height * random.uniform(0.25, 0.75), 1, viewport_height - 1)
-                cursor_pos = await move_mouse_human_like(
-                    page,
-                    cursor_pos,
-                    (drift_x, drift_y),
-                    viewport_width,
-                    viewport_height,
-                    random.randint(250, 760),
-                )
+        top_nav_candidates = [
+            item for item in safe_click_candidates
+            if float(item.get("y", viewport_height)) <= viewport_height * 0.20
+            and has_keyword(str(item.get("text", "")), nav_keywords)
+        ]
+        media_candidates = [
+            item for item in safe_click_candidates
+            if float(item.get("width", 0.0)) * float(item.get("height", 0.0)) >= 35000
+            and float(item.get("y", viewport_height)) > viewport_height * 0.12
+        ]
 
-            if empty_rounds > 2 and not no_targets_logged:
-                logger.info("🧭 Smart cursor: интерактивные узлы редкие, приоритет на скролл до конца")
-                no_targets_logged = True
+        target: Optional[Dict[str, Any]] = None
+        if inpage_click_enabled and top_nav_candidates and round_index <= 10:
+            target = random.choice(top_nav_candidates[: min(6, len(top_nav_candidates))])
+        elif inpage_click_enabled and media_candidates and random.random() < 0.60:
+            target = random.choice(media_candidates[: min(5, len(media_candidates))])
+        elif candidates and (max_targets <= 0 or hovered_count < max_targets):
+            top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
+            target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
 
+        if target is not None:
+            tx = float(target["x"])
+            ty = float(target["y"])
+            cursor_pos = await move_mouse_human_like(
+                page,
+                cursor_pos,
+                (tx, ty),
+                viewport_width,
+                viewport_height,
+                random.randint(260, 860),
+            )
+            await page.wait_for_timeout(random.randint(40, 120))
+
+            target_key = str(target.get("key", ""))
+            should_click = (
+                inpage_click_enabled
+                and target_key not in clicked_inpage_keys
+                and is_safe_inpage_click_target(target, current_url, allow_internal_nav_click)
+            )
+
+            click_probability = inpage_click_probability
+            if has_keyword(str(target.get("text", "")), nav_keywords):
+                click_probability = max(click_probability, 0.88)
+            if float(target.get("width", 0.0)) * float(target.get("height", 0.0)) >= 35000:
+                click_probability = max(click_probability, 0.70)
+
+            if should_click and random.random() < click_probability:
+                before_url = str(page.url or "")
+                await page.mouse.click(tx, ty, delay=random.randint(35, 110))
+                await page.wait_for_timeout(random.randint(120, 300))
+                clicked_inpage_keys.add(target_key)
+
+                after_url = str(page.url or "")
+                if (
+                    after_url != before_url
+                    and is_navigation_like_href(after_url, before_url)
+                    and not allow_internal_nav_click
+                ):
+                    logger.info("🖱️ Smart cursor: обнаружен переход, откатываемся назад")
+                    try:
+                        await page.go_back(wait_until="domcontentloaded", timeout=3000)
+                        await page.wait_for_timeout(random.randint(250, 550))
+                    except Exception:
+                        pass
+                elif after_url != before_url and allow_internal_nav_click:
+                    logger.info("🖱️ Smart cursor: выполнен внутренний переход по интерактиву")
+
+            hovered_count += 1
+            visited_keys.add(target_key)
+
+        if scroll_to_end:
             scroll_delta = int(viewport_height * random.uniform(0.60, 0.98) * scroll_speed_factor)
             await page.mouse.wheel(0, scroll_delta)
-            await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
-
             await page.evaluate(
-                """(delta) => {
-                    window.scrollBy({ top: delta, left: 0, behavior: 'auto' });
-                }""",
+                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
                 scroll_delta,
             )
             await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
@@ -773,19 +826,10 @@ async def run_smart_cursor(
             else:
                 stagnant_scroll_rounds = 0
 
-            if stagnant_scroll_rounds >= 1:
-                await page.evaluate(
-                    """(delta) => {
-                        window.scrollBy({ top: delta, left: 0, behavior: 'smooth' });
-                    }""",
-                    scroll_delta,
-                )
-                await page.wait_for_timeout(random.randint(max(20, scroll_pause_min_ms), max(40, scroll_pause_max_ms + 120)))
-
             if stagnant_scroll_rounds >= 2:
                 try:
                     await page.keyboard.press("PageDown")
-                    await page.wait_for_timeout(random.randint(max(20, scroll_pause_min_ms), max(40, scroll_pause_max_ms + 80)))
+                    await page.wait_for_timeout(random.randint(max(20, scroll_pause_min_ms), max(40, scroll_pause_max_ms + 60)))
                 except Exception:
                     pass
 
@@ -795,114 +839,9 @@ async def run_smart_cursor(
             else:
                 bottom_stable_rounds = 0
 
-            if scroll_to_end and bottom_stable_rounds >= bottom_stable_rounds_required:
+            if bottom_stable_rounds >= bottom_stable_rounds_required and round_index >= 8:
                 logger.info("🧭 Smart cursor: достигнут конец страницы")
                 break
-
-            continue
-
-        empty_rounds = 0
-        current_url = str(page.url or "")
-        safe_click_candidates = [
-            item for item in candidates
-            if is_safe_inpage_click_target(item, current_url)
-        ]
-
-        top_nav_candidates = [
-            item for item in safe_click_candidates
-            if float(item.get("y", viewport_height)) <= viewport_height * 0.20
-        ]
-
-        if inpage_click_enabled and top_nav_candidates and random.random() < 0.70:
-            # Верхняя навигация часто раскрывает in-page контент и не должна игнорироваться.
-            target = random.choice(top_nav_candidates[: min(6, len(top_nav_candidates))])
-        else:
-            top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
-            target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
-
-        tx = float(target["x"])
-        ty = float(target["y"])
-
-        travel_ms = random.randint(360, 1200)
-        cursor_pos = await move_mouse_human_like(
-            page,
-            cursor_pos,
-            (tx, ty),
-            viewport_width,
-            viewport_height,
-            travel_ms,
-        )
-
-        # Микрокоррекции над элементом, чтобы ховер выглядел естественно.
-        for _ in range(random.randint(1, 3)):
-            jitter_x = clamp(tx + random.uniform(-4, 4), 1, viewport_width - 1)
-            jitter_y = clamp(ty + random.uniform(-3, 3), 1, viewport_height - 1)
-            await page.mouse.move(jitter_x, jitter_y)
-            await page.wait_for_timeout(random.randint(30, 100))
-            cursor_pos = (jitter_x, jitter_y)
-
-        dwell_ms = random.randint(hover_min_ms, hover_max_ms)
-        await page.wait_for_timeout(dwell_ms)
-
-        if inpage_click_enabled:
-            target_key = str(target.get("key", ""))
-            can_click_target = (
-                target_key not in clicked_inpage_keys
-                and is_safe_inpage_click_target(target, current_url)
-            )
-
-            if can_click_target:
-                click_probability = inpage_click_probability
-                if float(target.get("y", viewport_height)) <= viewport_height * 0.22:
-                    click_probability = max(click_probability, 0.75)
-
-                if random.random() < click_probability:
-                    before_url = str(page.url or "")
-                    await page.mouse.click(tx, ty, delay=random.randint(35, 120))
-                    await page.wait_for_timeout(random.randint(120, 300))
-                    clicked_inpage_keys.add(target_key)
-
-                    after_url = str(page.url or "")
-                    if after_url != before_url and is_navigation_like_href(after_url, before_url):
-                        logger.info("🖱️ Smart cursor: обнаружен переход, откатываемся назад")
-                        try:
-                            await page.go_back(wait_until="domcontentloaded", timeout=3000)
-                            await page.wait_for_timeout(random.randint(250, 550))
-                        except Exception:
-                            pass
-
-        hovered_count += 1
-        visited_keys.add(target["key"])
-
-        if random.random() < 0.28:
-            await page.mouse.wheel(0, random.randint(80, 260))
-            await page.wait_for_timeout(random.randint(90, 220))
-
-        if scroll_to_end:
-            # Даже при найденных элементах продолжаем уверенный спуск до конца страницы.
-            step_delta = int(viewport_height * random.uniform(0.35, 0.62) * scroll_speed_factor)
-            await page.mouse.wheel(0, step_delta)
-            await page.evaluate(
-                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
-                step_delta,
-            )
-            await page.wait_for_timeout(random.randint(max(15, scroll_pause_min_ms - 15), max(35, scroll_pause_max_ms - 10)))
-
-        try:
-            metrics = await get_scroll_metrics(page)
-            current_scroll_y = int(metrics.get("scrollY", last_scroll_y))
-            at_bottom = bool(metrics.get("atBottom", False))
-            last_scroll_y = max(last_scroll_y, current_scroll_y)
-            if at_bottom:
-                bottom_stable_rounds += 1
-            else:
-                bottom_stable_rounds = 0
-        except Exception:
-            pass
-
-        if scroll_to_end and bottom_stable_rounds >= bottom_stable_rounds_required:
-            logger.info("🧭 Smart cursor: достигнут конец страницы")
-            break
 
     logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
     return hovered_count
@@ -933,6 +872,7 @@ async def main():
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
+        allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', True)
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
@@ -1007,6 +947,7 @@ async def main():
                     scroll_pause_max_ms=scroll_pause_max_ms,
                     inpage_click_enabled=inpage_click_enabled,
                     inpage_click_probability=inpage_click_probability,
+                    allow_internal_nav_click=allow_internal_nav_click,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
