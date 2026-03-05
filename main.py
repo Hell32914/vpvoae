@@ -662,6 +662,19 @@ def target_sort_score(target: Dict[str, Any]) -> float:
     return float(target.get("score", 0.0))
 
 
+def nav_family_key(target: Dict[str, Any]) -> str:
+    """Грубый ключ для дедупликации одинаковых пунктов в шапке/меню."""
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+    x = int(float(target.get("x", 0.0)))
+
+    text_token = text[:24]
+    href_token = href.split("?")[0][:36]
+    x_bucket = int(x / 120)
+    return f"{tag}|{text_token}|{href_token}|{x_bucket}"
+
+
 async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
     """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
     return await page.evaluate(
@@ -869,8 +882,26 @@ async def collect_top_nav_targets(
         and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
     ]
 
-    candidates.sort(key=lambda item: (float(item.get("x", 0.0)), -float(item.get("score", 0.0))))
-    return candidates[:12]
+    if not candidates:
+        return []
+
+    # Оставляем наиболее вероятный "ряд" навигации в верхней части страницы.
+    row_anchor_y = min(float(item.get("y", viewport_height * 0.2)) for item in candidates)
+    row_candidates = [
+        item for item in candidates
+        if float(item.get("y", viewport_height * 0.2)) <= row_anchor_y + 68
+    ]
+
+    unique: Dict[str, Dict[str, Any]] = {}
+    for item in row_candidates:
+        family = nav_family_key(item)
+        prev = unique.get(family)
+        if prev is None or target_sort_score(item) > target_sort_score(prev):
+            unique[family] = item
+
+    ordered = list(unique.values())
+    ordered.sort(key=lambda item: (float(item.get("x", 0.0)), float(item.get("y", 0.0)), -target_sort_score(item)))
+    return ordered[:14]
 
 
 async def visit_top_navigation_tabs(
@@ -904,6 +935,9 @@ async def visit_top_navigation_tabs(
             break
 
         target = nav_targets[0]
+
+        before_tab = await get_page_activity_snapshot(page)
+
         tx = float(target.get("x", viewport_width * 0.5))
         ty = float(target.get("y", viewport_height * 0.12))
 
@@ -919,20 +953,37 @@ async def visit_top_navigation_tabs(
         await page.mouse.click(tx, ty, delay=random.randint(28, 90))
         await page.wait_for_timeout(random.randint(350, 900))
 
+        after_tab = await get_page_activity_snapshot(page)
+        changed = page_state_changed(before_tab, after_tab)
+
+        if not changed:
+            # Повторная попытка с легким смещением на случай мелких hitbox/overlay.
+            retry_x = clamp(tx + random.uniform(-8, 8), 1, viewport_width - 1)
+            retry_y = clamp(ty + random.uniform(-6, 6), 1, viewport_height - 1)
+            await page.mouse.click(retry_x, retry_y, delay=random.randint(24, 80))
+            await page.wait_for_timeout(random.randint(260, 640))
+            after_retry = await get_page_activity_snapshot(page)
+            changed = page_state_changed(before_tab, after_retry)
+
         signature = nav_signature(target)
         visited_nav_keys.add(signature)
-        visited_count += 1
+        if changed:
+            visited_count += 1
+            logger.info(f"🧭 Smart cursor: открыта вкладка '{str(target.get('text', '')).strip()[:32]}'")
+        else:
+            logger.info(f"🧭 Smart cursor: пропуск неактивной вкладки '{str(target.get('text', '')).strip()[:32]}'")
 
         cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
 
-        await force_scroll_to_page_end(
-            page,
-            viewport_height,
-            scroll_speed_factor,
-            scroll_pause_min_ms,
-            scroll_pause_max_ms,
-            per_tab_scroll_timeout_ms,
-        )
+        if changed:
+            await force_scroll_to_page_end(
+                page,
+                viewport_height,
+                scroll_speed_factor,
+                scroll_pause_min_ms,
+                scroll_pause_max_ms,
+                per_tab_scroll_timeout_ms,
+            )
 
         # Возвращаемся к верху, чтобы снова видеть вкладки.
         try:
@@ -1023,13 +1074,25 @@ async def move_mouse_human_like(
     base_steps = int(clamp(distance / 26, 8, 36))
     steps = int(clamp(base_steps + random.randint(-1, 4), 8, 42))
 
+    dx = end_x - start_x
+    dy = end_y - start_y
+    length = max(distance, 1.0)
+    ux = dx / length
+    uy = dy / length
+    # Перпендикуляр к направлению движения для мягкого изгиба.
+    px = -uy
+    py = ux
+
+    lateral_amp = clamp(distance * 0.16, 8.0, 58.0)
+    forward_jitter = clamp(distance * 0.10, 6.0, 42.0)
+
     cp1 = (
-        start_x + (end_x - start_x) * random.uniform(0.2, 0.45) + random.uniform(-120, 120),
-        start_y + (end_y - start_y) * random.uniform(0.1, 0.4) + random.uniform(-90, 90),
+        start_x + dx * random.uniform(0.24, 0.42) + px * random.uniform(-lateral_amp, lateral_amp) + ux * random.uniform(-forward_jitter, forward_jitter),
+        start_y + dy * random.uniform(0.24, 0.42) + py * random.uniform(-lateral_amp, lateral_amp) + uy * random.uniform(-forward_jitter, forward_jitter),
     )
     cp2 = (
-        start_x + (end_x - start_x) * random.uniform(0.55, 0.85) + random.uniform(-120, 120),
-        start_y + (end_y - start_y) * random.uniform(0.55, 0.9) + random.uniform(-90, 90),
+        start_x + dx * random.uniform(0.58, 0.86) + px * random.uniform(-lateral_amp, lateral_amp) + ux * random.uniform(-forward_jitter, forward_jitter),
+        start_y + dy * random.uniform(0.58, 0.86) + py * random.uniform(-lateral_amp, lateral_amp) + uy * random.uniform(-forward_jitter, forward_jitter),
     )
 
     for i in range(1, steps + 1):
@@ -1040,7 +1103,7 @@ async def move_mouse_human_like(
         y = cubic_bezier(eased_t, start_y, cp1[1], cp2[1], end_y)
 
         # Шум уменьшается ближе к целевой точке, чтобы курсор "попадал" точно.
-        noise_scale = (1 - eased_t) * 2.2
+        noise_scale = (1 - eased_t) * 1.5
         x += random.uniform(-noise_scale, noise_scale)
         y += random.uniform(-noise_scale, noise_scale)
 
