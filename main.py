@@ -615,6 +615,180 @@ def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_
     return score >= 55
 
 
+def is_probable_top_nav_target(target: Dict[str, Any], viewport_height: int) -> bool:
+    """Универсально определяет элементы верхней навигации (вкладки/пункты меню)."""
+    y = float(target.get("y", viewport_height))
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+
+    if y > viewport_height * 0.24:
+        return False
+
+    if width < 28 or width > 420 or height < 10 or height > 120:
+        return False
+
+    if tag not in {"a", "button", "div", "span"}:
+        return False
+
+    if not text and not href:
+        return False
+
+    # Фильтруем системные и сервисные элементы шапки.
+    blocked_words = (
+        "login", "sign in", "account", "cookie", "privacy", "terms", "cart", "shop", "buy", "subscribe",
+    )
+    if has_keyword(text, blocked_words) or has_keyword(href, blocked_words):
+        return False
+
+    # Типичная длина текста вкладок/разделов.
+    if text and len(text) > 28:
+        return False
+
+    return True
+
+
+def nav_signature(target: Dict[str, Any]) -> str:
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    x = int(float(target.get("x", 0.0)))
+    y = int(float(target.get("y", 0.0)))
+    return f"{text}|{href}|{x}:{y}"
+
+
+async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
+    """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
+    return await page.evaluate(
+        """
+        ({ viewportWidth, viewportHeight }) => {
+            const selectors = [
+                'button',
+                '[role="button"]',
+                '[aria-label]',
+                '[title]',
+                '[class*="close"]',
+                '[class*="dismiss"]',
+                '[data-close]',
+                '[data-dismiss]',
+                '[aria-modal="true"] button',
+                '[role="dialog"] button'
+            ];
+
+            const closeWords = ['close', 'dismiss', 'cancel', 'exit', 'back', 'done', 'x', 'закрыть', 'крестик'];
+            const out = [];
+            const pool = new Set(document.querySelectorAll(selectors.join(',')));
+
+            for (const el of pool) {
+                if (!(el instanceof HTMLElement)) continue;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
+                    continue;
+                }
+
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 8 || rect.height < 8) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.left > viewportWidth || rect.top > viewportHeight) continue;
+
+                const text = (el.innerText || '').trim().toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                const title = (el.getAttribute('title') || '').trim().toLowerCase();
+                const cls = (el.className || '').toString().toLowerCase();
+
+                const isCloseLike = closeWords.some(w => text.includes(w) || aria.includes(w) || title.includes(w) || cls.includes(w));
+                if (!isCloseLike) continue;
+
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+
+                const nearTopRight = (cx > viewportWidth * 0.6 && cy < viewportHeight * 0.32) ? 120 : 0;
+                const score = nearTopRight + (style.cursor === 'pointer' ? 70 : 0) + Math.min(rect.width * rect.height, 4000) * 0.02;
+
+                out.push({
+                    x: Math.max(2, Math.min(viewportWidth - 2, cx)),
+                    y: Math.max(2, Math.min(viewportHeight - 2, cy)),
+                    score,
+                    text: (text || aria || title).slice(0, 40),
+                    key: `${Math.round(cx)}:${Math.round(cy)}|${(text || aria || title).slice(0, 20)}`,
+                });
+            }
+
+            out.sort((a, b) => b.score - a.score);
+            return out.slice(0, 6);
+        }
+        """,
+        {
+            "viewportWidth": viewport_width,
+            "viewportHeight": viewport_height,
+        },
+    )
+
+
+async def try_close_overlay(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+) -> Tuple[Tuple[float, float], bool]:
+    """Пытается закрыть открытые модалки/lightbox, чтобы курсор не застревал в галерее."""
+    before = await get_page_activity_snapshot(page)
+
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(random.randint(60, 140))
+    except Exception:
+        pass
+
+    close_targets = await collect_close_targets(page, viewport_width, viewport_height)
+    for item in close_targets[:2]:
+        tx = float(item.get("x", viewport_width * 0.92))
+        ty = float(item.get("y", viewport_height * 0.08))
+
+        cursor_pos = await move_mouse_human_like(
+            page,
+            cursor_pos,
+            (tx, ty),
+            viewport_width,
+            viewport_height,
+            random.randint(220, 540),
+        )
+        await page.wait_for_timeout(random.randint(50, 120))
+        await page.mouse.click(tx, ty, delay=random.randint(28, 90))
+        await page.wait_for_timeout(random.randint(160, 340))
+
+        after = await get_page_activity_snapshot(page)
+        if page_state_changed(before, after):
+            logger.info("🖱️ Smart cursor: закрыта модалка/галерея")
+            return cursor_pos, True
+
+    return cursor_pos, False
+
+
+async def perform_smooth_scroll(
+    page: Any,
+    viewport_height: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+) -> None:
+    """Плавный скролл небольшими шагами вместо одного резкого прыжка."""
+    total_delta = int(viewport_height * random.uniform(0.26, 0.46) * scroll_speed_factor)
+    steps = int(clamp(random.randint(4, 8), 3, 10))
+    base_step = max(20, int(total_delta / max(steps, 1)))
+
+    for _ in range(steps):
+        step_delta = max(12, int(base_step + random.uniform(-18, 22)))
+        await page.mouse.wheel(0, step_delta)
+        await page.evaluate(
+            """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
+            step_delta,
+        )
+        await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
+
+
 async def perform_forced_activation_clicks(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -755,6 +929,7 @@ async def run_smart_cursor(
     last_scroll_y = -1
     stagnant_scroll_rounds = 0
     recent_points: List[Tuple[float, float]] = []
+    clicked_nav_keys: Set[str] = set()
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -784,9 +959,18 @@ async def run_smart_cursor(
         last_scroll_y = -1
 
     nav_keywords = ("list", "grid", "stills", "motion", "culture", "information", "journal")
+    close_check_interval = 2
 
     while (time.monotonic() - start_time) * 1000 < total_time_ms:
         round_index += 1
+
+        if round_index % close_check_interval == 0:
+            cursor_pos, _ = await try_close_overlay(
+                page,
+                cursor_pos,
+                viewport_width,
+                viewport_height,
+            )
 
         if entry_click_enabled and round_index % 3 == 1:
             cursor_pos, clicked, clicked_key = await try_click_entry_element(
@@ -811,18 +995,20 @@ async def run_smart_cursor(
 
         top_nav_candidates = [
             item for item in safe_click_candidates
-            if float(item.get("y", viewport_height)) <= viewport_height * 0.20
-            and has_keyword(str(item.get("text", "")), nav_keywords)
+            if is_probable_top_nav_target(item, viewport_height)
+            and nav_signature(item) not in clicked_nav_keys
         ]
         media_candidates = [
             item for item in safe_click_candidates
             if float(item.get("width", 0.0)) * float(item.get("height", 0.0)) >= 35000
             and float(item.get("y", viewport_height)) > viewport_height * 0.12
+            and not is_probable_top_nav_target(item, viewport_height)
         ]
 
         target: Optional[Dict[str, Any]] = None
-        if inpage_click_enabled and top_nav_candidates and round_index <= 10:
-            target = random.choice(top_nav_candidates[: min(6, len(top_nav_candidates))])
+        if inpage_click_enabled and top_nav_candidates and round_index <= 14:
+            nav_pool = sorted(top_nav_candidates, key=lambda x: x.get("score", 0.0), reverse=True)[: min(10, len(top_nav_candidates))]
+            target = random.choice(nav_pool[: min(5, len(nav_pool))])
         elif inpage_click_enabled and media_candidates and random.random() < 0.60:
             target = random.choice(media_candidates[: min(5, len(media_candidates))])
         elif candidates and (max_targets <= 0 or hovered_count < max_targets):
@@ -886,14 +1072,26 @@ async def run_smart_cursor(
             click_probability = inpage_click_probability
             if has_keyword(str(target.get("text", "")), nav_keywords):
                 click_probability = max(click_probability, 0.88)
+            if is_probable_top_nav_target(target, viewport_height):
+                click_probability = max(click_probability, 0.92)
             if float(target.get("width", 0.0)) * float(target.get("height", 0.0)) >= 35000:
-                click_probability = max(click_probability, 0.70)
+                click_probability = min(max(click_probability, 0.22), 0.42)
 
             if should_click and random.random() < click_probability:
                 before_url = str(page.url or "")
                 await page.mouse.click(tx, ty, delay=random.randint(35, 110))
                 await page.wait_for_timeout(random.randint(120, 300))
                 clicked_inpage_keys.add(target_key)
+
+                if is_probable_top_nav_target(target, viewport_height):
+                    clicked_nav_keys.add(nav_signature(target))
+
+                cursor_pos, _ = await try_close_overlay(
+                    page,
+                    cursor_pos,
+                    viewport_width,
+                    viewport_height,
+                )
 
                 after_url = str(page.url or "")
                 if (
@@ -917,13 +1115,13 @@ async def run_smart_cursor(
                 recent_points.pop(0)
 
         if scroll_to_end:
-            scroll_delta = int(viewport_height * random.uniform(0.60, 0.98) * scroll_speed_factor)
-            await page.mouse.wheel(0, scroll_delta)
-            await page.evaluate(
-                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
-                scroll_delta,
+            await perform_smooth_scroll(
+                page,
+                viewport_height,
+                scroll_speed_factor,
+                scroll_pause_min_ms,
+                scroll_pause_max_ms,
             )
-            await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
 
             try:
                 metrics = await get_scroll_metrics(page)
@@ -985,6 +1183,7 @@ async def main():
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', True)
+        browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
@@ -1002,6 +1201,7 @@ async def main():
         logger.info(f"Display: {os.getenv('DISPLAY', ':99')}")
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
+        logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         
         async with async_playwright() as p:
             logger.info("🌐 Запуск браузера на виртуальном дисплее...")
@@ -1012,7 +1212,10 @@ async def main():
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
                     '--disable-extensions',
-                    '--disable-web-resources'
+                    '--disable-web-resources',
+                    '--start-fullscreen',
+                    '--hide-crash-restore-bubble',
+                    '--disable-infobars'
                 ]
             )
             
@@ -1033,6 +1236,15 @@ async def main():
                 logger.info("✅ Сайт загружен успешно")
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️  Таймаут при загрузке ({load_timeout}ms), продолжаем...")
+
+            if browser_fullscreen:
+                try:
+                    await page.bring_to_front()
+                    await page.wait_for_timeout(150)
+                    await page.keyboard.press("F11")
+                    await page.wait_for_timeout(450)
+                except Exception:
+                    logger.warning("⚠️ Не удалось переключить браузер в fullscreen")
 
             logger.info(f"⏳ Ожидание отрисовки WebGL анимаций ({render_timeout}ms)...")
             # Сайт тяжелый, даем время на полный рендер WebGL
