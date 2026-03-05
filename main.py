@@ -7,6 +7,7 @@ import random
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 
 # Конфигурация логирования для продакшена
@@ -322,6 +323,16 @@ async def try_click_entry_element(
     clicked_keys: Optional[Set[str]] = None,
 ) -> Tuple[Tuple[float, float], bool, Optional[str]]:
     """Пытается кликнуть по входному элементу, если страница заблокирована welcome/gate-экраном."""
+    current_url = str(page.url or "")
+    entry_words = (
+        "enter", "start", "continue", "explore", "open", "go", "begin", "launch", "proceed",
+        "skip", "next", "accept", "agree", "allow", "ok", "войти", "начать", "продолж", "далее", "принять",
+    )
+    purchase_words = (
+        "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
+        "purchase", "subscribe", "plan", "membership", "donate", "book", "store",
+    )
+
     targets = await collect_activation_targets(page, viewport_width, viewport_height, 36)
     if not targets:
         return cursor_pos, False, None
@@ -336,6 +347,21 @@ async def try_click_entry_element(
         candidate_key = str(candidate.get("key", ""))
         if clicked_keys is not None and candidate_key in clicked_keys:
             continue
+
+        text = str(candidate.get("text", "")).strip().lower()
+        href = str(candidate.get("href", "")).strip().lower()
+
+        if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
+            continue
+
+        if href and is_navigation_like_href(href, current_url):
+            # По требованию: не кликаем элементы, уводящие на другую страницу.
+            continue
+
+        # Без явных признаков входа не кликаем "случайные" ссылки.
+        if href and not has_keyword(text, entry_words) and not has_keyword(href, entry_words):
+            continue
+
         best = candidate
         break
 
@@ -416,6 +442,30 @@ def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
         or str(before.get("text", "")) != str(after.get("text", ""))
         or str(before.get("title", "")) != str(after.get("title", ""))
     )
+
+
+def has_keyword(value: str, keywords: Tuple[str, ...]) -> bool:
+    low = value.lower()
+    return any(word in low for word in keywords)
+
+
+def is_navigation_like_href(href: str, current_url: str) -> bool:
+    clean = href.strip().lower()
+    if not clean or clean.startswith("#") or clean.startswith("javascript:"):
+        return False
+
+    resolved = urljoin(current_url, href)
+    current_parts = urlparse(current_url)
+    resolved_parts = urlparse(resolved)
+
+    if resolved_parts.scheme not in {"http", "https"}:
+        return False
+
+    if resolved_parts.netloc != current_parts.netloc:
+        return True
+
+    # Если путь/параметры отличаются - это переход на другую страницу.
+    return (resolved_parts.path != current_parts.path) or (resolved_parts.query != current_parts.query)
 
 
 async def perform_forced_activation_clicks(
@@ -540,6 +590,7 @@ async def run_smart_cursor(
     entry_click_attempts: int,
     scroll_to_end: bool,
     bottom_stable_rounds_required: int,
+    scroll_speed_factor: float,
 ) -> int:
     """Автоматически обходит интерактивные блоки, вызывая hover-эффекты без ручной разметки."""
     start_time = time.monotonic()
@@ -637,9 +688,9 @@ async def run_smart_cursor(
                 logger.info("🧭 Smart cursor: интерактивные узлы редкие, приоритет на скролл до конца")
                 no_targets_logged = True
 
-            scroll_delta = int(viewport_height * random.uniform(0.52, 0.88))
+            scroll_delta = int(viewport_height * random.uniform(0.60, 0.98) * scroll_speed_factor)
             await page.mouse.wheel(0, scroll_delta)
-            await page.wait_for_timeout(random.randint(180, 420))
+            await page.wait_for_timeout(random.randint(120, 280))
 
             await page.evaluate(
                 """(delta) => {
@@ -647,21 +698,7 @@ async def run_smart_cursor(
                 }""",
                 scroll_delta,
             )
-            await page.wait_for_timeout(random.randint(180, 380))
-
-            if random.random() < 0.20:
-                click_x = clamp(viewport_width * random.uniform(0.43, 0.57), 1, viewport_width - 1)
-                click_y = clamp(viewport_height * random.uniform(0.42, 0.62), 1, viewport_height - 1)
-                cursor_pos = await move_mouse_human_like(
-                    page,
-                    cursor_pos,
-                    (click_x, click_y),
-                    viewport_width,
-                    viewport_height,
-                    random.randint(180, 420),
-                )
-                await page.mouse.click(click_x, click_y, delay=random.randint(30, 120))
-                await page.wait_for_timeout(random.randint(220, 620))
+            await page.wait_for_timeout(random.randint(120, 260))
 
             try:
                 metrics = await get_scroll_metrics(page)
@@ -737,7 +774,17 @@ async def run_smart_cursor(
 
         if random.random() < 0.28:
             await page.mouse.wheel(0, random.randint(80, 260))
-            await page.wait_for_timeout(random.randint(180, 420))
+            await page.wait_for_timeout(random.randint(90, 220))
+
+        if scroll_to_end:
+            # Даже при найденных элементах продолжаем уверенный спуск до конца страницы.
+            step_delta = int(viewport_height * random.uniform(0.35, 0.62) * scroll_speed_factor)
+            await page.mouse.wheel(0, step_delta)
+            await page.evaluate(
+                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
+                step_delta,
+            )
+            await page.wait_for_timeout(random.randint(80, 190))
 
         try:
             metrics = await get_scroll_metrics(page)
@@ -779,12 +826,14 @@ async def main():
         entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '2'))
         scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
         bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '3'))
+        scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.4'))
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
 
         entry_click_attempts = max(0, min(entry_click_attempts, 4))
         bottom_stable_rounds_required = max(1, min(bottom_stable_rounds_required, 8))
+        scroll_speed_factor = clamp(scroll_speed_factor, 0.6, 2.5)
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
@@ -844,6 +893,7 @@ async def main():
                     entry_click_attempts=entry_click_attempts,
                     scroll_to_end=scroll_to_end,
                     bottom_stable_rounds_required=bottom_stable_rounds_required,
+                    scroll_speed_factor=scroll_speed_factor,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
