@@ -166,7 +166,7 @@ async def collect_interactive_targets(
                 const text = (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 40);
                 const key = elementKey(el, cx, cy, text);
                 const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
-                const dynamicBoost = /menu|nav|tab|card|tile|cta|action|play|pause|open/i.test((el.className || '').toString()) ? 30 : 0;
+                const dynamicBoost = /menu|nav|tab|card|tile|cta|action|play|pause|open|calc|form|wizard|step|option|choice|result/i.test((el.className || '').toString()) ? 30 : 0;
 
                 out.push({
                     x: Math.max(2, Math.min(viewportWidth - 2, cx)),
@@ -583,6 +583,23 @@ def is_external_href(href: str, current_url: str) -> bool:
     return resolved_parts.netloc != current_parts.netloc
 
 
+def is_nav_tab_self_link(target: Dict[str, Any], current_url: str) -> bool:
+    """Ссылка указывает на текущую страницу — кликать бесполезно и может вызвать перезагрузку."""
+    href = str(target.get("href", "")).strip()
+    if not href or href.startswith("#") or href.startswith("javascript:"):
+        return False
+    resolved = urljoin(current_url, href)
+    current_parts = urlparse(current_url)
+    resolved_parts = urlparse(resolved)
+    if resolved_parts.scheme not in ("http", "https"):
+        return False
+    if resolved_parts.netloc != current_parts.netloc:
+        return False
+    current_path = current_parts.path.rstrip("/")
+    resolved_path = resolved_parts.path.rstrip("/")
+    return resolved_path == current_path and (resolved_parts.query or "") == (current_parts.query or "")
+
+
 def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_internal_nav_click: bool) -> bool:
     """Разрешаем клик только по элементам, которые не уводят на другую страницу."""
     text = str(target.get("text", "")).strip().lower()
@@ -971,6 +988,7 @@ async def collect_header_nav_targets(
         if nav_signature(item) not in visited_nav_keys
         and is_probable_top_nav_target(item, viewport_height)
         and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+        and not is_nav_tab_self_link(item, current_url)
     ]
 
     unique: Dict[str, Dict[str, Any]] = {}
@@ -1011,6 +1029,7 @@ async def collect_top_nav_targets(
         if is_probable_top_nav_target(item, viewport_height)
         and nav_signature(item) not in visited_nav_keys
         and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+        and not is_nav_tab_self_link(item, current_url)
     ]
 
     if not candidates:
@@ -1066,6 +1085,12 @@ async def visit_top_navigation_tabs(
             break
 
         target = nav_targets[0]
+
+        # Дополнительная проверка: self-link мог просочиться из-за изменения URL
+        current_url = str(page.url or "")
+        if is_nav_tab_self_link(target, current_url):
+            visited_nav_keys.add(nav_signature(target))
+            continue
 
         before_tab = await get_page_activity_snapshot(page)
 
@@ -1352,21 +1377,28 @@ async def run_smart_cursor(
 
     # Приоритет 2: пройти верхние вкладки последовательно (универсально, если они есть).
     if nav_tabs_visit_enabled and inpage_click_enabled:
-        cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
-            page,
-            cursor_pos,
-            viewport_width,
-            viewport_height,
-            allow_internal_nav_click,
-            clicked_nav_keys,
-            nav_tabs_max_visits,
-            nav_tab_scroll_timeout_ms,
-            scroll_speed_factor,
-            scroll_pause_min_ms,
-            scroll_pause_max_ms,
-        )
-        if visited_nav_count > 0:
-            logger.info(f"🧭 Smart cursor: последовательно пройдено вкладок {visited_nav_count}")
+        try:
+            cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
+                page,
+                cursor_pos,
+                viewport_width,
+                viewport_height,
+                allow_internal_nav_click,
+                clicked_nav_keys,
+                nav_tabs_max_visits,
+                nav_tab_scroll_timeout_ms,
+                scroll_speed_factor,
+                scroll_pause_min_ms,
+                scroll_pause_max_ms,
+            )
+            if visited_nav_count > 0:
+                logger.info(f"🧭 Smart cursor: последовательно пройдено вкладок {visited_nav_count}")
+        except Exception as nav_err:
+            logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок, продолжаем: {nav_err}")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
 
     try:
         last_scroll_y = int((await get_scroll_metrics(page)).get("scrollY", 0))
@@ -1499,6 +1531,14 @@ async def run_smart_cursor(
                 click_probability = max(click_probability, 0.92)
             if float(target.get("width", 0.0)) * float(target.get("height", 0.0)) >= 35000:
                 click_probability = min(max(click_probability, 0.22), 0.42)
+
+            # Кнопки действий в виджетах/калькуляторах кликаются с высоким приоритетом.
+            widget_action_words = (
+                "accept", "reset", "submit", "next", "confirm", "apply",
+                "calculate", "done", "save", "select", "choose", "finish",
+            )
+            if has_keyword(str(target.get("text", "")), widget_action_words):
+                click_probability = max(click_probability, 0.88)
 
             if should_click and random.random() < click_probability:
                 before_url = str(page.url or "")
