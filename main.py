@@ -840,7 +840,7 @@ async def main():
     try:
         # Получение конфигурации из переменных окружения
         output_path = os.getenv('OUTPUT_PATH', 'output')
-        target_url = os.getenv('TARGET_URL', 'https://sleep-well-creatives.com')
+        target_url = os.getenv('TARGET_URL', 'https://www.gsproductions.co.za/')
         viewport_width = int(os.getenv('VIEWPORT_WIDTH', '1920'))
         viewport_height = int(os.getenv('VIEWPORT_HEIGHT', '1080'))
         render_timeout = int(os.getenv('RENDER_TIMEOUT', '5000'))
