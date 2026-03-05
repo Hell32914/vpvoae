@@ -658,6 +658,10 @@ def nav_signature(target: Dict[str, Any]) -> str:
     return f"{text}|{href}|{x}:{y}"
 
 
+def target_sort_score(target: Dict[str, Any]) -> float:
+    return float(target.get("score", 0.0))
+
+
 async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
     """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
     return await page.evaluate(
@@ -789,6 +793,64 @@ async def perform_smooth_scroll(
         await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
 
 
+async def force_scroll_to_page_end(
+    page: Any,
+    viewport_height: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+    finish_timeout_ms: int,
+) -> bool:
+    """Финальный проход: агрессивно доскролливает страницу до конца, если основной цикл не успел."""
+    if finish_timeout_ms <= 0:
+        return False
+
+    start = time.monotonic()
+    stable_rounds = 0
+    last_scroll = -1
+
+    while (time.monotonic() - start) * 1000 < finish_timeout_ms:
+        await perform_smooth_scroll(
+            page,
+            viewport_height,
+            max(scroll_speed_factor, 1.0),
+            max(18, int(scroll_pause_min_ms * 0.7)),
+            max(28, int(scroll_pause_max_ms * 0.8)),
+        )
+
+        try:
+            metrics = await get_scroll_metrics(page)
+            current_scroll = int(metrics.get("scrollY", last_scroll))
+            at_bottom = bool(metrics.get("atBottom", False))
+        except Exception:
+            current_scroll = last_scroll
+            at_bottom = False
+
+        if current_scroll <= last_scroll + 2:
+            try:
+                await page.keyboard.press("PageDown")
+                await page.wait_for_timeout(random.randint(26, 70))
+            except Exception:
+                pass
+
+            try:
+                await page.keyboard.press("End")
+                await page.wait_for_timeout(random.randint(60, 120))
+            except Exception:
+                pass
+
+        if at_bottom:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        last_scroll = max(last_scroll, current_scroll)
+        if stable_rounds >= 2:
+            return True
+
+    return False
+
+
 async def perform_forced_activation_clicks(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -914,6 +976,7 @@ async def run_smart_cursor(
     scroll_speed_factor: float,
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
+    scroll_finish_timeout_ms: int,
     inpage_click_enabled: bool,
     inpage_click_probability: float,
     allow_internal_nav_click: bool,
@@ -963,6 +1026,8 @@ async def run_smart_cursor(
 
     while (time.monotonic() - start_time) * 1000 < total_time_ms:
         round_index += 1
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        scroll_priority_mode = scroll_to_end and elapsed_ms >= (total_time_ms * 0.72)
 
         if round_index % close_check_interval == 0:
             cursor_pos, _ = await try_close_overlay(
@@ -1006,19 +1071,19 @@ async def run_smart_cursor(
         ]
 
         target: Optional[Dict[str, Any]] = None
-        if inpage_click_enabled and top_nav_candidates and round_index <= 14:
-            nav_pool = sorted(top_nav_candidates, key=lambda x: x.get("score", 0.0), reverse=True)[: min(10, len(top_nav_candidates))]
+        if not scroll_priority_mode and inpage_click_enabled and top_nav_candidates and round_index <= 14:
+            nav_pool = sorted(top_nav_candidates, key=target_sort_score, reverse=True)[: min(10, len(top_nav_candidates))]
             target = random.choice(nav_pool[: min(5, len(nav_pool))])
-        elif inpage_click_enabled and media_candidates and random.random() < 0.60:
+        elif not scroll_priority_mode and inpage_click_enabled and media_candidates and random.random() < 0.60:
             target = random.choice(media_candidates[: min(5, len(media_candidates))])
-        elif candidates and (max_targets <= 0 or hovered_count < max_targets):
-            top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
+        elif not scroll_priority_mode and candidates and (max_targets <= 0 or hovered_count < max_targets):
+            top_pool = sorted(candidates, key=target_sort_score, reverse=True)[:8]
             target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
 
-        if target is None and candidates:
+        if not scroll_priority_mode and target is None and candidates:
             # Weighted fallback: повышаем шанс на элементы дальше от последних траекторий,
             # чтобы курсор не циклился в одной зоне и выглядел естественно.
-            weighted_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[: min(12, len(candidates))]
+            weighted_pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(12, len(candidates))]
             if weighted_pool:
                 weights: List[float] = []
                 for item in weighted_pool:
@@ -1153,6 +1218,20 @@ async def run_smart_cursor(
                 logger.info("🧭 Smart cursor: достигнут конец страницы")
                 break
 
+    if scroll_to_end:
+        reached_end = await force_scroll_to_page_end(
+            page,
+            viewport_height,
+            scroll_speed_factor,
+            scroll_pause_min_ms,
+            scroll_pause_max_ms,
+            scroll_finish_timeout_ms,
+        )
+        if reached_end:
+            logger.info("🧭 Smart cursor: финальным проходом достигнут конец страницы")
+        else:
+            logger.warning("⚠️ Smart cursor: не удалось гарантированно дойти до конца страницы в отведенный таймаут")
+
     logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
     return hovered_count
 
@@ -1180,6 +1259,7 @@ async def main():
         scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.4'))
         scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '25'))
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
+        scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '22000'))
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', True)
@@ -1193,6 +1273,7 @@ async def main():
         scroll_speed_factor = clamp(scroll_speed_factor, 0.6, 2.5)
         scroll_pause_min_ms = max(10, min(scroll_pause_min_ms, 400))
         scroll_pause_max_ms = max(scroll_pause_min_ms + 5, min(scroll_pause_max_ms, 800))
+        scroll_finish_timeout_ms = max(0, min(scroll_finish_timeout_ms, 90000))
         inpage_click_probability = clamp(inpage_click_probability, 0.0, 1.0)
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
@@ -1213,7 +1294,9 @@ async def main():
                     '--no-sandbox',
                     '--disable-extensions',
                     '--disable-web-resources',
+                    '--kiosk',
                     '--start-fullscreen',
+                    '--start-maximized',
                     '--hide-crash-restore-bubble',
                     '--disable-infobars'
                 ]
@@ -1269,6 +1352,7 @@ async def main():
                     scroll_speed_factor=scroll_speed_factor,
                     scroll_pause_min_ms=scroll_pause_min_ms,
                     scroll_pause_max_ms=scroll_pause_max_ms,
+                    scroll_finish_timeout_ms=scroll_finish_timeout_ms,
                     inpage_click_enabled=inpage_click_enabled,
                     inpage_click_probability=inpage_click_probability,
                     allow_internal_nav_click=allow_internal_nav_click,
