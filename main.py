@@ -60,7 +60,6 @@ async def collect_interactive_targets(
                 '[aria-haspopup="true"]'
             ];
 
-            const now = performance.now();
             const nodes = document.querySelectorAll(selectors.join(','));
             const out = [];
 
@@ -92,6 +91,7 @@ async def collect_interactive_targets(
                 const idPart = el.id ? `#${el.id}` : '';
                 const classPart = (el.className || '').toString().replace(/\\s+/g, '.').slice(0, 30);
                 const key = `${el.tagName}${idPart}.${classPart}|${Math.round(cx)}:${Math.round(cy)}|${text}`;
+                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
 
                 out.push({
                     x: Math.max(2, Math.min(viewportWidth - 2, cx)),
@@ -99,7 +99,10 @@ async def collect_interactive_targets(
                     width: rect.width,
                     height: rect.height,
                     score: area * 0.02 + centerScore * 100 + pointerBoost + tagBoost,
-                    key
+                    key,
+                    text,
+                    href,
+                    tag: el.tagName.toLowerCase()
                 });
             }
 
@@ -113,6 +116,340 @@ async def collect_interactive_targets(
             "viewportHeight": viewport_height,
         },
     )
+
+
+def entry_click_score(target: Dict[str, Any], viewport_width: int, viewport_height: int) -> float:
+    """Оценивает, насколько элемент похож на входную кнопку (Enter/Start/Continue)."""
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+
+    keywords = (
+        "enter",
+        "start",
+        "continue",
+        "explore",
+        "open",
+        "go",
+        "begin",
+        "launch",
+        "proceed",
+        "visit",
+        "view",
+    )
+
+    keyword_score = 0.0
+    if any(word in text for word in keywords):
+        keyword_score += 420.0
+    if any(word in href for word in keywords):
+        keyword_score += 140.0
+
+    if tag in {"button", "a"}:
+        keyword_score += 60.0
+
+    x = float(target.get("x", 0.0))
+    y = float(target.get("y", 0.0))
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+    area = width * height
+
+    diag = math.hypot(viewport_width, viewport_height)
+    center_dist = math.hypot(x - viewport_width / 2, y - viewport_height / 2)
+    center_bonus = max(0.0, 1.0 - center_dist / max(diag * 0.45, 1.0)) * 180.0
+
+    area_bonus = 0.0
+    if 200 <= area <= 25000:
+        area_bonus = 110.0
+
+    return float(target.get("score", 0.0)) + keyword_score + center_bonus + area_bonus
+
+
+async def collect_activation_targets(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Собирает кандидатов для первичной активации страницы (enter/cookie/overlay)."""
+    return await page.evaluate(
+        """
+        ({ limit, viewportWidth, viewportHeight }) => {
+            const selectors = [
+                'a[href]',
+                'button',
+                '[role="button"]',
+                '[onclick]',
+                '[tabindex]:not([tabindex="-1"])',
+                '[aria-label]',
+                '[class*="enter"]',
+                '[class*="start"]',
+                '[class*="continue"]',
+                '[class*="accept"]',
+                '[class*="cookie"]',
+                '[id*="enter"]',
+                '[id*="start"]'
+            ];
+
+            function toNumber(value, fallback) {
+                const n = Number(value);
+                return Number.isFinite(n) ? n : fallback;
+            }
+
+            function extractClickable(node) {
+                if (!node || !(node instanceof Element)) return null;
+                const clickable = node.closest('a,button,[role="button"],[onclick],[tabindex]:not([tabindex="-1"])');
+                if (!clickable || !(clickable instanceof HTMLElement)) return null;
+                return clickable;
+            }
+
+            const points = [
+                [viewportWidth / 2, viewportHeight / 2],
+                [viewportWidth / 2, viewportHeight * 0.58],
+                [viewportWidth / 2, viewportHeight * 0.42],
+                [viewportWidth * 0.35, viewportHeight / 2],
+                [viewportWidth * 0.65, viewportHeight / 2],
+            ];
+
+            const pool = new Set();
+            for (const node of document.querySelectorAll(selectors.join(','))) {
+                if (node instanceof HTMLElement) pool.add(node);
+            }
+
+            for (const [x, y] of points) {
+                const topNode = document.elementFromPoint(x, y);
+                const clickable = extractClickable(topNode);
+                if (clickable) pool.add(clickable);
+            }
+
+            const out = [];
+            for (const el of pool) {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
+                    continue;
+                }
+
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 8 || rect.height < 8) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.left > viewportWidth || rect.top > viewportHeight) continue;
+
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+
+                const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0, 80);
+                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                const z = toNumber(style.zIndex, 0);
+                const area = rect.width * rect.height;
+                const centerDist = Math.hypot(cx - viewportWidth / 2, cy - viewportHeight / 2);
+                const centerScore = Math.max(0, 1 - centerDist / Math.hypot(viewportWidth / 2, viewportHeight / 2));
+
+                const idPart = el.id ? `#${el.id}` : '';
+                const classPart = (el.className || '').toString().replace(/\\s+/g, '.').slice(0, 40);
+                const key = `${el.tagName}${idPart}.${classPart}|${Math.round(cx)}:${Math.round(cy)}|${text.slice(0, 30)}`;
+
+                out.push({
+                    key,
+                    x: Math.max(2, Math.min(viewportWidth - 2, cx)),
+                    y: Math.max(2, Math.min(viewportHeight - 2, cy)),
+                    width: rect.width,
+                    height: rect.height,
+                    text,
+                    href,
+                    tag: el.tagName.toLowerCase(),
+                    zIndex: z,
+                    score: centerScore * 100 + Math.min(area, 40000) * 0.004 + (style.cursor === 'pointer' ? 60 : 0)
+                });
+            }
+
+            out.sort((a, b) => b.score - a.score);
+            return out.slice(0, Math.max(limit, 1));
+        }
+        """,
+        {
+            "limit": limit,
+            "viewportWidth": viewport_width,
+            "viewportHeight": viewport_height,
+        },
+    )
+
+
+def activation_target_score(target: Dict[str, Any], viewport_width: int, viewport_height: int) -> float:
+    """Универсальный скор для первичного клика: enter, cookie, continue, close, централизованные CTA."""
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+    z_index = float(target.get("zIndex", 0.0))
+
+    primary_keywords = (
+        "enter", "start", "continue", "explore", "open", "go", "begin", "launch", "proceed",
+        "visit", "view", "discover", "watch", "play", "skip", "next", "close", "ok", "accept",
+        "agree", "allow", "got it", "i understand", "войти", "начать", "продолж", "далее", "принять",
+    )
+
+    keyword_bonus = 0.0
+    if any(word in text for word in primary_keywords):
+        keyword_bonus += 430.0
+    if any(word in href for word in primary_keywords):
+        keyword_bonus += 120.0
+
+    if tag in {"button", "a"}:
+        keyword_bonus += 55.0
+
+    x = float(target.get("x", 0.0))
+    y = float(target.get("y", 0.0))
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+    area = width * height
+
+    diag = math.hypot(viewport_width, viewport_height)
+    center_dist = math.hypot(x - viewport_width / 2, y - viewport_height / 2)
+    center_bonus = max(0.0, 1.0 - center_dist / max(diag * 0.55, 1.0)) * 200.0
+
+    area_bonus = 0.0
+    if 120 <= area <= 90000:
+        area_bonus = 100.0
+
+    z_bonus = clamp(z_index, 0.0, 1000.0) * 0.08
+
+    return float(target.get("score", 0.0)) + keyword_bonus + center_bonus + area_bonus + z_bonus
+
+
+async def try_click_entry_element(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+) -> Tuple[Tuple[float, float], bool]:
+    """Пытается кликнуть по входному элементу, если страница заблокирована welcome/gate-экраном."""
+    targets = await collect_activation_targets(page, viewport_width, viewport_height, 36)
+    if not targets:
+        return cursor_pos, False
+
+    ranked = sorted(
+        targets,
+        key=lambda item: activation_target_score(item, viewport_width, viewport_height),
+        reverse=True,
+    )
+    best = ranked[0]
+    best_score = activation_target_score(best, viewport_width, viewport_height)
+
+    if best_score < 360:
+        return cursor_pos, False
+
+    tx = float(best["x"])
+    ty = float(best["y"])
+    text_hint = str(best.get("text", "")).strip()
+
+    logger.info(f"🖱️ Smart cursor: клик по входному элементу '{text_hint[:30]}'")
+
+    cursor_pos = await move_mouse_human_like(
+        page,
+        cursor_pos,
+        (tx, ty),
+        viewport_width,
+        viewport_height,
+        random.randint(380, 980),
+    )
+    await page.wait_for_timeout(random.randint(90, 240))
+    await page.mouse.click(tx, ty, delay=random.randint(40, 130))
+
+    # Даем странице время снять оверлей и/или перейти дальше.
+    await page.wait_for_timeout(random.randint(900, 1700))
+    try:
+        await page.wait_for_load_state("networkidle", timeout=3000)
+    except Exception:
+        pass
+
+    return cursor_pos, True
+
+
+async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
+    """Легкий снимок состояния страницы для оценки, произошли ли изменения после клика."""
+    return await page.evaluate(
+        """
+        () => {
+            const text = (document.body?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 300);
+            return {
+                url: location.href,
+                scrollY: window.scrollY,
+                height: document.documentElement?.scrollHeight || 0,
+                title: document.title || '',
+                text
+            };
+        }
+        """
+    )
+
+
+def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
+    return (
+        before.get("url") != after.get("url")
+        or int(after.get("scrollY", 0)) != int(before.get("scrollY", 0))
+        or str(before.get("text", "")) != str(after.get("text", ""))
+        or str(before.get("title", "")) != str(after.get("title", ""))
+    )
+
+
+async def perform_forced_activation_clicks(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+) -> Tuple[Tuple[float, float], bool]:
+    """Fallback-активация: кликает по ключевым зонам и по top-element через elementFromPoint."""
+    points: List[Tuple[float, float]] = [
+        (viewport_width * 0.50, viewport_height * 0.52),
+        (viewport_width * 0.50, viewport_height * 0.62),
+        (viewport_width * 0.50, viewport_height * 0.42),
+        (viewport_width * 0.38, viewport_height * 0.52),
+        (viewport_width * 0.62, viewport_height * 0.52),
+    ]
+
+    snapshot_before = await get_page_activity_snapshot(page)
+
+    for x, y in points:
+        cx = clamp(x + random.uniform(-16, 16), 1, viewport_width - 1)
+        cy = clamp(y + random.uniform(-12, 12), 1, viewport_height - 1)
+
+        cursor_pos = await move_mouse_human_like(
+            page,
+            cursor_pos,
+            (cx, cy),
+            viewport_width,
+            viewport_height,
+            random.randint(260, 720),
+        )
+        await page.wait_for_timeout(random.randint(80, 180))
+
+        await page.mouse.click(cx, cy, delay=random.randint(30, 120))
+
+        # Дополнительно инициируем click по верхнему DOM-элементу в точке.
+        await page.evaluate(
+            """
+            ({ x, y }) => {
+                const node = document.elementFromPoint(x, y);
+                if (!node || !(node instanceof Element)) return false;
+                const clickable = node.closest('a,button,[role="button"],[onclick],[tabindex]:not([tabindex="-1"])') || node;
+                if (!(clickable instanceof HTMLElement)) return false;
+                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }
+            """,
+            {"x": cx, "y": cy},
+        )
+
+        await page.wait_for_timeout(random.randint(500, 1200))
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=1200)
+        except Exception:
+            pass
+
+        snapshot_after = await get_page_activity_snapshot(page)
+        if page_state_changed(snapshot_before, snapshot_after):
+            logger.info("🖱️ Smart cursor: fallback-клик изменил состояние страницы")
+            return cursor_pos, True
+
+    return cursor_pos, False
 
 
 async def move_mouse_human_like(
@@ -170,18 +507,51 @@ async def run_smart_cursor(
     max_targets: int,
     hover_min_ms: int,
     hover_max_ms: int,
+    entry_click_enabled: bool,
+    entry_click_attempts: int,
 ) -> int:
     """Автоматически обходит интерактивные блоки, вызывая hover-эффекты без ручной разметки."""
     start_time = time.monotonic()
     visited_keys: Set[str] = set()
     hovered_count = 0
     empty_rounds = 0
+    no_targets_logged = False
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
         viewport_height * random.uniform(0.35, 0.65),
     )
     await page.mouse.move(cursor_pos[0], cursor_pos[1])
+
+    if entry_click_enabled:
+        before_snapshot = await get_page_activity_snapshot(page)
+        activation_changed = False
+        for _ in range(max(entry_click_attempts, 0)):
+            cursor_pos, clicked = await try_click_entry_element(
+                page=page,
+                cursor_pos=cursor_pos,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
+            if not clicked:
+                break
+
+            after_snapshot = await get_page_activity_snapshot(page)
+            changed = page_state_changed(before_snapshot, after_snapshot)
+            before_snapshot = after_snapshot
+            if changed:
+                logger.info("🖱️ Smart cursor: страница изменилась после активационного клика")
+                activation_changed = True
+                break
+
+        if not activation_changed:
+            logger.info("🖱️ Smart cursor: запускаем fallback-активацию страницы")
+            cursor_pos, _ = await perform_forced_activation_clicks(
+                page=page,
+                cursor_pos=cursor_pos,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
 
     logger.info("🧭 Smart cursor: старт обхода интерактивных элементов")
 
@@ -192,9 +562,37 @@ async def run_smart_cursor(
         if not candidates:
             empty_rounds += 1
 
+            if empty_rounds > 1:
+                drift_x = clamp(viewport_width * random.uniform(0.2, 0.8), 1, viewport_width - 1)
+                drift_y = clamp(viewport_height * random.uniform(0.25, 0.75), 1, viewport_height - 1)
+                cursor_pos = await move_mouse_human_like(
+                    page,
+                    cursor_pos,
+                    (drift_x, drift_y),
+                    viewport_width,
+                    viewport_height,
+                    random.randint(250, 760),
+                )
+
             if empty_rounds > 2:
                 await page.mouse.wheel(0, int(viewport_height * random.uniform(0.45, 0.7)))
                 await page.wait_for_timeout(random.randint(280, 700))
+
+                if random.random() < 0.35:
+                    # Универсальный fallback: один мягкий клик по области рядом с центром,
+                    # когда DOM-маркеры почти не читаются (canvas/overlay-проекты).
+                    click_x = clamp(viewport_width * random.uniform(0.43, 0.57), 1, viewport_width - 1)
+                    click_y = clamp(viewport_height * random.uniform(0.42, 0.62), 1, viewport_height - 1)
+                    cursor_pos = await move_mouse_human_like(
+                        page,
+                        cursor_pos,
+                        (click_x, click_y),
+                        viewport_width,
+                        viewport_height,
+                        random.randint(220, 620),
+                    )
+                    await page.mouse.click(click_x, click_y, delay=random.randint(30, 120))
+                    await page.wait_for_timeout(random.randint(380, 900))
 
                 at_bottom = await page.evaluate(
                     """() => (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 3)"""
@@ -203,9 +601,9 @@ async def run_smart_cursor(
                     await page.evaluate("""() => window.scrollTo({ top: 0, behavior: 'smooth' })""")
                     await page.wait_for_timeout(random.randint(350, 800))
 
-                if empty_rounds > 5:
-                    logger.info("🧭 Smart cursor: новых интерактивных узлов не найдено")
-                    break
+                if empty_rounds > 5 and not no_targets_logged:
+                    logger.info("🧭 Smart cursor: новых интерактивных узлов не найдено, продолжаем fallback-режим")
+                    no_targets_logged = True
 
             continue
 
@@ -264,9 +662,13 @@ async def main():
         smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '24'))
         hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '450'))
         hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '1300'))
+        entry_click_enabled = env_bool('SMART_CURSOR_ENTRY_CLICK_ENABLED', True)
+        entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '2'))
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
+
+        entry_click_attempts = max(0, min(entry_click_attempts, 4))
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
@@ -322,6 +724,8 @@ async def main():
                     max_targets=smart_cursor_max_targets,
                     hover_min_ms=hover_min_ms,
                     hover_max_ms=hover_max_ms,
+                    entry_click_enabled=entry_click_enabled,
+                    entry_click_attempts=entry_click_attempts,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
