@@ -32,18 +32,21 @@ echo "=========================================="
 
 OUTPUT_PATH=${OUTPUT_PATH:-/app/output}
 VIDEO_OUTPUT_FILE="${OUTPUT_PATH}/recording_$(date +%Y%m%d_%H%M%S).mp4"
+FFMPEG_FRAMERATE=${FFMPEG_FRAMERATE:-24}
+FFMPEG_PRESET=${FFMPEG_PRESET:-ultrafast}
+FFMPEG_CRF=${FFMPEG_CRF:-23}
 
 # Запускаем FFmpeg в фоне для захвата видео с виртуального дисплея
 # Используем crop фильтр чтобы убрать интерфейс браузера сверху
 # crop=width:height:x:y -> crop=1920:980:0:100 (убираем первые 100px сверху для UI браузера)
 ffmpeg -f x11grab \
   -video_size 1920x1080 \
-  -framerate 30 \
+    -framerate "$FFMPEG_FRAMERATE" \
   -i :99 \
   -vf "crop=1920:980:0:100" \
   -c:v libx264 \
-  -preset veryfast \
-  -crf 18 \
+    -preset "$FFMPEG_PRESET" \
+    -crf "$FFMPEG_CRF" \
   -pix_fmt yuv420p \
   -y \
   "$VIDEO_OUTPUT_FILE" > /tmp/ffmpeg.log 2>&1 &
@@ -61,7 +64,7 @@ if ! kill -0 $FFMPEG_PID 2>/dev/null; then
     exit 1
 fi
 
-echo "✅ FFmpeg is recording at 30fps with CRF 18 (high quality)"
+echo "✅ FFmpeg is recording at ${FFMPEG_FRAMERATE}fps with preset=${FFMPEG_PRESET}, crf=${FFMPEG_CRF}"
 
 # Запуск основного приложения
 echo ""

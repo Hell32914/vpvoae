@@ -5,7 +5,7 @@ import logging
 import math
 import random
 import time
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 from playwright.async_api import async_playwright
 
@@ -319,22 +319,33 @@ async def try_click_entry_element(
     cursor_pos: Tuple[float, float],
     viewport_width: int,
     viewport_height: int,
-) -> Tuple[Tuple[float, float], bool]:
+    clicked_keys: Optional[Set[str]] = None,
+) -> Tuple[Tuple[float, float], bool, Optional[str]]:
     """Пытается кликнуть по входному элементу, если страница заблокирована welcome/gate-экраном."""
     targets = await collect_activation_targets(page, viewport_width, viewport_height, 36)
     if not targets:
-        return cursor_pos, False
+        return cursor_pos, False, None
 
     ranked = sorted(
         targets,
         key=lambda item: activation_target_score(item, viewport_width, viewport_height),
         reverse=True,
     )
-    best = ranked[0]
+    best: Optional[Dict[str, Any]] = None
+    for candidate in ranked:
+        candidate_key = str(candidate.get("key", ""))
+        if clicked_keys is not None and candidate_key in clicked_keys:
+            continue
+        best = candidate
+        break
+
+    if best is None:
+        return cursor_pos, False, None
+
     best_score = activation_target_score(best, viewport_width, viewport_height)
 
     if best_score < 360:
-        return cursor_pos, False
+        return cursor_pos, False, None
 
     tx = float(best["x"])
     ty = float(best["y"])
@@ -360,7 +371,7 @@ async def try_click_entry_element(
     except Exception:
         pass
 
-    return cursor_pos, True
+    return cursor_pos, True, str(best.get("key", ""))
 
 
 async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
@@ -375,6 +386,23 @@ async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
                 height: document.documentElement?.scrollHeight || 0,
                 title: document.title || '',
                 text
+            };
+        }
+        """
+    )
+
+
+async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
+    return await page.evaluate(
+        """
+        () => {
+            const doc = document.documentElement;
+            const scrollY = Math.round(window.scrollY || 0);
+            const maxScroll = Math.max(0, Math.round((doc?.scrollHeight || 0) - (window.innerHeight || 0)));
+            return {
+                scrollY,
+                maxScroll,
+                atBottom: scrollY >= (maxScroll - 3),
             };
         }
         """
@@ -465,8 +493,9 @@ async def move_mouse_human_like(
     end_x, end_y = end
 
     distance = math.hypot(end_x - start_x, end_y - start_y)
-    base_steps = int(clamp(distance / 18, 12, 64))
-    steps = int(clamp(base_steps + random.randint(-2, 6), 12, 72))
+    # Меньше шагов = меньше нагрузки на тяжелых WebGL-сайтах.
+    base_steps = int(clamp(distance / 26, 8, 36))
+    steps = int(clamp(base_steps + random.randint(-1, 4), 8, 42))
 
     cp1 = (
         start_x + (end_x - start_x) * random.uniform(0.2, 0.45) + random.uniform(-120, 120),
@@ -493,7 +522,7 @@ async def move_mouse_human_like(
         y = clamp(y, 1, viewport_height - 1)
 
         await page.mouse.move(x, y)
-        per_step_delay = max(4, int(duration_ms / steps + random.uniform(-4, 8)))
+        per_step_delay = max(6, int(duration_ms / steps + random.uniform(-2, 6)))
         await page.wait_for_timeout(per_step_delay)
 
     return end_x, end_y
@@ -509,13 +538,20 @@ async def run_smart_cursor(
     hover_max_ms: int,
     entry_click_enabled: bool,
     entry_click_attempts: int,
+    scroll_to_end: bool,
+    bottom_stable_rounds_required: int,
 ) -> int:
     """Автоматически обходит интерактивные блоки, вызывая hover-эффекты без ручной разметки."""
     start_time = time.monotonic()
     visited_keys: Set[str] = set()
+    clicked_entry_keys: Set[str] = set()
     hovered_count = 0
     empty_rounds = 0
     no_targets_logged = False
+    last_scroll_y = -1
+    stagnant_scroll_rounds = 0
+    bottom_stable_rounds = 0
+    round_index = 0
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -527,14 +563,18 @@ async def run_smart_cursor(
         before_snapshot = await get_page_activity_snapshot(page)
         activation_changed = False
         for _ in range(max(entry_click_attempts, 0)):
-            cursor_pos, clicked = await try_click_entry_element(
+            cursor_pos, clicked, clicked_key = await try_click_entry_element(
                 page=page,
                 cursor_pos=cursor_pos,
                 viewport_width=viewport_width,
                 viewport_height=viewport_height,
+                clicked_keys=clicked_entry_keys,
             )
             if not clicked:
                 break
+
+            if clicked_key:
+                clicked_entry_keys.add(clicked_key)
 
             after_snapshot = await get_page_activity_snapshot(page)
             changed = page_state_changed(before_snapshot, after_snapshot)
@@ -555,11 +595,30 @@ async def run_smart_cursor(
 
     logger.info("🧭 Smart cursor: старт обхода интерактивных элементов")
 
-    while (time.monotonic() - start_time) * 1000 < total_time_ms and hovered_count < max_targets:
+    try:
+        last_scroll_y = int((await get_scroll_metrics(page)).get("scrollY", 0))
+    except Exception:
+        last_scroll_y = -1
+
+    while (time.monotonic() - start_time) * 1000 < total_time_ms:
+        round_index += 1
+
+        if entry_click_enabled and round_index % 3 == 1:
+            cursor_pos, clicked, clicked_key = await try_click_entry_element(
+                page=page,
+                cursor_pos=cursor_pos,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+                clicked_keys=clicked_entry_keys,
+            )
+            if clicked and clicked_key:
+                clicked_entry_keys.add(clicked_key)
+
         targets = await collect_interactive_targets(page, viewport_width, viewport_height, max_targets)
         candidates = [item for item in targets if item["key"] not in visited_keys]
+        can_hover = max_targets > 0 and hovered_count < max_targets
 
-        if not candidates:
+        if not candidates or not can_hover:
             empty_rounds += 1
 
             if empty_rounds > 1:
@@ -574,36 +633,74 @@ async def run_smart_cursor(
                     random.randint(250, 760),
                 )
 
-            if empty_rounds > 2:
-                await page.mouse.wheel(0, int(viewport_height * random.uniform(0.45, 0.7)))
-                await page.wait_for_timeout(random.randint(280, 700))
+            if empty_rounds > 2 and not no_targets_logged:
+                logger.info("🧭 Smart cursor: интерактивные узлы редкие, приоритет на скролл до конца")
+                no_targets_logged = True
 
-                if random.random() < 0.35:
-                    # Универсальный fallback: один мягкий клик по области рядом с центром,
-                    # когда DOM-маркеры почти не читаются (canvas/overlay-проекты).
-                    click_x = clamp(viewport_width * random.uniform(0.43, 0.57), 1, viewport_width - 1)
-                    click_y = clamp(viewport_height * random.uniform(0.42, 0.62), 1, viewport_height - 1)
-                    cursor_pos = await move_mouse_human_like(
-                        page,
-                        cursor_pos,
-                        (click_x, click_y),
-                        viewport_width,
-                        viewport_height,
-                        random.randint(220, 620),
-                    )
-                    await page.mouse.click(click_x, click_y, delay=random.randint(30, 120))
-                    await page.wait_for_timeout(random.randint(380, 900))
+            scroll_delta = int(viewport_height * random.uniform(0.52, 0.88))
+            await page.mouse.wheel(0, scroll_delta)
+            await page.wait_for_timeout(random.randint(180, 420))
 
-                at_bottom = await page.evaluate(
-                    """() => (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 3)"""
+            await page.evaluate(
+                """(delta) => {
+                    window.scrollBy({ top: delta, left: 0, behavior: 'auto' });
+                }""",
+                scroll_delta,
+            )
+            await page.wait_for_timeout(random.randint(180, 380))
+
+            if random.random() < 0.20:
+                click_x = clamp(viewport_width * random.uniform(0.43, 0.57), 1, viewport_width - 1)
+                click_y = clamp(viewport_height * random.uniform(0.42, 0.62), 1, viewport_height - 1)
+                cursor_pos = await move_mouse_human_like(
+                    page,
+                    cursor_pos,
+                    (click_x, click_y),
+                    viewport_width,
+                    viewport_height,
+                    random.randint(180, 420),
                 )
-                if at_bottom:
-                    await page.evaluate("""() => window.scrollTo({ top: 0, behavior: 'smooth' })""")
-                    await page.wait_for_timeout(random.randint(350, 800))
+                await page.mouse.click(click_x, click_y, delay=random.randint(30, 120))
+                await page.wait_for_timeout(random.randint(220, 620))
 
-                if empty_rounds > 5 and not no_targets_logged:
-                    logger.info("🧭 Smart cursor: новых интерактивных узлов не найдено, продолжаем fallback-режим")
-                    no_targets_logged = True
+            try:
+                metrics = await get_scroll_metrics(page)
+                current_scroll_y = int(metrics.get("scrollY", last_scroll_y))
+                at_bottom = bool(metrics.get("atBottom", False))
+            except Exception:
+                current_scroll_y = last_scroll_y
+                at_bottom = False
+
+            if current_scroll_y <= last_scroll_y + 3:
+                stagnant_scroll_rounds += 1
+            else:
+                stagnant_scroll_rounds = 0
+
+            if stagnant_scroll_rounds >= 1:
+                await page.evaluate(
+                    """(delta) => {
+                        window.scrollBy({ top: delta, left: 0, behavior: 'smooth' });
+                    }""",
+                    scroll_delta,
+                )
+                await page.wait_for_timeout(random.randint(240, 520))
+
+            if stagnant_scroll_rounds >= 2:
+                try:
+                    await page.keyboard.press("PageDown")
+                    await page.wait_for_timeout(random.randint(220, 460))
+                except Exception:
+                    pass
+
+            last_scroll_y = max(last_scroll_y, current_scroll_y)
+            if at_bottom:
+                bottom_stable_rounds += 1
+            else:
+                bottom_stable_rounds = 0
+
+            if scroll_to_end and bottom_stable_rounds >= bottom_stable_rounds_required:
+                logger.info("🧭 Smart cursor: достигнут конец страницы")
+                break
 
             continue
 
@@ -642,6 +739,22 @@ async def run_smart_cursor(
             await page.mouse.wheel(0, random.randint(80, 260))
             await page.wait_for_timeout(random.randint(180, 420))
 
+        try:
+            metrics = await get_scroll_metrics(page)
+            current_scroll_y = int(metrics.get("scrollY", last_scroll_y))
+            at_bottom = bool(metrics.get("atBottom", False))
+            last_scroll_y = max(last_scroll_y, current_scroll_y)
+            if at_bottom:
+                bottom_stable_rounds += 1
+            else:
+                bottom_stable_rounds = 0
+        except Exception:
+            pass
+
+        if scroll_to_end and bottom_stable_rounds >= bottom_stable_rounds_required:
+            logger.info("🧭 Smart cursor: достигнут конец страницы")
+            break
+
     logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
     return hovered_count
 
@@ -658,17 +771,20 @@ async def main():
         render_timeout = int(os.getenv('RENDER_TIMEOUT', '5000'))
         load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
         smart_cursor_enabled = env_bool('SMART_CURSOR_ENABLED', True)
-        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '15000'))
+        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '45000'))
         smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '24'))
         hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '450'))
         hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '1300'))
         entry_click_enabled = env_bool('SMART_CURSOR_ENTRY_CLICK_ENABLED', True)
         entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '2'))
+        scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
+        bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '3'))
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
 
         entry_click_attempts = max(0, min(entry_click_attempts, 4))
+        bottom_stable_rounds_required = max(1, min(bottom_stable_rounds_required, 8))
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
@@ -712,9 +828,9 @@ async def main():
             # Сайт тяжелый, даем время на полный рендер WebGL
             await page.wait_for_timeout(render_timeout)
 
-            if smart_cursor_enabled and smart_cursor_timeout > 0 and smart_cursor_max_targets > 0:
+            if smart_cursor_enabled and smart_cursor_timeout > 0:
                 logger.info(
-                    f"🧭 Smart cursor активирован: budget={smart_cursor_timeout}ms, max_targets={smart_cursor_max_targets}"
+                    f"🧭 Smart cursor активирован: budget={smart_cursor_timeout}ms, max_targets={smart_cursor_max_targets}, scroll_to_end={scroll_to_end}"
                 )
                 await run_smart_cursor(
                     page=page,
@@ -726,6 +842,8 @@ async def main():
                     hover_max_ms=hover_max_ms,
                     entry_click_enabled=entry_click_enabled,
                     entry_click_attempts=entry_click_attempts,
+                    scroll_to_end=scroll_to_end,
+                    bottom_stable_rounds_required=bottom_stable_rounds_required,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
