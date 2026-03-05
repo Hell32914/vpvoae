@@ -35,15 +35,24 @@ VIDEO_OUTPUT_FILE="${OUTPUT_PATH}/recording_$(date +%Y%m%d_%H%M%S).mp4"
 FFMPEG_FRAMERATE=${FFMPEG_FRAMERATE:-24}
 FFMPEG_PRESET=${FFMPEG_PRESET:-ultrafast}
 FFMPEG_CRF=${FFMPEG_CRF:-23}
+FFMPEG_CROP_TOP=${FFMPEG_CROP_TOP:-0}
 
-# Запускаем FFmpeg в фоне для захвата видео с виртуального дисплея
-# Используем crop фильтр чтобы убрать интерфейс браузера сверху
-# crop=width:height:x:y -> crop=1920:980:0:100 (убираем первые 100px сверху для UI браузера)
+FILTER_ARGS=()
+if [ "$FFMPEG_CROP_TOP" -gt 0 ]; then
+  CROP_HEIGHT=$((1080 - FFMPEG_CROP_TOP))
+  if [ "$CROP_HEIGHT" -lt 100 ]; then
+    CROP_HEIGHT=100
+  fi
+  FILTER_ARGS=(-vf "crop=1920:${CROP_HEIGHT}:0:${FFMPEG_CROP_TOP}")
+fi
+
+# Запускаем FFmpeg в фоне для захвата видео с виртуального дисплея.
+# По умолчанию crop отключен, чтобы верхняя навигация сайта попадала в запись.
 ffmpeg -f x11grab \
   -video_size 1920x1080 \
     -framerate "$FFMPEG_FRAMERATE" \
   -i :99 \
-  -vf "crop=1920:980:0:100" \
+  "${FILTER_ARGS[@]}" \
   -c:v libx264 \
     -preset "$FFMPEG_PRESET" \
     -crf "$FFMPEG_CRF" \
@@ -53,7 +62,11 @@ ffmpeg -f x11grab \
 FFMPEG_PID=$!
 echo "   FFmpeg PID: $FFMPEG_PID"
 echo "   Recording to: $VIDEO_OUTPUT_FILE"
-echo "   Area: 1920x980 (обрезаны верхние 100px интерфейса браузера)"
+if [ "$FFMPEG_CROP_TOP" -gt 0 ]; then
+  echo "   Crop top: ${FFMPEG_CROP_TOP}px"
+else
+  echo "   Crop top: disabled"
+fi
 
 sleep 2
 

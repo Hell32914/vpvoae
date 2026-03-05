@@ -494,6 +494,35 @@ def is_navigation_like_href(href: str, current_url: str) -> bool:
     return (resolved_parts.path != current_parts.path) or (resolved_parts.query != current_parts.query)
 
 
+def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str) -> bool:
+    """Разрешаем клик только по элементам, которые не уводят на другую страницу."""
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+
+    if tag in {"input", "textarea", "select"}:
+        return False
+
+    purchase_words = (
+        "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
+        "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
+    )
+    if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
+        return False
+
+    if href and is_navigation_like_href(href, current_url):
+        return False
+
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+    score = float(target.get("score", 0.0))
+    if width < 14 or height < 14:
+        return False
+
+    # Небольшой порог, чтобы случайные декоративные элементы не кликались.
+    return score >= 55
+
+
 async def perform_forced_activation_clicks(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -619,11 +648,14 @@ async def run_smart_cursor(
     scroll_speed_factor: float,
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
+    inpage_click_enabled: bool,
+    inpage_click_probability: float,
 ) -> int:
     """Автоматически обходит интерактивные блоки, вызывая hover-эффекты без ручной разметки."""
     start_time = time.monotonic()
     visited_keys: Set[str] = set()
     clicked_entry_keys: Set[str] = set()
+    clicked_inpage_keys: Set[str] = set()
     hovered_count = 0
     empty_rounds = 0
     no_targets_logged = False
@@ -770,8 +802,23 @@ async def run_smart_cursor(
             continue
 
         empty_rounds = 0
-        top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
-        target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
+        current_url = str(page.url or "")
+        safe_click_candidates = [
+            item for item in candidates
+            if is_safe_inpage_click_target(item, current_url)
+        ]
+
+        top_nav_candidates = [
+            item for item in safe_click_candidates
+            if float(item.get("y", viewport_height)) <= viewport_height * 0.20
+        ]
+
+        if inpage_click_enabled and top_nav_candidates and random.random() < 0.70:
+            # Верхняя навигация часто раскрывает in-page контент и не должна игнорироваться.
+            target = random.choice(top_nav_candidates[: min(6, len(top_nav_candidates))])
+        else:
+            top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
+            target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
 
         tx = float(target["x"])
         ty = float(target["y"])
@@ -796,6 +843,33 @@ async def run_smart_cursor(
 
         dwell_ms = random.randint(hover_min_ms, hover_max_ms)
         await page.wait_for_timeout(dwell_ms)
+
+        if inpage_click_enabled:
+            target_key = str(target.get("key", ""))
+            can_click_target = (
+                target_key not in clicked_inpage_keys
+                and is_safe_inpage_click_target(target, current_url)
+            )
+
+            if can_click_target:
+                click_probability = inpage_click_probability
+                if float(target.get("y", viewport_height)) <= viewport_height * 0.22:
+                    click_probability = max(click_probability, 0.75)
+
+                if random.random() < click_probability:
+                    before_url = str(page.url or "")
+                    await page.mouse.click(tx, ty, delay=random.randint(35, 120))
+                    await page.wait_for_timeout(random.randint(120, 300))
+                    clicked_inpage_keys.add(target_key)
+
+                    after_url = str(page.url or "")
+                    if after_url != before_url and is_navigation_like_href(after_url, before_url):
+                        logger.info("🖱️ Smart cursor: обнаружен переход, откатываемся назад")
+                        try:
+                            await page.go_back(wait_until="domcontentloaded", timeout=3000)
+                            await page.wait_for_timeout(random.randint(250, 550))
+                        except Exception:
+                            pass
 
         hovered_count += 1
         visited_keys.add(target["key"])
@@ -855,8 +929,10 @@ async def main():
         scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
         bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '3'))
         scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.4'))
-        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '45'))
-        scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '120'))
+        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '25'))
+        scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
+        inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
+        inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
@@ -866,6 +942,7 @@ async def main():
         scroll_speed_factor = clamp(scroll_speed_factor, 0.6, 2.5)
         scroll_pause_min_ms = max(10, min(scroll_pause_min_ms, 400))
         scroll_pause_max_ms = max(scroll_pause_min_ms + 5, min(scroll_pause_max_ms, 800))
+        inpage_click_probability = clamp(inpage_click_probability, 0.0, 1.0)
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
@@ -928,6 +1005,8 @@ async def main():
                     scroll_speed_factor=scroll_speed_factor,
                     scroll_pause_min_ms=scroll_pause_min_ms,
                     scroll_pause_max_ms=scroll_pause_max_ms,
+                    inpage_click_enabled=inpage_click_enabled,
+                    inpage_click_probability=inpage_click_probability,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
