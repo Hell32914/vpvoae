@@ -864,6 +864,127 @@ async def force_scroll_to_page_end(
     return False
 
 
+async def collect_header_nav_targets(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+    allow_internal_nav_click: bool,
+    visited_nav_keys: Set[str],
+) -> List[Dict[str, Any]]:
+    """Целенаправленно собирает пункты верхнего меню/вкладок из header/nav-структур."""
+    raw = await page.evaluate(
+        """
+        ({ viewportWidth, viewportHeight }) => {
+            function isVisible(el) {
+                if (!(el instanceof HTMLElement)) return false;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+                if (Number(style.opacity || '1') < 0.02) return false;
+                if (style.pointerEvents === 'none') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width >= 18 && rect.height >= 10;
+            }
+
+            function clickableFrom(node) {
+                if (!node || !(node instanceof Element)) return null;
+                const clickable = node.closest('a,button,[role="button"],[role="link"],[role="menuitem"],[onclick],[tabindex]:not([tabindex="-1"])');
+                return clickable instanceof HTMLElement ? clickable : null;
+            }
+
+            const navRoots = [
+                ...document.querySelectorAll('header nav, header, nav, [role="navigation"], [aria-label*="nav" i], [class*="nav" i], [class*="menu" i], [id*="nav" i], [id*="menu" i]')
+            ];
+
+            const pool = new Set();
+            for (const root of navRoots) {
+                if (!(root instanceof HTMLElement)) continue;
+                const rr = root.getBoundingClientRect();
+                if (rr.top > viewportHeight * 0.35 || rr.bottom < 0) continue;
+
+                for (const node of root.querySelectorAll('a,button,[role="button"],[role="link"],[role="menuitem"],[onclick],[tabindex]:not([tabindex="-1"])')) {
+                    if (node instanceof HTMLElement) pool.add(node);
+                }
+            }
+
+            // Страховка для сайтов, где nav нет в семантике: собираем кликабельные элементы по точкам в верхней зоне.
+            const scanRows = [0.055, 0.085, 0.12, 0.16, 0.20];
+            const cols = 12;
+            for (const row of scanRows) {
+                const y = viewportHeight * row;
+                for (let c = 0; c < cols; c++) {
+                    const x = ((c + 0.5) / cols) * viewportWidth;
+                    const stack = document.elementsFromPoint(x, y) || [];
+                    for (const node of stack.slice(0, 6)) {
+                        const clickable = clickableFrom(node);
+                        if (clickable) pool.add(clickable);
+                    }
+                }
+            }
+
+            const out = [];
+            for (const el of pool) {
+                if (!isVisible(el)) continue;
+                const rect = el.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+                if (cy > viewportHeight * 0.34 || cx < 0 || cx > viewportWidth) continue;
+
+                const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 64);
+                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                const tag = el.tagName.toLowerCase();
+                const cls = (el.className || '').toString().toLowerCase();
+
+                const score =
+                    (cy <= viewportHeight * 0.18 ? 120 : 70)
+                    + Math.max(0, 90 - Math.abs(cy - viewportHeight * 0.11) * 1.2)
+                    + (tag === 'a' || tag === 'button' ? 45 : 18)
+                    + (text.length > 0 ? 30 : 0)
+                    + (/nav|menu|tab|item/.test(cls) ? 28 : 0)
+                    + Math.min(rect.width * rect.height, 5000) * 0.006;
+
+                out.push({
+                    x: Math.max(2, Math.min(viewportWidth - 2, cx)),
+                    y: Math.max(2, Math.min(viewportHeight - 2, cy)),
+                    width: rect.width,
+                    height: rect.height,
+                    score,
+                    text,
+                    href,
+                    tag,
+                    key: `${tag}|${text.slice(0, 28)}|${href.slice(0, 36)}|${Math.round(cx)}:${Math.round(cy)}`,
+                });
+            }
+
+            return out;
+        }
+        """,
+        {
+            "viewportWidth": viewport_width,
+            "viewportHeight": viewport_height,
+        },
+    )
+
+    current_url = str(page.url or "")
+    safe = [
+        item for item in raw
+        if nav_signature(item) not in visited_nav_keys
+        and is_probable_top_nav_target(item, viewport_height)
+        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+    ]
+
+    unique: Dict[str, Dict[str, Any]] = {}
+    for item in safe:
+        family = nav_family_key(item)
+        prev = unique.get(family)
+        if prev is None or target_sort_score(item) > target_sort_score(prev):
+            unique[family] = item
+
+    ordered = list(unique.values())
+    ordered.sort(key=lambda item: (float(item.get("x", 0.0)), float(item.get("y", 0.0)), -target_sort_score(item)))
+    return ordered[:14]
+
+
 async def collect_top_nav_targets(
     page: Any,
     viewport_width: int,
@@ -872,6 +993,16 @@ async def collect_top_nav_targets(
     visited_nav_keys: Set[str],
 ) -> List[Dict[str, Any]]:
     """Собирает кандидатов верхней навигации и сортирует слева направо."""
+    header_nav = await collect_header_nav_targets(
+        page,
+        viewport_width,
+        viewport_height,
+        allow_internal_nav_click,
+        visited_nav_keys,
+    )
+    if header_nav:
+        return header_nav
+
     targets = await collect_interactive_targets(page, viewport_width, viewport_height, 80)
     current_url = str(page.url or "")
 
@@ -953,8 +1084,18 @@ async def visit_top_navigation_tabs(
         await page.mouse.click(tx, ty, delay=random.randint(28, 90))
         await page.wait_for_timeout(random.randint(350, 900))
 
-        after_tab = await get_page_activity_snapshot(page)
-        changed = page_state_changed(before_tab, after_tab)
+        # После клика мог произойти полный переход (navigation) — контекст JS уничтожается.
+        # Ловим ошибку и ждём загрузки новой страницы.
+        try:
+            after_tab = await get_page_activity_snapshot(page)
+            changed = page_state_changed(before_tab, after_tab)
+        except Exception:
+            # Контекст разрушен навигацией — значит переход точно произошёл.
+            changed = True
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
 
         if not changed:
             # Повторная попытка с легким смещением на случай мелких hitbox/overlay.
@@ -962,8 +1103,15 @@ async def visit_top_navigation_tabs(
             retry_y = clamp(ty + random.uniform(-6, 6), 1, viewport_height - 1)
             await page.mouse.click(retry_x, retry_y, delay=random.randint(24, 80))
             await page.wait_for_timeout(random.randint(260, 640))
-            after_retry = await get_page_activity_snapshot(page)
-            changed = page_state_changed(before_tab, after_retry)
+            try:
+                after_retry = await get_page_activity_snapshot(page)
+                changed = page_state_changed(before_tab, after_retry)
+            except Exception:
+                changed = True
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
 
         signature = nav_signature(target)
         visited_nav_keys.add(signature)
@@ -973,7 +1121,14 @@ async def visit_top_navigation_tabs(
         else:
             logger.info(f"🧭 Smart cursor: пропуск неактивной вкладки '{str(target.get('text', '')).strip()[:32]}'")
 
-        cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
+        try:
+            cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
+        except Exception:
+            # Навигация уничтожила контекст — ждём загрузки.
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
 
         if changed:
             await force_scroll_to_page_end(
@@ -1227,12 +1382,18 @@ async def run_smart_cursor(
         scroll_priority_mode = scroll_to_end and elapsed_ms >= (total_time_ms * 0.72)
 
         if round_index % close_check_interval == 0:
-            cursor_pos, _ = await try_close_overlay(
-                page,
-                cursor_pos,
-                viewport_width,
-                viewport_height,
-            )
+            try:
+                cursor_pos, _ = await try_close_overlay(
+                    page,
+                    cursor_pos,
+                    viewport_width,
+                    viewport_height,
+                )
+            except Exception:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
 
         if entry_click_enabled and round_index % 3 == 1:
             cursor_pos, clicked, clicked_key = await try_click_entry_element(

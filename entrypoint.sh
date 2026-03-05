@@ -5,6 +5,9 @@ echo "=========================================="
 echo "🚀 VPVoAe Renderer Entrypoint"
 echo "=========================================="
 
+# Очистка устаревших lock-файлов Xvfb (после аварийного перезапуска контейнера)
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+
 # Запуск Xvfb в фоне с поддержкой GLX
 echo "🖥️  Starting Xvfb on :99 with GLX support..."
 Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset -dpi 96 > /tmp/xvfb.log 2>&1 &
