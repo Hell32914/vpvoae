@@ -53,24 +53,92 @@ async def collect_interactive_targets(
                 'textarea',
                 '[role="button"]',
                 '[role="link"]',
+                '[role="menuitem"]',
                 '[onclick]',
                 '[tabindex]:not([tabindex="-1"])',
+                '[contenteditable="true"]',
+                '[aria-controls]',
+                '[data-action]',
                 '[data-hover]',
                 '[class*="btn"]',
                 '[class*="link"]',
-                '[aria-haspopup="true"]'
+                '[class*="card"]',
+                '[class*="tile"]',
+                '[aria-haspopup="true"]',
+                'video',
+                'canvas',
+                'summary'
             ];
 
-            const nodes = document.querySelectorAll(selectors.join(','));
-            const out = [];
+            const pool = new Set();
 
-            for (const el of nodes) {
+            function addIfElement(node) {
+                if (node && node instanceof HTMLElement) {
+                    pool.add(node);
+                }
+            }
+
+            function getClickable(node) {
+                if (!node || !(node instanceof Element)) return null;
+                const clickable = node.closest('a,button,input,select,textarea,summary,[role="button"],[role="link"],[role="menuitem"],[onclick],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[aria-controls],[data-action]');
+                if (clickable && clickable instanceof HTMLElement) return clickable;
+
+                if (node instanceof HTMLElement) {
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    const hasSize = rect.width >= 14 && rect.height >= 14;
+                    if (hasSize && (style.cursor === 'pointer' || node.tagName.toLowerCase() === 'canvas' || node.tagName.toLowerCase() === 'video')) {
+                        return node;
+                    }
+                }
+
+                return null;
+            }
+
+            function elementKey(el, cx, cy, text) {
+                const parts = [];
+                let cur = el;
+                let depth = 0;
+                while (cur && cur instanceof HTMLElement && depth < 5) {
+                    const cls = (cur.className || '').toString().trim().split(/\\s+/).slice(0, 2).join('.');
+                    parts.push(`${cur.tagName.toLowerCase()}${cur.id ? '#' + cur.id : ''}${cls ? '.' + cls : ''}`);
+                    cur = cur.parentElement;
+                    depth += 1;
+                }
+
+                return `${parts.join('>')}|${Math.round(cx)}:${Math.round(cy)}|${text.slice(0, 30)}`;
+            }
+
+            for (const node of document.querySelectorAll(selectors.join(','))) {
+                addIfElement(node);
+            }
+
+            // Grid scan помогает находить интерактивы на нестандартной верстке и canvas/UI-оверлеях.
+            const cols = 8;
+            const rows = 5;
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const x = ((c + 0.5) / cols) * viewportWidth;
+                    const y = ((r + 0.5) / rows) * viewportHeight;
+                    const stack = document.elementsFromPoint(x, y) || [];
+                    for (const node of stack.slice(0, 6)) {
+                        const clickable = getClickable(node);
+                        if (clickable) addIfElement(clickable);
+                    }
+                }
+            }
+
+            const out = [];
+            const diag = Math.hypot(viewportWidth, viewportHeight);
+
+            for (const el of pool) {
                 if (!(el instanceof HTMLElement)) continue;
 
                 const style = window.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
                     continue;
                 }
+                if (style.pointerEvents === 'none') continue;
 
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 10 || rect.height < 10) continue;
@@ -82,24 +150,30 @@ async def collect_interactive_targets(
                 const cy = rect.top + rect.height / 2;
                 if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
 
+                const topNode = document.elementFromPoint(cx, cy);
+                if (topNode && topNode instanceof Element && !el.contains(topNode) && !topNode.contains(el)) {
+                    continue;
+                }
+
                 const area = Math.min(rect.width * rect.height, 12000);
                 const distFromCenter = Math.hypot(cx - viewportWidth / 2, cy - viewportHeight / 2);
-                const centerScore = Math.max(0, 1 - distFromCenter / Math.hypot(viewportWidth / 2, viewportHeight / 2));
+                const centerScore = Math.max(0, 1 - distFromCenter / (diag * 0.55));
+                const edgeDist = Math.min(cx, cy, viewportWidth - cx, viewportHeight - cy);
+                const edgePenalty = edgeDist < 8 ? 40 : 0;
                 const pointerBoost = style.cursor === 'pointer' ? 120 : 0;
                 const tagBoost = ({ button: 170, a: 130, input: 110, select: 110, textarea: 100 })[el.tagName.toLowerCase()] || 80;
 
                 const text = (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 40);
-                const idPart = el.id ? `#${el.id}` : '';
-                const classPart = (el.className || '').toString().replace(/\\s+/g, '.').slice(0, 30);
-                const key = `${el.tagName}${idPart}.${classPart}|${Math.round(cx)}:${Math.round(cy)}|${text}`;
+                const key = elementKey(el, cx, cy, text);
                 const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                const dynamicBoost = /menu|nav|tab|card|tile|cta|action|play|pause|open/i.test((el.className || '').toString()) ? 30 : 0;
 
                 out.push({
                     x: Math.max(2, Math.min(viewportWidth - 2, cx)),
                     y: Math.max(2, Math.min(viewportHeight - 2, cy)),
                     width: rect.width,
                     height: rect.height,
-                    score: area * 0.02 + centerScore * 100 + pointerBoost + tagBoost,
+                    score: area * 0.02 + centerScore * 100 + pointerBoost + tagBoost + dynamicBoost - edgePenalty,
                     key,
                     text,
                     href,
@@ -108,7 +182,7 @@ async def collect_interactive_targets(
             }
 
             out.sort((a, b) => b.score - a.score);
-            return out.slice(0, Math.max(limit * 3, limit));
+            return out.slice(0, Math.max(limit * 4, limit));
         }
         """,
         {
@@ -680,6 +754,7 @@ async def run_smart_cursor(
     bottom_stable_rounds = 0
     last_scroll_y = -1
     stagnant_scroll_rounds = 0
+    recent_points: List[Tuple[float, float]] = []
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -754,6 +829,29 @@ async def run_smart_cursor(
             top_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[:8]
             target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
 
+        if target is None and candidates:
+            # Weighted fallback: повышаем шанс на элементы дальше от последних траекторий,
+            # чтобы курсор не циклился в одной зоне и выглядел естественно.
+            weighted_pool = sorted(candidates, key=lambda x: x["score"], reverse=True)[: min(12, len(candidates))]
+            if weighted_pool:
+                weights: List[float] = []
+                for item in weighted_pool:
+                    base_score = max(1.0, float(item.get("score", 1.0)))
+                    tx = float(item.get("x", viewport_width / 2))
+                    ty = float(item.get("y", viewport_height / 2))
+                    dist_from_cursor = math.hypot(tx - cursor_pos[0], ty - cursor_pos[1])
+                    novelty = 1.0
+                    if recent_points:
+                        near_recent = min(math.hypot(tx - px, ty - py) for px, py in recent_points)
+                        novelty = clamp(near_recent / max(viewport_width, viewport_height), 0.35, 1.35)
+                    distance_factor = clamp(dist_from_cursor / max(viewport_width, viewport_height), 0.45, 1.25)
+                    weights.append(base_score * novelty * distance_factor)
+
+                try:
+                    target = random.choices(weighted_pool, weights=weights, k=1)[0]
+                except Exception:
+                    target = weighted_pool[0]
+
         if target is not None:
             tx = float(target["x"])
             ty = float(target["y"])
@@ -766,6 +864,17 @@ async def run_smart_cursor(
                 random.randint(260, 860),
             )
             await page.wait_for_timeout(random.randint(40, 120))
+
+            # Небольшой "поиск" в границах элемента, чтобы надежнее триггерить hover на сложной верстке.
+            jitter_radius_x = max(2.0, min(float(target.get("width", 0.0)) * 0.12, 14.0))
+            jitter_radius_y = max(2.0, min(float(target.get("height", 0.0)) * 0.12, 12.0))
+            jx = clamp(tx + random.uniform(-jitter_radius_x, jitter_radius_x), 1, viewport_width - 1)
+            jy = clamp(ty + random.uniform(-jitter_radius_y, jitter_radius_y), 1, viewport_height - 1)
+            await page.mouse.move(jx, jy)
+            await page.wait_for_timeout(random.randint(24, 80))
+
+            hover_delay = random.randint(hover_min_ms, hover_max_ms)
+            await page.wait_for_timeout(hover_delay)
 
             target_key = str(target.get("key", ""))
             should_click = (
@@ -803,6 +912,9 @@ async def run_smart_cursor(
 
             hovered_count += 1
             visited_keys.add(target_key)
+            recent_points.append((tx, ty))
+            if len(recent_points) > 6:
+                recent_points.pop(0)
 
         if scroll_to_end:
             scroll_delta = int(viewport_height * random.uniform(0.60, 0.98) * scroll_speed_factor)
