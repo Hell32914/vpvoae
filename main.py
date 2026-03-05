@@ -418,7 +418,13 @@ async def try_click_entry_element(
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store",
     )
 
-    targets = await collect_activation_targets(page, viewport_width, viewport_height, 36)
+    try:
+        targets = await collect_activation_targets(page, viewport_width, viewport_height, 36)
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return cursor_pos, False, None
+        raise
     if not targets:
         return cursor_pos, False, None
 
@@ -502,37 +508,53 @@ async def try_click_entry_element(
 
 async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
     """Легкий снимок состояния страницы для оценки, произошли ли изменения после клика."""
-    return await page.evaluate(
-        """
-        () => {
-            const text = (document.body?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 300);
-            return {
-                url: location.href,
-                scrollY: window.scrollY,
-                height: document.documentElement?.scrollHeight || 0,
-                title: document.title || '',
-                text
-            };
-        }
-        """
-    )
+    _default = {"url": str(page.url or ""), "scrollY": 0, "height": 0, "title": "", "text": ""}
+    try:
+        result = await page.evaluate(
+            """
+            () => {
+                const text = (document.body?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 300);
+                return {
+                    url: location.href,
+                    scrollY: window.scrollY,
+                    height: document.documentElement?.scrollHeight || 0,
+                    title: document.title || '',
+                    text
+                };
+            }
+            """
+        )
+        return result if isinstance(result, dict) else _default
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return _default
+        raise
 
 
 async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
-    return await page.evaluate(
-        """
-        () => {
-            const doc = document.documentElement;
-            const scrollY = Math.round(window.scrollY || 0);
-            const maxScroll = Math.max(0, Math.round((doc?.scrollHeight || 0) - (window.innerHeight || 0)));
-            return {
-                scrollY,
-                maxScroll,
-                atBottom: scrollY >= (maxScroll - 3),
-            };
-        }
-        """
-    )
+    _default = {"scrollY": 0, "maxScroll": 0, "atBottom": False}
+    try:
+        result = await page.evaluate(
+            """
+            () => {
+                const doc = document.documentElement;
+                const scrollY = Math.round(window.scrollY || 0);
+                const maxScroll = Math.max(0, Math.round((doc?.scrollHeight || 0) - (window.innerHeight || 0)));
+                return {
+                    scrollY,
+                    maxScroll,
+                    atBottom: scrollY >= (maxScroll - 3),
+                };
+            }
+            """
+        )
+        return result if isinstance(result, dict) else _default
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return _default
+        raise
 
 
 def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
@@ -598,6 +620,36 @@ def is_nav_tab_self_link(target: Dict[str, Any], current_url: str) -> bool:
     current_path = current_parts.path.rstrip("/")
     resolved_path = resolved_parts.path.rstrip("/")
     return resolved_path == current_path and (resolved_parts.query or "") == (current_parts.query or "")
+
+
+def _is_nav_error(exc: Exception) -> bool:
+    """Check if exception was caused by page navigation destroying the JS execution context."""
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "execution context was destroyed",
+        "navigat",
+        "target closed",
+        "frame was detached",
+        "frame has been detached",
+        "context was destroyed",
+    ))
+
+
+async def _recover_after_nav(page, timeout: int = 15000) -> None:
+    """Wait for the page to stabilize after an unexpected navigation."""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=min(timeout, 8000))
+    except Exception:
+        pass
+    # Small grace period for JS frameworks to hydrate.
+    try:
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 
 def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_internal_nav_click: bool) -> bool:
@@ -768,7 +820,13 @@ async def try_close_overlay(
     viewport_height: int,
 ) -> Tuple[Tuple[float, float], bool]:
     """Пытается закрыть открытые модалки/lightbox, чтобы курсор не застревал в галерее."""
-    before = await get_page_activity_snapshot(page)
+    try:
+        before = await get_page_activity_snapshot(page)
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return cursor_pos, False
+        raise
 
     try:
         await page.keyboard.press("Escape")
@@ -776,27 +834,46 @@ async def try_close_overlay(
     except Exception:
         pass
 
-    close_targets = await collect_close_targets(page, viewport_width, viewport_height)
+    try:
+        close_targets = await collect_close_targets(page, viewport_width, viewport_height)
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return cursor_pos, False
+        raise
+
     for item in close_targets[:2]:
         tx = float(item.get("x", viewport_width * 0.92))
         ty = float(item.get("y", viewport_height * 0.08))
 
-        cursor_pos = await move_mouse_human_like(
-            page,
-            cursor_pos,
-            (tx, ty),
-            viewport_width,
-            viewport_height,
-            random.randint(220, 540),
-        )
-        await page.wait_for_timeout(random.randint(50, 120))
-        await page.mouse.click(tx, ty, delay=random.randint(28, 90))
-        await page.wait_for_timeout(random.randint(160, 340))
+        try:
+            cursor_pos = await move_mouse_human_like(
+                page,
+                cursor_pos,
+                (tx, ty),
+                viewport_width,
+                viewport_height,
+                random.randint(220, 540),
+            )
+            await page.wait_for_timeout(random.randint(50, 120))
+            await page.mouse.click(tx, ty, delay=random.randint(28, 90))
+            await page.wait_for_timeout(random.randint(160, 340))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                return cursor_pos, True
+            raise
 
-        after = await get_page_activity_snapshot(page)
-        if page_state_changed(before, after):
-            logger.info("🖱️ Smart cursor: закрыта модалка/галерея")
-            return cursor_pos, True
+        try:
+            after = await get_page_activity_snapshot(page)
+            if page_state_changed(before, after):
+                logger.info("🖱️ Smart cursor: закрыта модалка/галерея")
+                return cursor_pos, True
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                return cursor_pos, True
+            raise
 
     return cursor_pos, False
 
@@ -816,10 +893,13 @@ async def perform_smooth_scroll(
     for _ in range(steps):
         step_delta = max(12, int(base_step + random.uniform(-18, 22)))
         await page.mouse.wheel(0, step_delta)
-        await page.evaluate(
-            """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
-            step_delta,
-        )
+        try:
+            await page.evaluate(
+                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
+                step_delta,
+            )
+        except Exception:
+            pass
         await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
 
 
@@ -889,7 +969,8 @@ async def collect_header_nav_targets(
     visited_nav_keys: Set[str],
 ) -> List[Dict[str, Any]]:
     """Целенаправленно собирает пункты верхнего меню/вкладок из header/nav-структур."""
-    raw = await page.evaluate(
+    try:
+        raw = await page.evaluate(
         """
         ({ viewportWidth, viewportHeight }) => {
             function isVisible(el) {
@@ -981,10 +1062,15 @@ async def collect_header_nav_targets(
             "viewportHeight": viewport_height,
         },
     )
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return []
+        raise
 
     current_url = str(page.url or "")
     safe = [
-        item for item in raw
+        item for item in (raw or [])
         if nav_signature(item) not in visited_nav_keys
         and is_probable_top_nav_target(item, viewport_height)
         and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
@@ -1011,17 +1097,29 @@ async def collect_top_nav_targets(
     visited_nav_keys: Set[str],
 ) -> List[Dict[str, Any]]:
     """Собирает кандидатов верхней навигации и сортирует слева направо."""
-    header_nav = await collect_header_nav_targets(
-        page,
-        viewport_width,
-        viewport_height,
-        allow_internal_nav_click,
-        visited_nav_keys,
-    )
+    try:
+        header_nav = await collect_header_nav_targets(
+            page,
+            viewport_width,
+            viewport_height,
+            allow_internal_nav_click,
+            visited_nav_keys,
+        )
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return []
+        raise
     if header_nav:
         return header_nav
 
-    targets = await collect_interactive_targets(page, viewport_width, viewport_height, 80)
+    try:
+        targets = await collect_interactive_targets(page, viewport_width, viewport_height, 80)
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return []
+        raise
     current_url = str(page.url or "")
 
     candidates = [
@@ -1072,14 +1170,24 @@ async def visit_top_navigation_tabs(
     if max_nav_tabs_to_visit <= 0:
         return cursor_pos, visited_count
 
-    for _ in range(max_nav_tabs_to_visit):
-        nav_targets = await collect_top_nav_targets(
-            page,
-            viewport_width,
-            viewport_height,
-            allow_internal_nav_click,
-            visited_nav_keys,
-        )
+    original_url = str(page.url or "")
+
+    for tab_iter in range(max_nav_tabs_to_visit):
+        # ── Вся итерация обёрнута для отказоустойчивости ──
+        try:
+            nav_targets = await collect_top_nav_targets(
+                page,
+                viewport_width,
+                viewport_height,
+                allow_internal_nav_click,
+                visited_nav_keys,
+            )
+        except Exception as exc:
+            if _is_nav_error(exc):
+                logger.warning("⚠️ Smart cursor: навигация при сборе вкладок, восстанавливаемся")
+                await _recover_after_nav(page)
+                continue
+            raise
 
         if not nav_targets:
             break
@@ -1092,51 +1200,92 @@ async def visit_top_navigation_tabs(
             visited_nav_keys.add(nav_signature(target))
             continue
 
-        before_tab = await get_page_activity_snapshot(page)
+        try:
+            before_tab = await get_page_activity_snapshot(page)
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                before_tab = {"url": current_url, "scrollY": 0, "height": 0, "title": "", "text": ""}
+            else:
+                raise
 
         tx = float(target.get("x", viewport_width * 0.5))
         ty = float(target.get("y", viewport_height * 0.12))
 
-        cursor_pos = await move_mouse_human_like(
-            page,
-            cursor_pos,
-            (tx, ty),
-            viewport_width,
-            viewport_height,
-            random.randint(280, 760),
-        )
-        await page.wait_for_timeout(random.randint(60, 180))
-        await page.mouse.click(tx, ty, delay=random.randint(28, 90))
-        await page.wait_for_timeout(random.randint(350, 900))
+        try:
+            cursor_pos = await move_mouse_human_like(
+                page,
+                cursor_pos,
+                (tx, ty),
+                viewport_width,
+                viewport_height,
+                random.randint(280, 760),
+            )
+            await page.wait_for_timeout(random.randint(60, 180))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                visited_nav_keys.add(nav_signature(target))
+                continue
+            raise
 
-        # После клика мог произойти полный переход (navigation) — контекст JS уничтожается.
-        # Ловим ошибку и ждём загрузки новой страницы.
+        # Запоминаем URL до клика для обнаружения навигации.
+        url_before_click = str(page.url or "")
+
+        try:
+            await page.mouse.click(tx, ty, delay=random.randint(28, 90))
+            await page.wait_for_timeout(random.randint(350, 900))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                visited_nav_keys.add(nav_signature(target))
+                visited_count += 1
+                logger.info(f"🧭 Smart cursor: вкладка вызвала навигацию '{str(target.get('text', '')).strip()[:32]}'")
+                # Скроллим новую страницу и возвращаемся.
+                await _scroll_and_return(
+                    page, original_url, viewport_height, scroll_speed_factor,
+                    scroll_pause_min_ms, scroll_pause_max_ms, per_tab_scroll_timeout_ms
+                )
+                continue
+            raise
+
+        # Проверяем, изменился ли URL (быстрая проверка без evaluate).
+        url_after_click = str(page.url or "")
+        navigated_away = url_after_click != url_before_click
+
+        # Если URL изменился — ждём загрузки новой страницы.
+        if navigated_away:
+            await _recover_after_nav(page)
+
+        # Проверяем состояние страницы.
         try:
             after_tab = await get_page_activity_snapshot(page)
-            changed = page_state_changed(before_tab, after_tab)
+            changed = page_state_changed(before_tab, after_tab) or navigated_away
         except Exception:
-            # Контекст разрушен навигацией — значит переход точно произошёл.
             changed = True
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
+            await _recover_after_nav(page)
 
         if not changed:
             # Повторная попытка с легким смещением на случай мелких hitbox/overlay.
             retry_x = clamp(tx + random.uniform(-8, 8), 1, viewport_width - 1)
             retry_y = clamp(ty + random.uniform(-6, 6), 1, viewport_height - 1)
-            await page.mouse.click(retry_x, retry_y, delay=random.randint(24, 80))
-            await page.wait_for_timeout(random.randint(260, 640))
+            try:
+                await page.mouse.click(retry_x, retry_y, delay=random.randint(24, 80))
+                await page.wait_for_timeout(random.randint(260, 640))
+            except Exception:
+                pass
+
+            url_after_retry = str(page.url or "")
+            if url_after_retry != url_before_click:
+                navigated_away = True
+                await _recover_after_nav(page)
+
             try:
                 after_retry = await get_page_activity_snapshot(page)
-                changed = page_state_changed(before_tab, after_retry)
+                changed = page_state_changed(before_tab, after_retry) or navigated_away
             except Exception:
                 changed = True
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
+                await _recover_after_nav(page)
 
         signature = nav_signature(target)
         visited_nav_keys.add(signature)
@@ -1146,24 +1295,40 @@ async def visit_top_navigation_tabs(
         else:
             logger.info(f"🧭 Smart cursor: пропуск неактивной вкладки '{str(target.get('text', '')).strip()[:32]}'")
 
+        # Закрытие модалок (полностью безопасно — try_close_overlay уже nav-safe).
         try:
             cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
         except Exception:
-            # Навигация уничтожила контекст — ждём загрузки.
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
+            await _recover_after_nav(page)
 
         if changed:
-            await force_scroll_to_page_end(
-                page,
-                viewport_height,
-                scroll_speed_factor,
-                scroll_pause_min_ms,
-                scroll_pause_max_ms,
-                per_tab_scroll_timeout_ms,
-            )
+            try:
+                await force_scroll_to_page_end(
+                    page,
+                    viewport_height,
+                    scroll_speed_factor,
+                    scroll_pause_min_ms,
+                    scroll_pause_max_ms,
+                    per_tab_scroll_timeout_ms,
+                )
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    logger.warning(f"⚠️ Smart cursor: ошибка при скролле вкладки: {exc}")
+
+        # Если навигация увела на другую страницу, возвращаемся на оригинальную.
+        current_after = str(page.url or "")
+        if navigated_away and current_after != original_url:
+            try:
+                await page.goto(original_url, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(random.randint(400, 900))
+            except Exception:
+                try:
+                    await page.go_back(wait_until="domcontentloaded", timeout=10000)
+                    await page.wait_for_timeout(random.randint(300, 700))
+                except Exception:
+                    pass
 
         # Возвращаемся к верху, чтобы снова видеть вкладки.
         try:
@@ -1173,6 +1338,37 @@ async def visit_top_navigation_tabs(
             pass
 
     return cursor_pos, visited_count
+
+
+async def _scroll_and_return(
+    page: Any,
+    original_url: str,
+    viewport_height: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+    scroll_timeout_ms: int,
+) -> None:
+    """Прокручивает текущую страницу до конца и возвращается на original_url."""
+    try:
+        await force_scroll_to_page_end(
+            page, viewport_height, scroll_speed_factor,
+            scroll_pause_min_ms, scroll_pause_max_ms, scroll_timeout_ms,
+        )
+    except Exception:
+        pass
+
+    current = str(page.url or "")
+    if current != original_url:
+        try:
+            await page.goto(original_url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(random.randint(400, 900))
+        except Exception:
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=10000)
+                await page.wait_for_timeout(random.randint(300, 700))
+            except Exception:
+                pass
 
 
 async def perform_forced_activation_clicks(
@@ -1209,19 +1405,22 @@ async def perform_forced_activation_clicks(
         await page.mouse.click(cx, cy, delay=random.randint(30, 120))
 
         # Дополнительно инициируем click по верхнему DOM-элементу в точке.
-        await page.evaluate(
-            """
-            ({ x, y }) => {
-                const node = document.elementFromPoint(x, y);
-                if (!node || !(node instanceof Element)) return false;
-                const clickable = node.closest('a,button,[role="button"],[onclick],[tabindex]:not([tabindex="-1"])') || node;
-                if (!(clickable instanceof HTMLElement)) return false;
-                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                return true;
-            }
-            """,
-            {"x": cx, "y": cy},
-        )
+        try:
+            await page.evaluate(
+                """
+                ({ x, y }) => {
+                    const node = document.elementFromPoint(x, y);
+                    if (!node || !(node instanceof Element)) return false;
+                    const clickable = node.closest('a,button,[role="button"],[onclick],[tabindex]:not([tabindex="-1"])') || node;
+                    if (!(clickable instanceof HTMLElement)) return false;
+                    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                }
+                """,
+                {"x": cx, "y": cy},
+            )
+        except Exception:
+            pass
 
         await page.wait_for_timeout(random.randint(500, 1200))
         try:
@@ -1229,10 +1428,16 @@ async def perform_forced_activation_clicks(
         except Exception:
             pass
 
-        snapshot_after = await get_page_activity_snapshot(page)
-        if page_state_changed(snapshot_before, snapshot_after):
-            logger.info("🖱️ Smart cursor: fallback-клик изменил состояние страницы")
-            return cursor_pos, True
+        try:
+            snapshot_after = await get_page_activity_snapshot(page)
+            if page_state_changed(snapshot_before, snapshot_after):
+                logger.info("🖱️ Smart cursor: fallback-клик изменил состояние страницы")
+                return cursor_pos, True
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                return cursor_pos, True
+            raise
 
     return cursor_pos, False
 
@@ -1341,13 +1546,19 @@ async def run_smart_cursor(
 
     if entry_click_enabled:
         for _ in range(max(entry_click_attempts, 0)):
-            cursor_pos, clicked, clicked_key = await try_click_entry_element(
-                page=page,
-                cursor_pos=cursor_pos,
-                viewport_width=viewport_width,
-                viewport_height=viewport_height,
-                clicked_keys=clicked_entry_keys,
-            )
+            try:
+                cursor_pos, clicked, clicked_key = await try_click_entry_element(
+                    page=page,
+                    cursor_pos=cursor_pos,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    clicked_keys=clicked_entry_keys,
+                )
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                    break
+                raise
             if not clicked:
                 break
             if clicked_key:
@@ -1358,16 +1569,23 @@ async def run_smart_cursor(
     # Приоритет 1: гарантированно пройти главную страницу до конца.
     if scroll_to_end:
         main_scroll_timeout = max(6000, min(scroll_finish_timeout_ms, int(total_time_ms * 0.32)))
-        reached_main_end = await force_scroll_to_page_end(
-            page,
-            viewport_height,
-            scroll_speed_factor,
-            scroll_pause_min_ms,
-            scroll_pause_max_ms,
-            main_scroll_timeout,
-        )
-        if reached_main_end:
-            logger.info("🧭 Smart cursor: главная страница прокручена до конца")
+        try:
+            reached_main_end = await force_scroll_to_page_end(
+                page,
+                viewport_height,
+                scroll_speed_factor,
+                scroll_pause_min_ms,
+                scroll_pause_max_ms,
+                main_scroll_timeout,
+            )
+            if reached_main_end:
+                logger.info("🧭 Smart cursor: главная страница прокручена до конца")
+        except Exception as exc:
+            if _is_nav_error(exc):
+                logger.warning("⚠️ Smart cursor: навигация при начальном скролле, восстанавливаемся")
+                await _recover_after_nav(page)
+            else:
+                logger.warning(f"⚠️ Smart cursor: ошибка при начальном скролле: {exc}")
 
         try:
             await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -1395,10 +1613,7 @@ async def run_smart_cursor(
                 logger.info(f"🧭 Smart cursor: последовательно пройдено вкладок {visited_nav_count}")
         except Exception as nav_err:
             logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок, продолжаем: {nav_err}")
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
+            await _recover_after_nav(page)
 
     try:
         last_scroll_y = int((await get_scroll_metrics(page)).get("scrollY", 0))
@@ -1428,18 +1643,30 @@ async def run_smart_cursor(
                     pass
 
         if entry_click_enabled and round_index % 3 == 1:
-            cursor_pos, clicked, clicked_key = await try_click_entry_element(
-                page=page,
-                cursor_pos=cursor_pos,
-                viewport_width=viewport_width,
-                viewport_height=viewport_height,
-                clicked_keys=clicked_entry_keys,
-            )
-            if clicked and clicked_key:
-                clicked_entry_keys.add(clicked_key)
+            try:
+                cursor_pos, clicked, clicked_key = await try_click_entry_element(
+                    page=page,
+                    cursor_pos=cursor_pos,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    clicked_keys=clicked_entry_keys,
+                )
+                if clicked and clicked_key:
+                    clicked_entry_keys.add(clicked_key)
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                # Non-critical, continue
 
         scan_limit = max(40, max_targets if max_targets > 0 else 40)
-        targets = await collect_interactive_targets(page, viewport_width, viewport_height, scan_limit)
+        try:
+            targets = await collect_interactive_targets(page, viewport_width, viewport_height, scan_limit)
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                targets = []
+            else:
+                targets = []
         candidates = [item for item in targets if str(item.get("key", "")) not in visited_keys]
 
         current_url = str(page.url or "")
@@ -1617,18 +1844,25 @@ async def run_smart_cursor(
                 break
 
     if scroll_to_end:
-        reached_end = await force_scroll_to_page_end(
-            page,
-            viewport_height,
-            scroll_speed_factor,
-            scroll_pause_min_ms,
-            scroll_pause_max_ms,
-            scroll_finish_timeout_ms,
-        )
-        if reached_end:
-            logger.info("🧭 Smart cursor: финальным проходом достигнут конец страницы")
-        else:
-            logger.warning("⚠️ Smart cursor: не удалось гарантированно дойти до конца страницы в отведенный таймаут")
+        try:
+            reached_end = await force_scroll_to_page_end(
+                page,
+                viewport_height,
+                scroll_speed_factor,
+                scroll_pause_min_ms,
+                scroll_pause_max_ms,
+                scroll_finish_timeout_ms,
+            )
+            if reached_end:
+                logger.info("🧭 Smart cursor: финальным проходом достигнут конец страницы")
+            else:
+                logger.warning("⚠️ Smart cursor: не удалось гарантированно дойти до конца страницы в отведенный таймаут")
+        except Exception as exc:
+            if _is_nav_error(exc):
+                logger.warning("⚠️ Smart cursor: навигация при финальном скролле")
+                await _recover_after_nav(page)
+            else:
+                logger.warning(f"⚠️ Smart cursor: ошибка при финальном скролле: {exc}")
 
     logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
     return hovered_count
