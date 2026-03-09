@@ -43,10 +43,10 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - vpvoae-output:/app/output
-    cpu_shares: 1024
-    mem_limit: 2G
-    memswap_limit: 3G
-    shm_size: 2G
+    cpu_shares: ${CPU_SHARES:-1024}
+    mem_limit: ${MEMORY_LIMIT:-2G}
+    memswap_limit: ${MEMSWAP_LIMIT:-3G}
+    shm_size: ${SHM_SIZE:-2G}
     logging:
       driver: "json-file"
       options:
