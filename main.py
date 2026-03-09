@@ -1427,14 +1427,22 @@ async def run_strict_top_to_bottom_pass(
         try:
             after_metrics = await get_scroll_metrics(page)
             current_scroll_y = int(after_metrics.get("scrollY", scroll_y))
+            max_scroll_y = int(after_metrics.get("maxScroll", 0))
             at_bottom = bool(after_metrics.get("atBottom", at_bottom_now))
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
                 current_scroll_y = max(last_scroll_y, scroll_y)
+                max_scroll_y = 0
                 at_bottom = False
             else:
                 raise
+
+        if round_index % 12 == 0:
+            logger.info(
+                f"🧭 Strict progress: scrollY={current_scroll_y}, maxScroll={max_scroll_y}, "
+                f"stagnant={stagnant_rounds}, hovered={hovered_count}"
+            )
 
         if current_scroll_y <= last_scroll_y + 3:
             stagnant_rounds += 1
