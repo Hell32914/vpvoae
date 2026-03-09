@@ -893,14 +893,321 @@ async def perform_smooth_scroll(
     for _ in range(steps):
         step_delta = max(12, int(base_step + random.uniform(-18, 22)))
         await page.mouse.wheel(0, step_delta)
-        try:
-            await page.evaluate(
-                """(delta) => window.scrollBy({ top: delta, left: 0, behavior: 'auto' })""",
-                step_delta,
-            )
-        except Exception:
-            pass
         await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
+
+
+async def collect_document_interaction_targets(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Сканирует DOM до скролла и возвращает интерактивные цели с абсолютной Y-координатой."""
+    return await page.evaluate(
+        """
+        ({ viewportWidth, viewportHeight, limit }) => {
+            const selectors = [
+                'a[href]',
+                'button',
+                'input:not([type="hidden"])',
+                'select',
+                'textarea',
+                '[role="button"]',
+                '[role="link"]',
+                '[role="menuitem"]',
+                '[onclick]',
+                '[tabindex]:not([tabindex="-1"])',
+                '[contenteditable="true"]',
+                '[aria-controls]',
+                '[data-action]',
+                '[data-hover]',
+                '[class*="btn"]',
+                '[class*="link"]',
+                '[class*="card"]',
+                '[class*="tile"]',
+                'video',
+                'canvas',
+                'summary'
+            ];
+
+            const pool = new Set();
+            for (const node of document.querySelectorAll(selectors.join(','))) {
+                if (node instanceof HTMLElement) pool.add(node);
+            }
+
+            const clampValue = (value, minValue, maxValue) => Math.max(minValue, Math.min(maxValue, value));
+            const doc = document.documentElement;
+            const body = document.body;
+            const docHeight = Math.max(
+                doc?.scrollHeight || 0,
+                body?.scrollHeight || 0,
+                viewportHeight,
+            );
+
+            function elementKey(el, absX, absY, text) {
+                const parts = [];
+                let cur = el;
+                let depth = 0;
+                while (cur && cur instanceof HTMLElement && depth < 5) {
+                    const cls = (cur.className || '').toString().trim().split(/\\s+/).slice(0, 2).join('.');
+                    parts.push(`${cur.tagName.toLowerCase()}${cur.id ? '#' + cur.id : ''}${cls ? '.' + cls : ''}`);
+                    cur = cur.parentElement;
+                    depth += 1;
+                }
+                return `${parts.join('>')}|${Math.round(absX)}:${Math.round(absY)}|${text.slice(0, 30)}`;
+            }
+
+            const out = [];
+            for (const el of pool) {
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
+                    continue;
+                }
+                if (style.pointerEvents === 'none') continue;
+
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 10 || rect.height < 10) continue;
+
+                const absX = rect.left + (window.scrollX || 0) + rect.width / 2;
+                const absY = rect.top + (window.scrollY || 0) + rect.height / 2;
+                if (!Number.isFinite(absX) || !Number.isFinite(absY)) continue;
+                if (absY < -120 || absY > docHeight + 260) continue;
+
+                const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 72);
+                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                const tag = el.tagName.toLowerCase();
+                const key = elementKey(el, absX, absY, text);
+
+                const pointerBoost = style.cursor === 'pointer' ? 90 : 0;
+                const tagBoost = ({ button: 100, a: 90, input: 70, select: 70, textarea: 65, video: 55, canvas: 55 })[tag] || 45;
+                const textBoost = text.length > 0 ? 24 : 0;
+                const areaBoost = Math.min(rect.width * rect.height, 12000) * 0.01;
+
+                out.push({
+                    key,
+                    x: clampValue(absX, 2, viewportWidth - 2),
+                    absY: Math.max(1, absY),
+                    width: rect.width,
+                    height: rect.height,
+                    score: pointerBoost + tagBoost + textBoost + areaBoost,
+                    text,
+                    href,
+                    tag,
+                });
+            }
+
+            out.sort((a, b) => (a.absY - b.absY) || (b.score - a.score));
+            return out.slice(0, Math.max(limit, 1));
+        }
+        """,
+        {
+            "viewportWidth": viewport_width,
+            "viewportHeight": viewport_height,
+            "limit": limit,
+        },
+    )
+
+
+async def run_strict_top_to_bottom_pass(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+    total_time_ms: int,
+    max_targets: int,
+    hover_min_ms: int,
+    hover_max_ms: int,
+    bottom_stable_rounds_required: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+    inpage_click_enabled: bool,
+    inpage_click_probability: float,
+) -> Tuple[Tuple[float, float], int, bool]:
+    """Однонаправленный проход сверху вниз: hover-эффекты + безопасные in-page клики без навигации."""
+    hovered_count = 0
+    reached_bottom = False
+    visited_keys: Set[str] = set()
+    clicked_keys: Set[str] = set()
+    analysis_targets: List[Dict[str, Any]] = []
+
+    widget_action_words = (
+        "accept", "reset", "submit", "next", "confirm", "apply",
+        "calculate", "done", "save", "select", "choose", "finish",
+    )
+
+    try:
+        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+        await page.wait_for_timeout(random.randint(180, 420))
+    except Exception:
+        pass
+
+    started_at = time.monotonic()
+    last_scroll_y = -1
+    stagnant_rounds = 0
+    bottom_stable_rounds = 0
+    round_index = 0
+    last_analysis_round = -1000
+
+    while (time.monotonic() - started_at) * 1000 < total_time_ms:
+        round_index += 1
+
+        if round_index == 1 or (round_index - last_analysis_round) >= 8:
+            try:
+                analysis_targets = await collect_document_interaction_targets(
+                    page=page,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    limit=1200,
+                )
+                last_analysis_round = round_index
+                if round_index == 1:
+                    logger.info(f"🧭 Smart cursor: DOM анализ до скролла, найдено целей={len(analysis_targets)}")
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                    analysis_targets = []
+                else:
+                    raise
+
+        try:
+            metrics = await get_scroll_metrics(page)
+            scroll_y = int(metrics.get("scrollY", max(last_scroll_y, 0)))
+            at_bottom_now = bool(metrics.get("atBottom", False))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                scroll_y = max(last_scroll_y, 0)
+                at_bottom_now = False
+            else:
+                raise
+
+        can_interact = (max_targets <= 0) or (hovered_count < max_targets)
+        if can_interact and analysis_targets:
+            viewport_top = scroll_y + int(viewport_height * 0.16)
+            viewport_bottom = scroll_y + int(viewport_height * 0.86)
+
+            candidates = [
+                item for item in analysis_targets
+                if str(item.get("key", "")) not in visited_keys
+                and viewport_top <= int(float(item.get("absY", 0.0))) <= viewport_bottom
+                and not is_probable_top_nav_target(item, viewport_height)
+            ]
+
+            if candidates:
+                pool = candidates[: min(6, len(candidates))]
+                target = random.choice(pool[:3] if len(pool) >= 3 else pool)
+
+                tx = clamp(float(target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
+                ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
+                target_key = str(target.get("key", ""))
+
+                try:
+                    cursor_pos = await move_mouse_human_like(
+                        page=page,
+                        start=cursor_pos,
+                        end=(tx, ty),
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                        duration_ms=random.randint(220, 640),
+                    )
+                    await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                        continue
+
+                visited_keys.add(target_key)
+                hovered_count += 1
+
+                should_click = (
+                    inpage_click_enabled
+                    and target_key not in clicked_keys
+                    and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=False)
+                )
+                click_probability = min(inpage_click_probability, 0.24)
+                if has_keyword(str(target.get("text", "")), widget_action_words):
+                    click_probability = max(click_probability, 0.34)
+
+                if should_click and random.random() < click_probability:
+                    before_url = str(page.url or "")
+                    before_scroll = scroll_y
+                    try:
+                        await page.mouse.click(tx, ty, delay=random.randint(35, 105))
+                        await page.wait_for_timeout(random.randint(130, 300))
+                    except Exception as exc:
+                        if _is_nav_error(exc):
+                            await _recover_after_nav(page)
+                            continue
+                    clicked_keys.add(target_key)
+
+                    after_url = str(page.url or "")
+                    if after_url != before_url:
+                        logger.info("🖱️ Smart cursor: пойман нежелательный переход, откатываемся назад")
+                        try:
+                            await page.go_back(wait_until="domcontentloaded", timeout=5000)
+                            await page.wait_for_timeout(random.randint(280, 520))
+                        except Exception:
+                            pass
+                        await _recover_after_nav(page)
+                        try:
+                            await page.evaluate(
+                                """(top) => window.scrollTo({ top, left: 0, behavior: 'auto' })""",
+                                int(before_scroll),
+                            )
+                        except Exception:
+                            pass
+
+        if round_index % 4 == 0:
+            try:
+                cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
+            except Exception:
+                pass
+
+        await perform_smooth_scroll(
+            page=page,
+            viewport_height=viewport_height,
+            scroll_speed_factor=scroll_speed_factor,
+            scroll_pause_min_ms=scroll_pause_min_ms,
+            scroll_pause_max_ms=scroll_pause_max_ms,
+        )
+
+        try:
+            after_metrics = await get_scroll_metrics(page)
+            current_scroll_y = int(after_metrics.get("scrollY", scroll_y))
+            at_bottom = bool(after_metrics.get("atBottom", at_bottom_now))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                current_scroll_y = max(last_scroll_y, scroll_y)
+                at_bottom = False
+            else:
+                raise
+
+        if current_scroll_y <= last_scroll_y + 3:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+
+        if stagnant_rounds >= 3:
+            try:
+                await page.mouse.wheel(0, int(viewport_height * 0.62))
+                await page.wait_for_timeout(random.randint(60, 130))
+            except Exception:
+                pass
+            stagnant_rounds = 0
+
+        last_scroll_y = max(last_scroll_y, current_scroll_y)
+        if at_bottom:
+            bottom_stable_rounds += 1
+        else:
+            bottom_stable_rounds = 0
+
+        if bottom_stable_rounds >= bottom_stable_rounds_required:
+            reached_bottom = True
+            break
+
+    return cursor_pos, hovered_count, reached_bottom
 
 
 async def force_scroll_to_page_end(
@@ -1524,6 +1831,7 @@ async def run_smart_cursor(
     inpage_click_enabled: bool,
     inpage_click_probability: float,
     allow_internal_nav_click: bool,
+    strict_top_to_bottom_mode: bool,
 ) -> int:
     """Фазовый обход сайта: сначала полный скролл, потом вкладки и интерактив."""
     start_time = time.monotonic()
@@ -1562,6 +1870,32 @@ async def run_smart_cursor(
                 break
             if clicked_key:
                 clicked_entry_keys.add(clicked_key)
+
+    if strict_top_to_bottom_mode:
+        logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
+        cursor_pos, strict_hovered, reached_bottom = await run_strict_top_to_bottom_pass(
+            page=page,
+            cursor_pos=cursor_pos,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            total_time_ms=total_time_ms,
+            max_targets=max_targets,
+            hover_min_ms=hover_min_ms,
+            hover_max_ms=hover_max_ms,
+            bottom_stable_rounds_required=bottom_stable_rounds_required,
+            scroll_speed_factor=scroll_speed_factor,
+            scroll_pause_min_ms=scroll_pause_min_ms,
+            scroll_pause_max_ms=scroll_pause_max_ms,
+            inpage_click_enabled=inpage_click_enabled,
+            inpage_click_probability=inpage_click_probability,
+        )
+        hovered_count += strict_hovered
+        if reached_bottom:
+            logger.info("🧭 Smart cursor: STRICT проход завершен, страница просмотрена до конца")
+        else:
+            logger.warning("⚠️ Smart cursor: STRICT проход завершился по таймауту до достижения конца страницы")
+        logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
+        return hovered_count
 
     # ════════════════════════════════════════════════════════════════
     # ФАЗА 1: Полный скролл главной страницы до самого конца
@@ -1919,12 +2253,13 @@ async def main():
         scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '25'))
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
         scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '22000'))
-        nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', True)
+        nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', False)
         nav_tabs_max_visits = int(os.getenv('SMART_CURSOR_NAV_TABS_MAX_VISITS', '10'))
         nav_tab_scroll_timeout_ms = int(os.getenv('SMART_CURSOR_NAV_TAB_SCROLL_TIMEOUT_MS', '17000'))
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
-        inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.28'))
-        allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', True)
+        inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.18'))
+        allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', False)
+        strict_top_to_bottom_mode = env_bool('SMART_CURSOR_STRICT_TOP_TO_BOTTOM', True)
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
         browser_app_mode = env_bool('BROWSER_APP_MODE', True)
 
@@ -1947,6 +2282,7 @@ async def main():
         logger.info(f"Display: {os.getenv('DISPLAY', ':99')}")
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
+        logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
         
@@ -2031,6 +2367,7 @@ async def main():
                     inpage_click_enabled=inpage_click_enabled,
                     inpage_click_probability=inpage_click_probability,
                     allow_internal_nav_click=allow_internal_nav_click,
+                    strict_top_to_bottom_mode=strict_top_to_bottom_mode,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
