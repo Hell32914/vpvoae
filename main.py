@@ -925,6 +925,15 @@ async def collect_document_interaction_targets(
                 '[class*="link"]',
                 '[class*="card"]',
                 '[class*="tile"]',
+                '[class*="char"]',
+                '[class*="letter"]',
+                '[data-char]',
+                '[data-letter]',
+                'h1',
+                'h2',
+                'h3',
+                'h4',
+                'span',
                 'video',
                 'canvas',
                 'summary'
@@ -957,8 +966,93 @@ async def collect_document_interaction_targets(
                 return `${parts.join('>')}|${Math.round(absX)}:${Math.round(absY)}|${text.slice(0, 30)}`;
             }
 
+            function hasTransition(style) {
+                const raw = (style.transitionDuration || '').toString();
+                if (!raw) return false;
+                for (const part of raw.split(',')) {
+                    const token = part.trim().toLowerCase();
+                    if (!token) continue;
+                    if (token.endsWith('ms')) {
+                        if (Number.parseFloat(token) > 0.1) return true;
+                        continue;
+                    }
+                    if (token.endsWith('s')) {
+                        if (Number.parseFloat(token) > 0.001) return true;
+                        continue;
+                    }
+                }
+                return false;
+            }
+
+            function isInteractiveNode(el, tag) {
+                if (['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)) {
+                    return true;
+                }
+                return (
+                    el.hasAttribute('onclick')
+                    || el.hasAttribute('data-action')
+                    || el.hasAttribute('aria-controls')
+                    || el.getAttribute('role') === 'button'
+                    || el.getAttribute('role') === 'link'
+                    || el.getAttribute('role') === 'menuitem'
+                );
+            }
+
+            function isHoverEffectTextCandidate(el, tag, textNoWs, rect, style) {
+                if (textNoWs.length < 1 || textNoWs.length > 84) return false;
+
+                const cls = (el.className || '').toString().toLowerCase();
+                const idPart = (el.id || '').toString().toLowerCase();
+                const attrHint = [
+                    el.getAttribute('data-hover') || '',
+                    el.getAttribute('data-char') || '',
+                    el.getAttribute('data-letter') || '',
+                    el.getAttribute('aria-label') || '',
+                ].join(' ').toLowerCase();
+                const hint = `${cls} ${idPart} ${attrHint}`;
+
+                const hasMotionStyle = (
+                    hasTransition(style)
+                    || ((style.transitionProperty || '').toLowerCase().includes('transform'))
+                    || ((style.transitionProperty || '').toLowerCase().includes('all'))
+                    || ((style.animationName || '').toLowerCase() !== 'none')
+                    || ((style.willChange || '').toLowerCase().includes('transform'))
+                    || ((style.transform || '').toLowerCase() !== 'none')
+                );
+
+                const looksMicroText = (
+                    ['span', 'em', 'strong', 'i', 'b', 'a'].includes(tag)
+                    && textNoWs.length <= 10
+                    && rect.width <= 320
+                );
+
+                const looksHeadingText = (
+                    /^h[1-6]$/.test(tag)
+                    || hint.includes('title')
+                    || hint.includes('headline')
+                    || hint.includes('hero')
+                    || hint.includes('char')
+                    || hint.includes('letter')
+                    || hint.includes('glyph')
+                );
+
+                const likelyHoverZone = (
+                    rect.width >= 120
+                    && rect.height >= 16
+                    && rect.width <= viewportWidth * 0.95
+                    && rect.height <= viewportHeight * 0.5
+                );
+
+                if (!looksMicroText && !looksHeadingText) return false;
+                if (!likelyHoverZone) return false;
+
+                return hasMotionStyle || style.cursor === 'pointer' || looksHeadingText;
+            }
+
             const out = [];
             for (const el of pool) {
+                if (!(el instanceof HTMLElement)) continue;
+
                 const style = window.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
                     continue;
@@ -973,15 +1067,22 @@ async def collect_document_interaction_targets(
                 if (!Number.isFinite(absX) || !Number.isFinite(absY)) continue;
                 if (absY < -120 || absY > docHeight + 260) continue;
 
-                const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 72);
+                const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 84);
+                const textNoWs = text.replace(/\\s+/g, '');
                 const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
                 const tag = el.tagName.toLowerCase();
+
+                const interactive = isInteractiveNode(el, tag);
+                const hoverText = isHoverEffectTextCandidate(el, tag, textNoWs, rect, style);
+                if (!interactive && !hoverText) continue;
+
                 const key = elementKey(el, absX, absY, text);
 
                 const pointerBoost = style.cursor === 'pointer' ? 90 : 0;
                 const tagBoost = ({ button: 100, a: 90, input: 70, select: 70, textarea: 65, video: 55, canvas: 55 })[tag] || 45;
                 const textBoost = text.length > 0 ? 24 : 0;
                 const areaBoost = Math.min(rect.width * rect.height, 12000) * 0.01;
+                const hoverBoost = hoverText ? 82 : 0;
 
                 out.push({
                     key,
@@ -989,10 +1090,11 @@ async def collect_document_interaction_targets(
                     absY: Math.max(1, absY),
                     width: rect.width,
                     height: rect.height,
-                    score: pointerBoost + tagBoost + textBoost + areaBoost,
+                    score: pointerBoost + tagBoost + textBoost + areaBoost + hoverBoost,
                     text,
                     href,
                     tag,
+                    isHoverText: hoverText,
                 });
             }
 
@@ -1023,8 +1125,12 @@ async def run_strict_top_to_bottom_pass(
     scroll_pause_max_ms: int,
     inpage_click_enabled: bool,
     inpage_click_probability: float,
+    scroll_finish_timeout_ms: int,
+    require_bottom: bool,
+    require_bottom_max_ms: int,
+    strict_allow_clicks: bool,
 ) -> Tuple[Tuple[float, float], int, bool]:
-    """Однонаправленный проход сверху вниз: hover-эффекты + безопасные in-page клики без навигации."""
+    """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
     reached_bottom = False
     visited_keys: Set[str] = set()
@@ -1043,13 +1149,24 @@ async def run_strict_top_to_bottom_pass(
         pass
 
     started_at = time.monotonic()
+    soft_budget_ms = max(8000, int(total_time_ms))
+    hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
+
     last_scroll_y = -1
     stagnant_rounds = 0
     bottom_stable_rounds = 0
     round_index = 0
     last_analysis_round = -1000
+    micro_hover_min = max(40, int(hover_min_ms * 0.35))
+    micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
 
-    while (time.monotonic() - started_at) * 1000 < total_time_ms:
+    while True:
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        if elapsed_ms >= soft_budget_ms and (reached_bottom or not require_bottom):
+            break
+        if elapsed_ms >= hard_budget_ms:
+            break
+
         round_index += 1
 
         if round_index == 1 or (round_index - last_analysis_round) >= 8:
@@ -1095,23 +1212,45 @@ async def run_strict_top_to_bottom_pass(
             ]
 
             if candidates:
-                pool = candidates[: min(6, len(candidates))]
+                hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
+                if hover_text_candidates:
+                    pool = sorted(hover_text_candidates, key=target_sort_score, reverse=True)[: min(8, len(hover_text_candidates))]
+                else:
+                    pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(8, len(candidates))]
                 target = random.choice(pool[:3] if len(pool) >= 3 else pool)
 
                 tx = clamp(float(target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
                 ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
                 target_key = str(target.get("key", ""))
+                is_hover_text = bool(target.get("isHoverText", False))
+                target_width = float(target.get("width", 0.0))
+                sweep_points: List[Tuple[float, float]] = []
+
+                if is_hover_text and target_width >= 110:
+                    half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
+                    sweep_points = [
+                        (clamp(tx - half_span, 2, viewport_width - 2), ty),
+                        (tx, ty),
+                        (clamp(tx + half_span, 2, viewport_width - 2), ty),
+                    ]
+                else:
+                    sweep_points = [(tx, ty)]
 
                 try:
-                    cursor_pos = await move_mouse_human_like(
-                        page=page,
-                        start=cursor_pos,
-                        end=(tx, ty),
-                        viewport_width=viewport_width,
-                        viewport_height=viewport_height,
-                        duration_ms=random.randint(220, 640),
-                    )
-                    await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                    for i, point in enumerate(sweep_points):
+                        cursor_pos = await move_mouse_human_like(
+                            page=page,
+                            start=cursor_pos,
+                            end=point,
+                            viewport_width=viewport_width,
+                            viewport_height=viewport_height,
+                            duration_ms=random.randint(130, 420) if is_hover_text else random.randint(220, 640),
+                        )
+                        if is_hover_text:
+                            # Короткий sweep по буквам/символам, чтобы активировать hover-анимации.
+                            await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
+                        elif i == len(sweep_points) - 1:
+                            await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
                 except Exception as exc:
                     if _is_nav_error(exc):
                         await _recover_after_nav(page)
@@ -1121,7 +1260,8 @@ async def run_strict_top_to_bottom_pass(
                 hovered_count += 1
 
                 should_click = (
-                    inpage_click_enabled
+                    strict_allow_clicks
+                    and inpage_click_enabled
                     and target_key not in clicked_keys
                     and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=False)
                 )
@@ -1206,6 +1346,26 @@ async def run_strict_top_to_bottom_pass(
         if bottom_stable_rounds >= bottom_stable_rounds_required:
             reached_bottom = True
             break
+
+    if require_bottom and not reached_bottom:
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        remaining_ms = max(0, int(hard_budget_ms - elapsed_ms))
+        finish_budget_ms = min(max(4000, int(scroll_finish_timeout_ms)), remaining_ms)
+        if finish_budget_ms > 0:
+            try:
+                reached_bottom = await force_scroll_to_page_end(
+                    page=page,
+                    viewport_height=viewport_height,
+                    scroll_speed_factor=scroll_speed_factor,
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                    finish_timeout_ms=finish_budget_ms,
+                )
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    logger.warning(f"⚠️ Smart cursor: ошибка финального доскролла в STRICT режиме: {exc}")
 
     return cursor_pos, hovered_count, reached_bottom
 
@@ -1832,6 +1992,9 @@ async def run_smart_cursor(
     inpage_click_probability: float,
     allow_internal_nav_click: bool,
     strict_top_to_bottom_mode: bool,
+    smart_cursor_require_bottom: bool,
+    smart_cursor_require_bottom_max_ms: int,
+    strict_top_to_bottom_allow_clicks: bool,
 ) -> int:
     """Фазовый обход сайта: сначала полный скролл, потом вкладки и интерактив."""
     start_time = time.monotonic()
@@ -1888,12 +2051,16 @@ async def run_smart_cursor(
             scroll_pause_max_ms=scroll_pause_max_ms,
             inpage_click_enabled=inpage_click_enabled,
             inpage_click_probability=inpage_click_probability,
+            scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+            require_bottom=smart_cursor_require_bottom,
+            require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
+            strict_allow_clicks=strict_top_to_bottom_allow_clicks,
         )
         hovered_count += strict_hovered
         if reached_bottom:
             logger.info("🧭 Smart cursor: STRICT проход завершен, страница просмотрена до конца")
         else:
-            logger.warning("⚠️ Smart cursor: STRICT проход завершился по таймауту до достижения конца страницы")
+            logger.warning("⚠️ Smart cursor: STRICT проход завершился по hard-timeout до достижения конца страницы")
         logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
         return hovered_count
 
@@ -2241,7 +2408,7 @@ async def main():
         render_timeout = int(os.getenv('RENDER_TIMEOUT', '5000'))
         load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
         smart_cursor_enabled = env_bool('SMART_CURSOR_ENABLED', True)
-        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '45000'))
+        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '120000'))
         smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '24'))
         hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '450'))
         hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '1300'))
@@ -2260,6 +2427,9 @@ async def main():
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.18'))
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', False)
         strict_top_to_bottom_mode = env_bool('SMART_CURSOR_STRICT_TOP_TO_BOTTOM', True)
+        strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', False)
+        smart_cursor_require_bottom = env_bool('SMART_CURSOR_REQUIRE_BOTTOM', True)
+        smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '240000'))
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
         browser_app_mode = env_bool('BROWSER_APP_MODE', True)
 
@@ -2275,6 +2445,10 @@ async def main():
         nav_tabs_max_visits = max(0, min(nav_tabs_max_visits, 18))
         nav_tab_scroll_timeout_ms = max(1500, min(nav_tab_scroll_timeout_ms, 60000))
         inpage_click_probability = clamp(inpage_click_probability, 0.0, 1.0)
+        smart_cursor_timeout = max(8000, min(smart_cursor_timeout, 900000))
+        smart_cursor_require_bottom_max_ms = max(30000, min(smart_cursor_require_bottom_max_ms, 900000))
+        if smart_cursor_require_bottom and smart_cursor_require_bottom_max_ms < smart_cursor_timeout:
+            smart_cursor_require_bottom_max_ms = smart_cursor_timeout
         
         logger.info("🚀 Запуск VPVoAe Web Renderer")
         logger.info(f"Target URL: {target_url}")
@@ -2283,6 +2457,8 @@ async def main():
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
+        logger.info(f"🧭 Smart cursor strict allow clicks: {'ENABLED' if strict_top_to_bottom_allow_clicks else 'DISABLED'}")
+        logger.info(f"🧭 Smart cursor require bottom: {'ENABLED' if smart_cursor_require_bottom else 'DISABLED'} (max={smart_cursor_require_bottom_max_ms}ms)")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
         
@@ -2317,13 +2493,17 @@ async def main():
             page = await context.new_page()
 
             logger.info(f"📄 Открываем целевой сайт: {target_url}")
-            # Ждем, пока перестанут подгружаться новые ресурсы (networkidle)
+            # Сначала быстрый DOM-ready, затем короткая попытка дождаться networkidle.
             try:
                 await page.goto(
                     target_url,
-                    wait_until="networkidle",
+                    wait_until="domcontentloaded",
                     timeout=load_timeout
                 )
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(12000, max(2500, int(load_timeout * 0.35))))
+                except Exception:
+                    pass
                 logger.info("✅ Сайт загружен успешно")
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️  Таймаут при загрузке ({load_timeout}ms), продолжаем...")
@@ -2368,6 +2548,9 @@ async def main():
                     inpage_click_probability=inpage_click_probability,
                     allow_internal_nav_click=allow_internal_nav_click,
                     strict_top_to_bottom_mode=strict_top_to_bottom_mode,
+                    smart_cursor_require_bottom=smart_cursor_require_bottom,
+                    smart_cursor_require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
+                    strict_top_to_bottom_allow_clicks=strict_top_to_bottom_allow_clicks,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
