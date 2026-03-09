@@ -538,13 +538,68 @@ async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
         result = await page.evaluate(
             """
             () => {
-                const doc = document.documentElement;
-                const scrollY = Math.round(window.scrollY || 0);
-                const maxScroll = Math.max(0, Math.round((doc?.scrollHeight || 0) - (window.innerHeight || 0)));
+                const toInt = (value, fallback = 0) => {
+                    const n = Number(value);
+                    return Number.isFinite(n) ? Math.round(n) : fallback;
+                };
+
+                const viewportHeight = toInt(window.innerHeight || 0, 0);
+                const scrollingEl = document.scrollingElement || document.documentElement || document.body;
+
+                let scrollY = Math.max(
+                    toInt(window.scrollY || window.pageYOffset || 0, 0),
+                    toInt(scrollingEl?.scrollTop || 0, 0),
+                );
+
+                let maxScroll = Math.max(
+                    0,
+                    toInt((scrollingEl?.scrollHeight || 0) - viewportHeight, 0),
+                );
+
+                const candidates = [];
+                if (document.body) candidates.push(document.body);
+                for (const el of document.querySelectorAll('[data-scroll-container], [data-scroll], .smooth-scroll, .scroll-container, .lenis, .lenis-root, main')) {
+                    if (el instanceof HTMLElement) candidates.push(el);
+                }
+
+                const seen = new Set();
+                for (const el of candidates) {
+                    if (!(el instanceof HTMLElement) || seen.has(el)) continue;
+                    seen.add(el);
+
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const elementHeight = Math.max(
+                        toInt(el.scrollHeight || 0, 0),
+                        toInt(el.offsetHeight || 0, 0),
+                        toInt(rect.height || 0, 0),
+                    );
+                    if (elementHeight < viewportHeight + 40) continue;
+
+                    const nativeMax = Math.max(0, toInt((el.scrollHeight || 0) - (el.clientHeight || viewportHeight), 0));
+                    if (nativeMax > 0) {
+                        scrollY = Math.max(scrollY, toInt(el.scrollTop || 0, 0));
+                        maxScroll = Math.max(maxScroll, nativeMax);
+                    }
+
+                    const transformedTop = Math.max(0, toInt(-(rect.top || 0), 0));
+                    const transformedMax = Math.max(0, elementHeight - viewportHeight);
+                    const hasTransform = (
+                        ((style.transform || '').toLowerCase() !== 'none')
+                        || ((style.willChange || '').toLowerCase().includes('transform'))
+                    );
+
+                    if (hasTransform || transformedTop > 0) {
+                        scrollY = Math.max(scrollY, transformedTop);
+                        maxScroll = Math.max(maxScroll, transformedMax);
+                    }
+                }
+
+                const atBottom = maxScroll <= 4 ? true : scrollY >= (maxScroll - 6);
                 return {
                     scrollY,
                     maxScroll,
-                    atBottom: scrollY >= (maxScroll - 3),
+                    atBottom,
                 };
             }
             """
@@ -894,6 +949,63 @@ async def perform_smooth_scroll(
         step_delta = max(12, int(base_step + random.uniform(-18, 22)))
         await page.mouse.wheel(0, step_delta)
         await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
+
+
+async def force_scroll_progress(page: Any, viewport_height: int) -> None:
+    """Форсирует продвижение скролла на сайтах с нестандартным smooth-scroll."""
+    delta = max(80, int(viewport_height * 0.9))
+    try:
+        await page.mouse.wheel(0, delta)
+        await page.wait_for_timeout(random.randint(45, 110))
+    except Exception:
+        pass
+
+    try:
+        await page.keyboard.press("PageDown")
+        await page.wait_for_timeout(random.randint(28, 80))
+    except Exception:
+        pass
+
+    try:
+        await page.evaluate(
+            """
+            (delta) => {
+                const targets = [
+                    document.scrollingElement,
+                    document.documentElement,
+                    document.body,
+                    ...document.querySelectorAll('[data-scroll-container], [data-scroll], .smooth-scroll, .scroll-container, .lenis, .lenis-root, main'),
+                ];
+
+                const seen = new Set();
+                for (const node of targets) {
+                    if (!(node instanceof HTMLElement) || seen.has(node)) continue;
+                    seen.add(node);
+
+                    try {
+                        if ((node.scrollHeight || 0) > (node.clientHeight || 0) + 4) {
+                            node.scrollBy({ top: delta, left: 0, behavior: 'auto' });
+                        }
+                    } catch {}
+                }
+
+                try { window.scrollBy({ top: delta, left: 0, behavior: 'auto' }); } catch {}
+
+                try {
+                    window.dispatchEvent(new WheelEvent('wheel', {
+                        deltaY: delta,
+                        bubbles: true,
+                        cancelable: true,
+                    }));
+                } catch {}
+
+                return true;
+            }
+            """,
+            delta,
+        )
+    except Exception:
+        pass
 
 
 async def collect_document_interaction_targets(
@@ -1330,11 +1442,7 @@ async def run_strict_top_to_bottom_pass(
             stagnant_rounds = 0
 
         if stagnant_rounds >= 3:
-            try:
-                await page.mouse.wheel(0, int(viewport_height * 0.62))
-                await page.wait_for_timeout(random.randint(60, 130))
-            except Exception:
-                pass
+            await force_scroll_progress(page, viewport_height)
             stagnant_rounds = 0
 
         last_scroll_y = max(last_scroll_y, current_scroll_y)
@@ -1351,6 +1459,9 @@ async def run_strict_top_to_bottom_pass(
         elapsed_ms = (time.monotonic() - started_at) * 1000
         remaining_ms = max(0, int(hard_budget_ms - elapsed_ms))
         finish_budget_ms = min(max(4000, int(scroll_finish_timeout_ms)), remaining_ms)
+        if finish_budget_ms <= 0:
+            # Даже при достижении hard-timeout даем короткий финальный шанс дойти до низа.
+            finish_budget_ms = max(8000, min(30000, int(scroll_finish_timeout_ms)))
         if finish_budget_ms > 0:
             try:
                 reached_bottom = await force_scroll_to_page_end(
@@ -1404,12 +1515,7 @@ async def force_scroll_to_page_end(
             at_bottom = False
 
         if current_scroll <= last_scroll + 2:
-            try:
-                await page.keyboard.press("PageDown")
-                await page.wait_for_timeout(random.randint(26, 70))
-            except Exception:
-                pass
-
+            await force_scroll_progress(page, viewport_height)
             try:
                 await page.keyboard.press("End")
                 await page.wait_for_timeout(random.randint(60, 120))
@@ -2430,6 +2536,8 @@ async def main():
         strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', False)
         smart_cursor_require_bottom = env_bool('SMART_CURSOR_REQUIRE_BOTTOM', True)
         smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '240000'))
+        screenshot_enabled = env_bool('SCREENSHOT_ENABLED', True)
+        screenshot_timeout_ms = int(os.getenv('SCREENSHOT_TIMEOUT_MS', '8000'))
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
         browser_app_mode = env_bool('BROWSER_APP_MODE', True)
 
@@ -2447,6 +2555,7 @@ async def main():
         inpage_click_probability = clamp(inpage_click_probability, 0.0, 1.0)
         smart_cursor_timeout = max(8000, min(smart_cursor_timeout, 900000))
         smart_cursor_require_bottom_max_ms = max(30000, min(smart_cursor_require_bottom_max_ms, 900000))
+        screenshot_timeout_ms = max(1000, min(screenshot_timeout_ms, 60000))
         if smart_cursor_require_bottom and smart_cursor_require_bottom_max_ms < smart_cursor_timeout:
             smart_cursor_require_bottom_max_ms = smart_cursor_timeout
         
@@ -2459,6 +2568,7 @@ async def main():
         logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict allow clicks: {'ENABLED' if strict_top_to_bottom_allow_clicks else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor require bottom: {'ENABLED' if smart_cursor_require_bottom else 'DISABLED'} (max={smart_cursor_require_bottom_max_ms}ms)")
+        logger.info(f"📸 Screenshot: {'ENABLED' if screenshot_enabled else 'DISABLED'} (timeout={screenshot_timeout_ms}ms)")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
         
@@ -2555,24 +2665,38 @@ async def main():
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
 
-            logger.info("📸 Создание скриншота...")
             # Создаем директорию для результатов
             os.makedirs(output_path, exist_ok=True)
-            
-            # Сохраняем скриншот с временной меткой (без full_page для совместимости с Xvfb)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            screenshot_path = os.path.join(output_path, f"screenshot_{timestamp}.png")
-            await page.screenshot(path=screenshot_path, full_page=False, omit_background=False)
-            
-            # Также сохраняем последний скриншот для быстрого доступа
-            latest_path = os.path.join(output_path, "screenshot_latest.png")
-            await page.screenshot(path=latest_path, full_page=False, omit_background=False)
+
+            if screenshot_enabled:
+                logger.info("📸 Создание скриншота...")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = os.path.join(output_path, f"screenshot_{timestamp}.png")
+                latest_path = os.path.join(output_path, "screenshot_latest.png")
+
+                try:
+                    await page.screenshot(
+                        path=screenshot_path,
+                        full_page=False,
+                        omit_background=False,
+                        timeout=screenshot_timeout_ms,
+                    )
+                    await page.screenshot(
+                        path=latest_path,
+                        full_page=False,
+                        omit_background=False,
+                        timeout=screenshot_timeout_ms,
+                    )
+
+                    file_size = os.path.getsize(screenshot_path) / (1024 * 1024)  # MB
+                    logger.info(f"✅ Скриншот сохранен: {screenshot_path} ({file_size:.2f}MB)")
+                    logger.info(f"✅ Latest: {latest_path}")
+                except Exception as screenshot_exc:
+                    logger.warning(f"⚠️ Не удалось сохранить скриншот: {screenshot_exc}")
+            else:
+                logger.info("📸 Скриншот пропущен по конфигурации")
 
             await context.close()
-            
-            file_size = os.path.getsize(screenshot_path) / (1024 * 1024)  # MB
-            logger.info(f"✅ Скриншот сохранен: {screenshot_path} ({file_size:.2f}MB)")
-            logger.info(f"✅ Latest: {latest_path}")
             logger.info("✨ Рендеринг завершен успешно")
             logger.info("📹 FFmpeg продолжает запись (будет остановлен в entrypoint.sh)")
             sys.exit(0)
