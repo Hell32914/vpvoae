@@ -78,6 +78,60 @@ async def collect_interactive_targets(
                 }
             }
 
+            function hasTransition(style) {
+                const raw = (style.transitionDuration || '').toString();
+                if (!raw) return false;
+                for (const part of raw.split(',')) {
+                    const token = part.trim().toLowerCase();
+                    if (!token) continue;
+                    if (token.endsWith('ms')) {
+                        if (Number.parseFloat(token) > 0.1) return true;
+                        continue;
+                    }
+                    if (token.endsWith('s')) {
+                        if (Number.parseFloat(token) > 0.001) return true;
+                        continue;
+                    }
+                }
+                return false;
+            }
+
+            function isSurfaceHoverCandidate(el, rect, style) {
+                const tag = el.tagName.toLowerCase();
+                const cls = (el.className || '').toString().toLowerCase();
+                const idPart = (el.id || '').toString().toLowerCase();
+                const attrHint = [
+                    el.getAttribute('data-hover') || '',
+                    el.getAttribute('data-cursor') || '',
+                    el.getAttribute('aria-label') || '',
+                ].join(' ').toLowerCase();
+                const hint = `${cls} ${idPart} ${attrHint}`;
+
+                const looksLikeScene = (
+                    tag === 'canvas'
+                    || tag === 'video'
+                    || tag === 'model-viewer'
+                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience/.test(hint)
+                );
+
+                const largeEnough = (
+                    rect.width >= viewportWidth * 0.18
+                    && rect.height >= viewportHeight * 0.16
+                );
+
+                const motionSignals = (
+                    hasTransition(style)
+                    || ((style.animationName || '').toLowerCase() !== 'none')
+                    || ((style.willChange || '').toLowerCase().includes('transform'))
+                    || ((style.transform || '').toLowerCase() !== 'none')
+                    || ((style.cursor || '').toLowerCase() === 'pointer')
+                    || ((style.cursor || '').toLowerCase() === 'grab')
+                    || ((style.cursor || '').toLowerCase() === 'crosshair')
+                );
+
+                return (looksLikeScene && rect.width >= 80 && rect.height >= 50) || (largeEnough && motionSignals);
+            }
+
             function getClickable(node) {
                 if (!node || !(node instanceof Element)) return null;
                 const clickable = node.closest('a,button,input,select,textarea,summary,[role="button"],[role="link"],[role="menuitem"],[onclick],[tabindex]:not([tabindex="-1"]),[contenteditable="true"],[aria-controls],[data-action]');
@@ -167,17 +221,20 @@ async def collect_interactive_targets(
                 const key = elementKey(el, cx, cy, text);
                 const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
                 const dynamicBoost = /menu|nav|tab|card|tile|cta|action|play|pause|open|calc|form|wizard|step|option|choice|result/i.test((el.className || '').toString()) ? 30 : 0;
+                const surfaceHover = isSurfaceHoverCandidate(el, rect, style);
+                const surfaceBoost = surfaceHover ? 96 : 0;
 
                 out.push({
                     x: Math.max(2, Math.min(viewportWidth - 2, cx)),
                     y: Math.max(2, Math.min(viewportHeight - 2, cy)),
                     width: rect.width,
                     height: rect.height,
-                    score: area * 0.02 + centerScore * 100 + pointerBoost + tagBoost + dynamicBoost - edgePenalty,
+                    score: area * 0.02 + centerScore * 100 + pointerBoost + tagBoost + dynamicBoost + surfaceBoost - edgePenalty,
                     key,
                     text,
                     href,
-                    tag: el.tagName.toLowerCase()
+                    tag: el.tagName.toLowerCase(),
+                    isSurfaceHover: surfaceHover,
                 });
             }
 
@@ -1096,6 +1153,19 @@ async def collect_document_interaction_targets(
                 return false;
             }
 
+            function hasMotionSignals(style) {
+                return (
+                    hasTransition(style)
+                    || ((style.transitionProperty || '').toLowerCase().includes('transform'))
+                    || ((style.transitionProperty || '').toLowerCase().includes('all'))
+                    || ((style.animationName || '').toLowerCase() !== 'none')
+                    || ((style.willChange || '').toLowerCase().includes('transform'))
+                    || ((style.willChange || '').toLowerCase().includes('filter'))
+                    || ((style.willChange || '').toLowerCase().includes('opacity'))
+                    || ((style.transform || '').toLowerCase() !== 'none')
+                );
+            }
+
             function isInteractiveNode(el, tag) {
                 if (['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)) {
                     return true;
@@ -1108,6 +1178,41 @@ async def collect_document_interaction_targets(
                     || el.getAttribute('role') === 'link'
                     || el.getAttribute('role') === 'menuitem'
                 );
+            }
+
+            function isSurfaceHoverCandidate(el, tag, rect, style) {
+                const cls = (el.className || '').toString().toLowerCase();
+                const idPart = (el.id || '').toString().toLowerCase();
+                const attrHint = [
+                    el.getAttribute('data-hover') || '',
+                    el.getAttribute('data-cursor') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                ].join(' ').toLowerCase();
+                const hint = `${cls} ${idPart} ${attrHint}`;
+
+                const looksLikeScene = (
+                    tag === 'canvas'
+                    || tag === 'video'
+                    || tag === 'model-viewer'
+                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase/.test(hint)
+                );
+
+                const largeEnough = (
+                    rect.width >= viewportWidth * 0.16
+                    && rect.height >= viewportHeight * 0.14
+                );
+
+                const cursorKind = (style.cursor || '').toLowerCase();
+                const cursorInteractive = (
+                    cursorKind === 'pointer'
+                    || cursorKind === 'grab'
+                    || cursorKind === 'crosshair'
+                    || cursorKind === 'move'
+                );
+
+                return (looksLikeScene && rect.width >= 80 && rect.height >= 50)
+                    || (largeEnough && (hasMotionSignals(style) || cursorInteractive));
             }
 
             function isHoverEffectTextCandidate(el, tag, textNoWs, rect, style) {
@@ -1123,14 +1228,7 @@ async def collect_document_interaction_targets(
                 ].join(' ').toLowerCase();
                 const hint = `${cls} ${idPart} ${attrHint}`;
 
-                const hasMotionStyle = (
-                    hasTransition(style)
-                    || ((style.transitionProperty || '').toLowerCase().includes('transform'))
-                    || ((style.transitionProperty || '').toLowerCase().includes('all'))
-                    || ((style.animationName || '').toLowerCase() !== 'none')
-                    || ((style.willChange || '').toLowerCase().includes('transform'))
-                    || ((style.transform || '').toLowerCase() !== 'none')
-                );
+                const hasMotionStyle = hasMotionSignals(style);
 
                 const looksMicroText = (
                     ['span', 'em', 'strong', 'i', 'b', 'a'].includes(tag)
@@ -1161,6 +1259,37 @@ async def collect_document_interaction_targets(
                 return hasMotionStyle || style.cursor === 'pointer' || looksHeadingText;
             }
 
+            // Дополнительный grid-scan для сайтов без семантических DOM-меток.
+            const scanCols = 11;
+            const scanRows = 7;
+            for (let r = 0; r < scanRows; r++) {
+                for (let c = 0; c < scanCols; c++) {
+                    const x = ((c + 0.5) / scanCols) * viewportWidth;
+                    const y = ((r + 0.5) / scanRows) * viewportHeight;
+                    const stack = document.elementsFromPoint(x, y) || [];
+                    for (const node of stack.slice(0, 7)) {
+                        if (!(node instanceof HTMLElement)) continue;
+                        const tag = node.tagName.toLowerCase();
+                        const rect = node.getBoundingClientRect();
+                        if (rect.width < 10 || rect.height < 10) continue;
+
+                        const style = window.getComputedStyle(node);
+                        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.05) {
+                            continue;
+                        }
+                        if (style.pointerEvents === 'none') continue;
+
+                        if (
+                            isInteractiveNode(node, tag)
+                            || isSurfaceHoverCandidate(node, tag, rect, style)
+                            || ((style.cursor || '').toLowerCase() === 'pointer' && hasMotionSignals(style))
+                        ) {
+                            pool.add(node);
+                        }
+                    }
+                }
+            }
+
             const out = [];
             for (const el of pool) {
                 if (!(el instanceof HTMLElement)) continue;
@@ -1186,7 +1315,8 @@ async def collect_document_interaction_targets(
 
                 const interactive = isInteractiveNode(el, tag);
                 const hoverText = isHoverEffectTextCandidate(el, tag, textNoWs, rect, style);
-                if (!interactive && !hoverText) continue;
+                const surfaceHover = isSurfaceHoverCandidate(el, tag, rect, style);
+                if (!interactive && !hoverText && !surfaceHover) continue;
 
                 const key = elementKey(el, absX, absY, text);
 
@@ -1195,6 +1325,7 @@ async def collect_document_interaction_targets(
                 const textBoost = text.length > 0 ? 24 : 0;
                 const areaBoost = Math.min(rect.width * rect.height, 12000) * 0.01;
                 const hoverBoost = hoverText ? 82 : 0;
+                const surfaceBoost = surfaceHover ? 106 : 0;
 
                 out.push({
                     key,
@@ -1202,11 +1333,12 @@ async def collect_document_interaction_targets(
                     absY: Math.max(1, absY),
                     width: rect.width,
                     height: rect.height,
-                    score: pointerBoost + tagBoost + textBoost + areaBoost + hoverBoost,
+                    score: pointerBoost + tagBoost + textBoost + areaBoost + hoverBoost + surfaceBoost,
                     text,
                     href,
                     tag,
                     isHoverText: hoverText,
+                    isSurfaceHover: surfaceHover,
                 });
             }
 
@@ -1241,6 +1373,7 @@ async def run_strict_top_to_bottom_pass(
     require_bottom: bool,
     require_bottom_max_ms: int,
     strict_allow_clicks: bool,
+    bottom_debug: bool,
 ) -> Tuple[Tuple[float, float], int, bool]:
     """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
@@ -1271,6 +1404,8 @@ async def run_strict_top_to_bottom_pass(
     last_analysis_round = -1000
     micro_hover_min = max(40, int(hover_min_ms * 0.35))
     micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
+    surface_hover_min = max(micro_hover_min + 30, int(hover_min_ms * 0.42))
+    surface_hover_max = max(surface_hover_min + 35, int(hover_max_ms * 0.75))
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -1325,7 +1460,11 @@ async def run_strict_top_to_bottom_pass(
 
             if candidates:
                 hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
-                if hover_text_candidates:
+                surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False))]
+
+                if surface_hover_candidates and (not hover_text_candidates or random.random() < 0.62):
+                    pool = sorted(surface_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(surface_hover_candidates))]
+                elif hover_text_candidates:
                     pool = sorted(hover_text_candidates, key=target_sort_score, reverse=True)[: min(8, len(hover_text_candidates))]
                 else:
                     pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(8, len(candidates))]
@@ -1335,10 +1474,27 @@ async def run_strict_top_to_bottom_pass(
                 ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
                 target_key = str(target.get("key", ""))
                 is_hover_text = bool(target.get("isHoverText", False))
+                is_surface_hover = bool(target.get("isSurfaceHover", False))
                 target_width = float(target.get("width", 0.0))
+                target_height = float(target.get("height", 0.0))
                 sweep_points: List[Tuple[float, float]] = []
 
-                if is_hover_text and target_width >= 110:
+                if is_surface_hover and (target_width >= 120 or target_height >= 90):
+                    span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
+                    span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
+                    sweep_points = [
+                        (clamp(tx - span_x, 2, viewport_width - 2), ty),
+                        (tx, clamp(ty - span_y, 2, viewport_height - 2)),
+                        (clamp(tx + span_x, 2, viewport_width - 2), ty),
+                        (tx, clamp(ty + span_y, 2, viewport_height - 2)),
+                        (tx, ty),
+                    ]
+                    if target_width >= 220 and target_height >= 120:
+                        sweep_points.extend([
+                            (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
+                            (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
+                        ])
+                elif is_hover_text and target_width >= 110:
                     half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
                     sweep_points = [
                         (clamp(tx - half_span, 2, viewport_width - 2), ty),
@@ -1356,9 +1512,18 @@ async def run_strict_top_to_bottom_pass(
                             end=point,
                             viewport_width=viewport_width,
                             viewport_height=viewport_height,
-                            duration_ms=random.randint(130, 420) if is_hover_text else random.randint(220, 640),
+                            duration_ms=(
+                                random.randint(90, 260)
+                                if is_surface_hover
+                                else random.randint(130, 420)
+                                if is_hover_text
+                                else random.randint(220, 640)
+                            ),
                         )
-                        if is_hover_text:
+                        if is_surface_hover:
+                            # Для WebGL/canvas-областей делаем серию коротких движений, чтобы гарантированно вызвать реакцию сцены.
+                            await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
+                        elif is_hover_text:
                             # Короткий sweep по буквам/символам, чтобы активировать hover-анимации.
                             await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
                         elif i == len(sweep_points) - 1:
@@ -1454,7 +1619,48 @@ async def run_strict_top_to_bottom_pass(
             stagnant_rounds = 0
 
         last_scroll_y = max(last_scroll_y, current_scroll_y)
+        analysis_max_abs_y = max(
+            (
+                int(float(item.get("absY", 0.0)))
+                for item in analysis_targets
+                if float(item.get("absY", 0.0)) > 1.0
+            ),
+            default=0,
+        )
+
+        bottom_confirmed = False
+        bottom_reason = "atBottom=false"
         if at_bottom:
+            if max_scroll_y > 12:
+                bottom_confirmed = current_scroll_y >= (max_scroll_y - 8)
+                bottom_reason = f"window distance={max_scroll_y - current_scroll_y}"
+            elif analysis_max_abs_y > 0:
+                bottom_confirmed = analysis_max_abs_y <= (current_scroll_y + int(viewport_height * 0.94))
+                bottom_reason = f"analysis tail={analysis_max_abs_y - (current_scroll_y + int(viewport_height * 0.94))}"
+            else:
+                bottom_confirmed = round_index >= max(6, bottom_stable_rounds_required * 2) and stagnant_rounds >= 1
+                bottom_reason = (
+                    "fallback "
+                    f"guard_round={round_index >= max(6, bottom_stable_rounds_required * 2)} "
+                    f"guard_stagnant={stagnant_rounds >= 1}"
+                )
+        elif max_scroll_y > 12:
+            bottom_reason = f"window distance={max_scroll_y - current_scroll_y}"
+        elif analysis_max_abs_y > 0:
+            bottom_reason = f"analysis tail={analysis_max_abs_y - (current_scroll_y + int(viewport_height * 0.94))}"
+
+        if bottom_debug and (
+            round_index % 8 == 0
+            or (at_bottom and not bottom_confirmed)
+            or bottom_confirmed
+        ):
+            logger.info(
+                "🧭 Bottom check: "
+                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
+                f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, stable={bottom_stable_rounds}"
+            )
+
+        if bottom_confirmed:
             bottom_stable_rounds += 1
         else:
             bottom_stable_rounds = 0
@@ -1479,6 +1685,7 @@ async def run_strict_top_to_bottom_pass(
                     scroll_pause_min_ms=scroll_pause_min_ms,
                     scroll_pause_max_ms=scroll_pause_max_ms,
                     finish_timeout_ms=finish_budget_ms,
+                    bottom_debug=bottom_debug,
                 )
             except Exception as exc:
                 if _is_nav_error(exc):
@@ -1496,6 +1703,7 @@ async def force_scroll_to_page_end(
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
     finish_timeout_ms: int,
+    bottom_debug: bool = False,
 ) -> bool:
     """Финальный проход: агрессивно доскролливает страницу до конца, если основной цикл не успел."""
     if finish_timeout_ms <= 0:
@@ -1504,8 +1712,10 @@ async def force_scroll_to_page_end(
     start = time.monotonic()
     stable_rounds = 0
     last_scroll = -1
+    round_index = 0
 
     while (time.monotonic() - start) * 1000 < finish_timeout_ms:
+        round_index += 1
         await perform_smooth_scroll(
             page,
             viewport_height,
@@ -1517,9 +1727,11 @@ async def force_scroll_to_page_end(
         try:
             metrics = await get_scroll_metrics(page)
             current_scroll = int(metrics.get("scrollY", last_scroll))
+            max_scroll = int(metrics.get("maxScroll", 0))
             at_bottom = bool(metrics.get("atBottom", False))
         except Exception:
             current_scroll = last_scroll
+            max_scroll = 0
             at_bottom = False
 
         if current_scroll <= last_scroll + 2:
@@ -1530,13 +1742,36 @@ async def force_scroll_to_page_end(
             except Exception:
                 pass
 
+        bottom_confirmed = False
+        bottom_reason = "atBottom=false"
         if at_bottom:
+            if max_scroll > 12:
+                bottom_confirmed = current_scroll >= (max_scroll - 8)
+                bottom_reason = f"window distance={max_scroll - current_scroll}"
+            else:
+                bottom_confirmed = round_index >= 8
+                bottom_reason = f"fallback rounds={round_index}"
+        elif max_scroll > 12:
+            bottom_reason = f"window distance={max_scroll - current_scroll}"
+
+        if bottom_debug and (
+            round_index % 6 == 0
+            or (at_bottom and not bottom_confirmed)
+            or bottom_confirmed
+        ):
+            logger.info(
+                "🧭 Force-bottom check: "
+                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
+                f"scrollY={current_scroll}, maxScroll={max_scroll}, stable={stable_rounds}"
+            )
+
+        if bottom_confirmed:
             stable_rounds += 1
         else:
             stable_rounds = 0
 
         last_scroll = max(last_scroll, current_scroll)
-        if stable_rounds >= 2:
+        if stable_rounds >= 3:
             return True
 
     return False
@@ -2109,6 +2344,7 @@ async def run_smart_cursor(
     smart_cursor_require_bottom: bool,
     smart_cursor_require_bottom_max_ms: int,
     strict_top_to_bottom_allow_clicks: bool,
+    bottom_debug: bool,
 ) -> int:
     """Фазовый обход сайта: сначала полный скролл, потом вкладки и интерактив."""
     start_time = time.monotonic()
@@ -2169,6 +2405,7 @@ async def run_smart_cursor(
             require_bottom=smart_cursor_require_bottom,
             require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
             strict_allow_clicks=strict_top_to_bottom_allow_clicks,
+            bottom_debug=bottom_debug,
         )
         hovered_count += strict_hovered
         if reached_bottom:
@@ -2229,15 +2466,39 @@ async def run_smart_cursor(
                 and not is_probable_top_nav_target(item, viewport_height)
             ]
             if hover_candidates and random.random() < 0.55:
-                pick = random.choice(hover_candidates[:5])
+                surface_candidates = [item for item in hover_candidates if bool(item.get("isSurfaceHover", False))]
+                if surface_candidates and random.random() < 0.74:
+                    pick = random.choice(surface_candidates[: min(5, len(surface_candidates))])
+                else:
+                    pick = random.choice(hover_candidates[:5])
                 tx = float(pick["x"])
                 ty = float(pick["y"])
+                target_width = float(pick.get("width", 0.0))
+                target_height = float(pick.get("height", 0.0))
+                is_surface_hover = bool(pick.get("isSurfaceHover", False))
                 try:
-                    cursor_pos = await move_mouse_human_like(
-                        page, cursor_pos, (tx, ty),
-                        viewport_width, viewport_height, random.randint(200, 600),
-                    )
-                    await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                    if is_surface_hover and (target_width >= 120 or target_height >= 90):
+                        span_x = min(max(target_width * 0.22, 22.0), viewport_width * 0.22)
+                        span_y = min(max(target_height * 0.17, 18.0), viewport_height * 0.18)
+                        path_points = [
+                            (clamp(tx - span_x, 2, viewport_width - 2), ty),
+                            (tx, clamp(ty - span_y, 2, viewport_height - 2)),
+                            (clamp(tx + span_x, 2, viewport_width - 2), ty),
+                            (tx, clamp(ty + span_y, 2, viewport_height - 2)),
+                            (tx, ty),
+                        ]
+                        for point in path_points:
+                            cursor_pos = await move_mouse_human_like(
+                                page, cursor_pos, point,
+                                viewport_width, viewport_height, random.randint(90, 260),
+                            )
+                            await page.wait_for_timeout(random.randint(max(60, int(hover_min_ms * 0.35)), max(100, int(hover_max_ms * 0.58))))
+                    else:
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos, (tx, ty),
+                            viewport_width, viewport_height, random.randint(200, 600),
+                        )
+                        await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
                     visited_keys.add(str(pick.get("key", "")))
                     hovered_count += 1
                 except Exception:
@@ -2395,7 +2656,11 @@ async def run_smart_cursor(
             if inpage_click_enabled and media_candidates and random.random() < 0.60:
                 target = random.choice(media_candidates[: min(5, len(media_candidates))])
             elif candidates and (max_targets <= 0 or hovered_count < max_targets):
-                top_pool = sorted(candidates, key=target_sort_score, reverse=True)[:8]
+                surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False))]
+                if surface_hover_candidates and random.random() < 0.62:
+                    top_pool = sorted(surface_hover_candidates, key=target_sort_score, reverse=True)[:8]
+                else:
+                    top_pool = sorted(candidates, key=target_sort_score, reverse=True)[:8]
                 target = random.choice(top_pool[:3] if len(top_pool) >= 3 else top_pool)
 
             if target is None and candidates:
@@ -2421,20 +2686,40 @@ async def run_smart_cursor(
             if target is not None:
                 tx = float(target["x"])
                 ty = float(target["y"])
+                target_width = float(target.get("width", 0.0))
+                target_height = float(target.get("height", 0.0))
+                is_surface_hover = bool(target.get("isSurfaceHover", False))
                 try:
-                    cursor_pos = await move_mouse_human_like(
-                        page, cursor_pos, (tx, ty),
-                        viewport_width, viewport_height, random.randint(260, 860),
-                    )
-                    await page.wait_for_timeout(random.randint(40, 120))
+                    if is_surface_hover and (target_width >= 120 or target_height >= 90):
+                        span_x = min(max(target_width * 0.23, 24.0), viewport_width * 0.24)
+                        span_y = min(max(target_height * 0.19, 20.0), viewport_height * 0.20)
+                        sweep = [
+                            (clamp(tx - span_x, 1, viewport_width - 1), ty),
+                            (tx, clamp(ty - span_y, 1, viewport_height - 1)),
+                            (clamp(tx + span_x, 1, viewport_width - 1), ty),
+                            (tx, clamp(ty + span_y, 1, viewport_height - 1)),
+                            (tx, ty),
+                        ]
+                        for point in sweep:
+                            cursor_pos = await move_mouse_human_like(
+                                page, cursor_pos, point,
+                                viewport_width, viewport_height, random.randint(90, 280),
+                            )
+                            await page.wait_for_timeout(random.randint(max(65, int(hover_min_ms * 0.34)), max(110, int(hover_max_ms * 0.62))))
+                    else:
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos, (tx, ty),
+                            viewport_width, viewport_height, random.randint(260, 860),
+                        )
+                        await page.wait_for_timeout(random.randint(40, 120))
 
-                    jitter_rx = max(2.0, min(float(target.get("width", 0.0)) * 0.12, 14.0))
-                    jitter_ry = max(2.0, min(float(target.get("height", 0.0)) * 0.12, 12.0))
-                    jx = clamp(tx + random.uniform(-jitter_rx, jitter_rx), 1, viewport_width - 1)
-                    jy = clamp(ty + random.uniform(-jitter_ry, jitter_ry), 1, viewport_height - 1)
-                    await page.mouse.move(jx, jy)
-                    await page.wait_for_timeout(random.randint(24, 80))
-                    await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                        jitter_rx = max(2.0, min(target_width * 0.12, 14.0))
+                        jitter_ry = max(2.0, min(target_height * 0.12, 12.0))
+                        jx = clamp(tx + random.uniform(-jitter_rx, jitter_rx), 1, viewport_width - 1)
+                        jy = clamp(ty + random.uniform(-jitter_ry, jitter_ry), 1, viewport_height - 1)
+                        await page.mouse.move(jx, jy)
+                        await page.wait_for_timeout(random.randint(24, 80))
+                        await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
                 except Exception as exc:
                     if _is_nav_error(exc):
                         await _recover_after_nav(page)
@@ -2522,18 +2807,18 @@ async def main():
         render_timeout = int(os.getenv('RENDER_TIMEOUT', '5000'))
         load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
         smart_cursor_enabled = env_bool('SMART_CURSOR_ENABLED', True)
-        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '120000'))
-        smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '24'))
-        hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '450'))
-        hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '1300'))
+        smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '360000'))
+        smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '0'))
+        hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '220'))
+        hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '760'))
         entry_click_enabled = env_bool('SMART_CURSOR_ENTRY_CLICK_ENABLED', True)
-        entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '2'))
+        entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '3'))
         scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
-        bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '3'))
-        scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.4'))
-        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '25'))
+        bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '4'))
+        scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.25'))
+        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '24'))
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
-        scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '22000'))
+        scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '45000'))
         nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', False)
         nav_tabs_max_visits = int(os.getenv('SMART_CURSOR_NAV_TABS_MAX_VISITS', '10'))
         nav_tab_scroll_timeout_ms = int(os.getenv('SMART_CURSOR_NAV_TAB_SCROLL_TIMEOUT_MS', '17000'))
@@ -2543,7 +2828,8 @@ async def main():
         strict_top_to_bottom_mode = env_bool('SMART_CURSOR_STRICT_TOP_TO_BOTTOM', True)
         strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', False)
         smart_cursor_require_bottom = env_bool('SMART_CURSOR_REQUIRE_BOTTOM', True)
-        smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '240000'))
+        smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '900000'))
+        smart_cursor_bottom_debug = env_bool('SMART_CURSOR_BOTTOM_DEBUG', False)
         screenshot_enabled = env_bool('SCREENSHOT_ENABLED', True)
         screenshot_timeout_ms = int(os.getenv('SCREENSHOT_TIMEOUT_MS', '8000'))
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
@@ -2576,6 +2862,7 @@ async def main():
         logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict allow clicks: {'ENABLED' if strict_top_to_bottom_allow_clicks else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor require bottom: {'ENABLED' if smart_cursor_require_bottom else 'DISABLED'} (max={smart_cursor_require_bottom_max_ms}ms)")
+        logger.info(f"🧭 Smart cursor bottom debug: {'ENABLED' if smart_cursor_bottom_debug else 'DISABLED'}")
         logger.info(f"📸 Screenshot: {'ENABLED' if screenshot_enabled else 'DISABLED'} (timeout={screenshot_timeout_ms}ms)")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
@@ -2669,6 +2956,7 @@ async def main():
                     smart_cursor_require_bottom=smart_cursor_require_bottom,
                     smart_cursor_require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
                     strict_top_to_bottom_allow_clicks=strict_top_to_bottom_allow_clicks,
+                    bottom_debug=smart_cursor_bottom_debug,
                 )
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
