@@ -19,6 +19,14 @@ if ! [[ "$SCREEN_DEPTH" =~ ^[0-9]+$ ]]; then
   SCREEN_DEPTH=24
 fi
 
+# libx264 (yuv420p) требует чётные размеры кадра.
+if [ $((SCREEN_WIDTH % 2)) -ne 0 ]; then
+  SCREEN_WIDTH=$((SCREEN_WIDTH - 1))
+fi
+if [ $((SCREEN_HEIGHT % 2)) -ne 0 ]; then
+  SCREEN_HEIGHT=$((SCREEN_HEIGHT - 1))
+fi
+
 # Очистка устаревших lock-файлов Xvfb (после аварийного перезапуска контейнера)
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
 
@@ -64,10 +72,24 @@ fi
 
 FILTER_ARGS=()
 if [ "$FFMPEG_CROP_TOP" -gt 0 ]; then
+  # y (crop top) тоже делаем чётным, чтобы избежать проблем кодека.
+  if [ $((FFMPEG_CROP_TOP % 2)) -ne 0 ]; then
+    FFMPEG_CROP_TOP=$((FFMPEG_CROP_TOP + 1))
+  fi
+
   CROP_HEIGHT=$((SCREEN_HEIGHT - FFMPEG_CROP_TOP))
   if [ "$CROP_HEIGHT" -lt 100 ]; then
     CROP_HEIGHT=100
   fi
+
+  # h должен быть чётным для yuv420p/libx264.
+  if [ $((CROP_HEIGHT % 2)) -ne 0 ]; then
+    CROP_HEIGHT=$((CROP_HEIGHT - 1))
+  fi
+
+  # Пересчитываем верхний отступ после коррекции высоты.
+  FFMPEG_CROP_TOP=$((SCREEN_HEIGHT - CROP_HEIGHT))
+
   FILTER_ARGS=(-vf "crop=${SCREEN_WIDTH}:${CROP_HEIGHT}:0:${FFMPEG_CROP_TOP}")
 fi
 
