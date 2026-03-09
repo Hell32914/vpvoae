@@ -1406,6 +1406,8 @@ async def run_strict_top_to_bottom_pass(
     micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
     surface_hover_min = max(micro_hover_min + 30, int(hover_min_ms * 0.42))
     surface_hover_max = max(surface_hover_min + 35, int(hover_max_ms * 0.75))
+    hover_showcase_min = max(240, int(hover_min_ms * 0.95))
+    hover_showcase_max = max(hover_showcase_min + 90, int(hover_max_ms * 1.20))
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -1436,7 +1438,13 @@ async def run_strict_top_to_bottom_pass(
 
         try:
             metrics = await get_scroll_metrics(page)
-            scroll_y = int(metrics.get("scrollY", max(last_scroll_y, 0)))
+            scroll_y_raw = int(metrics.get("scrollY", max(last_scroll_y, 0)))
+            if bottom_debug and last_scroll_y >= 0 and scroll_y_raw + 8 < last_scroll_y:
+                logger.info(
+                    "🧭 Scroll rebound detected: "
+                    f"raw={scroll_y_raw}, last={last_scroll_y}. Принудительно держим движение вниз"
+                )
+            scroll_y = max(scroll_y_raw, max(last_scroll_y, 0))
             at_bottom_now = bool(metrics.get("atBottom", False))
         except Exception as exc:
             if _is_nav_error(exc):
@@ -1461,11 +1469,19 @@ async def run_strict_top_to_bottom_pass(
             if candidates:
                 hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
                 surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False))]
+                any_hover_candidates = [
+                    item for item in candidates
+                    if bool(item.get("isSurfaceHover", False)) or bool(item.get("isHoverText", False))
+                ]
 
-                if surface_hover_candidates and (not hover_text_candidates or random.random() < 0.62):
+                # В режиме спуска: если hover найден, сначала обязательно показываем его,
+                # и только затем продолжаем скролл вниз.
+                if surface_hover_candidates:
                     pool = sorted(surface_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(surface_hover_candidates))]
                 elif hover_text_candidates:
                     pool = sorted(hover_text_candidates, key=target_sort_score, reverse=True)[: min(8, len(hover_text_candidates))]
+                elif any_hover_candidates:
+                    pool = sorted(any_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(any_hover_candidates))]
                 else:
                     pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(8, len(candidates))]
                 target = random.choice(pool[:3] if len(pool) >= 3 else pool)
@@ -1532,6 +1548,13 @@ async def run_strict_top_to_bottom_pass(
                     if _is_nav_error(exc):
                         await _recover_after_nav(page)
                         continue
+                    if bottom_debug:
+                        logger.info(f"🧭 Hover interaction skipped due to error: {exc}")
+                    continue
+
+                if is_surface_hover or is_hover_text:
+                    # Обязательная пауза показа результата hover перед продолжением спуска.
+                    await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
 
                 visited_keys.add(target_key)
                 hovered_count += 1
@@ -1591,7 +1614,13 @@ async def run_strict_top_to_bottom_pass(
 
         try:
             after_metrics = await get_scroll_metrics(page)
-            current_scroll_y = int(after_metrics.get("scrollY", scroll_y))
+            current_scroll_raw = int(after_metrics.get("scrollY", scroll_y))
+            if bottom_debug and last_scroll_y >= 0 and current_scroll_raw + 8 < last_scroll_y:
+                logger.info(
+                    "🧭 Scroll rebound detected (post-scroll): "
+                    f"raw={current_scroll_raw}, last={last_scroll_y}. Игнорируем откат"
+                )
+            current_scroll_y = max(current_scroll_raw, max(last_scroll_y, scroll_y))
             max_scroll_y = int(after_metrics.get("maxScroll", 0))
             at_bottom = bool(after_metrics.get("atBottom", at_bottom_now))
         except Exception as exc:
@@ -2341,6 +2370,7 @@ async def run_smart_cursor(
     inpage_click_probability: float,
     allow_internal_nav_click: bool,
     strict_top_to_bottom_mode: bool,
+    always_descend: bool,
     smart_cursor_require_bottom: bool,
     smart_cursor_require_bottom_max_ms: int,
     strict_top_to_bottom_allow_clicks: bool,
@@ -2384,7 +2414,10 @@ async def run_smart_cursor(
             if clicked_key:
                 clicked_entry_keys.add(clicked_key)
 
-    if strict_top_to_bottom_mode:
+    strict_mode_active = strict_top_to_bottom_mode or always_descend
+    if strict_mode_active:
+        if always_descend and not strict_top_to_bottom_mode:
+            logger.info("🧭 Smart cursor: включен ALWAYS_DESCEND, принудительно используем STRICT проход")
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
         cursor_pos, strict_hovered, reached_bottom = await run_strict_top_to_bottom_pass(
             page=page,
@@ -2402,7 +2435,7 @@ async def run_smart_cursor(
             inpage_click_enabled=inpage_click_enabled,
             inpage_click_probability=inpage_click_probability,
             scroll_finish_timeout_ms=scroll_finish_timeout_ms,
-            require_bottom=smart_cursor_require_bottom,
+            require_bottom=(smart_cursor_require_bottom or always_descend),
             require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
             strict_allow_clicks=strict_top_to_bottom_allow_clicks,
             bottom_debug=bottom_debug,
@@ -2826,6 +2859,7 @@ async def main():
         inpage_click_probability = float(os.getenv('SMART_CURSOR_INPAGE_CLICK_PROBABILITY', '0.18'))
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', False)
         strict_top_to_bottom_mode = env_bool('SMART_CURSOR_STRICT_TOP_TO_BOTTOM', True)
+        smart_cursor_always_descend = env_bool('SMART_CURSOR_ALWAYS_DESCEND', True)
         strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', False)
         smart_cursor_require_bottom = env_bool('SMART_CURSOR_REQUIRE_BOTTOM', True)
         smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '900000'))
@@ -2860,6 +2894,7 @@ async def main():
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
+        logger.info(f"🧭 Smart cursor always descend: {'ENABLED' if smart_cursor_always_descend else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict allow clicks: {'ENABLED' if strict_top_to_bottom_allow_clicks else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor require bottom: {'ENABLED' if smart_cursor_require_bottom else 'DISABLED'} (max={smart_cursor_require_bottom_max_ms}ms)")
         logger.info(f"🧭 Smart cursor bottom debug: {'ENABLED' if smart_cursor_bottom_debug else 'DISABLED'}")
@@ -2874,7 +2909,6 @@ async def main():
                 '--disable-dev-shm-usage',
                 '--no-sandbox',
                 '--disable-extensions',
-                '--disable-web-resources',
                 '--kiosk',
                 '--start-fullscreen',
                 '--start-maximized',
@@ -2953,6 +2987,7 @@ async def main():
                     inpage_click_probability=inpage_click_probability,
                     allow_internal_nav_click=allow_internal_nav_click,
                     strict_top_to_bottom_mode=strict_top_to_bottom_mode,
+                    always_descend=smart_cursor_always_descend,
                     smart_cursor_require_bottom=smart_cursor_require_bottom,
                     smart_cursor_require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
                     strict_top_to_bottom_allow_clicks=strict_top_to_bottom_allow_clicks,
