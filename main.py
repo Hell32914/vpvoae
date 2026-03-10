@@ -856,6 +856,36 @@ def nav_family_key(target: Dict[str, Any]) -> str:
     return f"{tag}|{text_token}|{href_token}|{x_bucket}"
 
 
+def strict_target_family_key(target: Dict[str, Any]) -> str:
+    """Стабильный ключ цели для STRICT режима, устойчивый к мелкому дрожанию координат/текста."""
+    tag = str(target.get("tag", "")).strip().lower()
+    text_raw = str(target.get("text", "")).strip().lower()
+    text_norm = " ".join("".join(ch if ch.isalnum() else " " for ch in text_raw).split())
+    href = str(target.get("href", "")).strip().lower().split("?")[0]
+
+    x = float(target.get("x", 0.0))
+    abs_y = float(target.get("absY", target.get("y", 0.0)))
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+
+    x_bucket = int(max(0.0, x) / 92)
+    y_bucket = int(max(0.0, abs_y) / 240)
+    area_bucket = int(max(0.0, width * height) / 8500)
+
+    marker = ""
+    if bool(target.get("isSurfaceHover", False)):
+        marker += "S"
+    if bool(target.get("isHoverText", False)):
+        marker += "H"
+
+    # Для подписанных/ссылочных контролов intentionally ослабляем зависимость от y,
+    # чтобы не повторять одни и те же fixed/sticky hover-цели при прокрутке.
+    if text_norm or href:
+        return f"{tag}|{text_norm[:26]}|{href[:36]}|x{x_bucket}|a{area_bucket}|{marker}"
+
+    return f"{tag}|x{x_bucket}|y{y_bucket}|a{area_bucket}|{marker}"
+
+
 async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
     """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
     return await page.evaluate(
@@ -1379,7 +1409,10 @@ async def run_strict_top_to_bottom_pass(
     hovered_count = 0
     reached_bottom = False
     visited_keys: Set[str] = set()
+    visited_families: Set[str] = set()
     clicked_keys: Set[str] = set()
+    clicked_families: Set[str] = set()
+    recent_interactions: List[Tuple[float, float, float, int]] = []
     analysis_targets: List[Dict[str, Any]] = []
 
     widget_action_words = (
@@ -1463,15 +1496,64 @@ async def run_strict_top_to_bottom_pass(
         if can_interact and analysis_targets:
             viewport_top = scroll_y + int(viewport_height * 0.16)
             viewport_bottom = scroll_y + int(viewport_height * 0.86)
+            current_url = str(page.url or "")
 
-            candidates = [
-                item for item in analysis_targets
-                if str(item.get("key", "")) not in visited_keys
-                and viewport_top <= int(float(item.get("absY", 0.0))) <= viewport_bottom
-                and not is_probable_top_nav_target(item, viewport_height)
-            ]
+            candidates: List[Dict[str, Any]] = []
+            for item in analysis_targets:
+                item_key = str(item.get("key", ""))
+                if not item_key or item_key in visited_keys:
+                    continue
+
+                item_abs_y = float(item.get("absY", 0.0))
+                if not (viewport_top <= int(item_abs_y) <= viewport_bottom):
+                    continue
+                if is_probable_top_nav_target(item, viewport_height):
+                    continue
+
+                item_family = strict_target_family_key(item)
+                if item_family in visited_families:
+                    continue
+
+                item_x = float(item.get("x", viewport_width * 0.5))
+                item_view_y = clamp(item_abs_y - scroll_y, 2, viewport_height - 2)
+                recently_repeated = False
+                for px, py, p_abs_y, p_round in recent_interactions:
+                    if round_index - p_round > 7:
+                        continue
+                    if abs(item_abs_y - p_abs_y) > max(140.0, viewport_height * 0.22):
+                        continue
+                    if math.hypot(item_x - px, item_view_y - py) <= max(76.0, min(viewport_width, viewport_height) * 0.10):
+                        recently_repeated = True
+                        break
+                if recently_repeated:
+                    continue
+
+                candidates.append(item)
 
             if candidates:
+                priority_click_candidates: List[Dict[str, Any]] = []
+                for item in candidates:
+                    txt = str(item.get("text", "")).strip().lower()
+                    href = str(item.get("href", "")).strip().lower()
+                    tag = str(item.get("tag", "")).strip().lower()
+                    width = float(item.get("width", 0.0))
+                    height = float(item.get("height", 0.0))
+                    area = width * height
+
+                    action_hint = has_keyword(txt, hover_click_words) or has_keyword(txt, widget_action_words)
+                    button_like = tag in {"button", "summary"}
+                    no_nav_href = (not href) or href.startswith("#") or href.startswith("javascript:")
+                    compact = area <= 30000 and width <= 260 and height <= 170
+
+                    looks_clickable_trigger = (
+                        action_hint
+                        or (button_like and compact)
+                        or (no_nav_href and compact and txt and len(txt) <= 24)
+                    )
+
+                    if looks_clickable_trigger and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click=False):
+                        priority_click_candidates.append(item)
+
                 hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
                 surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False))]
                 any_hover_candidates = [
@@ -1481,7 +1563,9 @@ async def run_strict_top_to_bottom_pass(
 
                 # В режиме спуска: если hover найден, сначала обязательно показываем его,
                 # и только затем продолжаем скролл вниз.
-                if surface_hover_candidates:
+                if priority_click_candidates:
+                    pool = sorted(priority_click_candidates, key=target_sort_score, reverse=True)[: min(7, len(priority_click_candidates))]
+                elif surface_hover_candidates:
                     pool = sorted(surface_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(surface_hover_candidates))]
                 elif hover_text_candidates:
                     pool = sorted(hover_text_candidates, key=target_sort_score, reverse=True)[: min(8, len(hover_text_candidates))]
@@ -1489,11 +1573,13 @@ async def run_strict_top_to_bottom_pass(
                     pool = sorted(any_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(any_hover_candidates))]
                 else:
                     pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(8, len(candidates))]
-                target = random.choice(pool[:3] if len(pool) >= 3 else pool)
+                target = random.choice(pool[:2] if len(pool) >= 2 else pool)
 
                 tx = clamp(float(target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
                 ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
+                target_abs_y = float(target.get("absY", scroll_y + ty))
                 target_key = str(target.get("key", ""))
+                target_family = strict_target_family_key(target)
                 is_hover_text = bool(target.get("isHoverText", False))
                 is_surface_hover = bool(target.get("isSurfaceHover", False))
                 target_width = float(target.get("width", 0.0))
@@ -1562,7 +1648,11 @@ async def run_strict_top_to_bottom_pass(
                     await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
 
                 visited_keys.add(target_key)
+                visited_families.add(target_family)
                 hovered_count += 1
+                recent_interactions.append((tx, ty, target_abs_y, round_index))
+                if len(recent_interactions) > 20:
+                    recent_interactions.pop(0)
 
                 target_text = str(target.get("text", ""))
                 target_href = str(target.get("href", "")).strip().lower()
@@ -1579,6 +1669,7 @@ async def run_strict_top_to_bottom_pass(
                 should_click = (
                     inpage_click_enabled
                     and target_key not in clicked_keys
+                    and target_family not in clicked_families
                     and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=False)
                     and (strict_allow_clicks or action_hint or is_local_trigger)
                 )
@@ -1587,13 +1678,15 @@ async def run_strict_top_to_bottom_pass(
                 if strict_allow_clicks:
                     click_probability = max(click_probability, 0.42)
                 if is_local_trigger:
-                    click_probability = max(click_probability, 0.62)
+                    click_probability = max(click_probability, 0.82)
                 if action_hint:
-                    click_probability = max(click_probability, 0.86)
+                    click_probability = 1.0
                 if has_keyword(target_text, widget_action_words):
-                    click_probability = max(click_probability, 0.72)
+                    click_probability = max(click_probability, 0.88)
                 if is_surface_hover and not action_hint:
-                    click_probability = min(click_probability, 0.38)
+                    click_probability = min(click_probability, 0.32)
+                if target_tag in {"button", "summary"} and not target_href:
+                    click_probability = max(click_probability, 0.92)
 
                 if should_click and random.random() < click_probability:
                     before_url = str(page.url or "")
@@ -1606,6 +1699,7 @@ async def run_strict_top_to_bottom_pass(
                             await _recover_after_nav(page)
                             continue
                     clicked_keys.add(target_key)
+                    clicked_families.add(target_family)
 
                     after_url = str(page.url or "")
                     if after_url != before_url:
@@ -1641,7 +1735,14 @@ async def run_strict_top_to_bottom_pass(
                         radius_limit = max(180.0, min(viewport_width, viewport_height) * 0.28)
                         for item in nearby_targets:
                             item_key = str(item.get("key", ""))
-                            if not item_key or item_key in clicked_keys or item_key == target_key:
+                            item_family = strict_target_family_key(item)
+                            if (
+                                not item_key
+                                or item_key in clicked_keys
+                                or item_key == target_key
+                                or item_family in clicked_families
+                                or item_family == target_family
+                            ):
                                 continue
                             if not is_safe_inpage_click_target(item, str(page.url or ""), allow_internal_nav_click=False):
                                 continue
@@ -1679,7 +1780,12 @@ async def run_strict_top_to_bottom_pass(
                                 await page.mouse.click(ftx, fty, delay=random.randint(30, 95))
                                 await page.wait_for_timeout(random.randint(140, 320))
                                 clicked_keys.add(fk)
+                                clicked_families.add(strict_target_family_key(follow_target))
                                 visited_keys.add(fk)
+                                visited_families.add(strict_target_family_key(follow_target))
+                                recent_interactions.append((ftx, fty, float(scroll_y + fty), round_index))
+                                if len(recent_interactions) > 20:
+                                    recent_interactions.pop(0)
                                 logger.info("🖱️ Smart cursor: выполнен follow-up клик по соседней hover-цели")
                             except Exception as exc:
                                 if _is_nav_error(exc):
