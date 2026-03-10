@@ -914,6 +914,36 @@ def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_
     return score >= 55
 
 
+def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str) -> bool:
+    """Безопасная фильтрация top-nav вкладок: разрешаем внутренние разделы, но исключаем внешние/commerce/system."""
+    text = str(target.get("text", "")).strip().lower()
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+
+    if tag in {"input", "textarea", "select"}:
+        return False
+
+    blocked_words = (
+        "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
+        "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
+        "login", "sign in", "account", "privacy", "terms", "cookie",
+    )
+    if has_keyword(text, blocked_words) or has_keyword(href, blocked_words):
+        return False
+
+    if href and is_external_href(href, current_url):
+        return False
+
+    width = float(target.get("width", 0.0))
+    height = float(target.get("height", 0.0))
+    score = float(target.get("score", 0.0))
+    if width < 14 or height < 10:
+        return False
+
+    # Для меню ослабляем порог относительно generic click target.
+    return score >= 35
+
+
 def is_probable_top_nav_target(target: Dict[str, Any], viewport_height: int) -> bool:
     """Универсально определяет элементы верхней навигации (вкладки/пункты меню)."""
     y = float(target.get("y", viewport_height))
@@ -1001,10 +1031,16 @@ def strict_target_family_key(target: Dict[str, Any]) -> str:
     if bool(target.get("isHoverText", False)):
         marker += "H"
 
+    # Для hover-эффектов в глубине страницы сохраняем привязку к y-bucket,
+    # чтобы не терять похожие эффекты в разных секциях.
+    hover_depth_bucket = ""
+    if marker and abs_y >= 360:
+        hover_depth_bucket = f"|y{y_bucket}"
+
     # Для подписанных/ссылочных контролов intentionally ослабляем зависимость от y,
     # чтобы не повторять одни и те же fixed/sticky hover-цели при прокрутке.
     if text_norm or href:
-        return f"{tag}|{text_norm[:26]}|{href[:36]}|x{x_bucket}|a{area_bucket}|{marker}"
+        return f"{tag}|{text_norm[:26]}|{href[:36]}|x{x_bucket}{hover_depth_bucket}|a{area_bucket}|{marker}"
 
     return f"{tag}|x{x_bucket}|y{y_bucket}|a{area_bucket}|{marker}"
 
@@ -1728,6 +1764,7 @@ async def run_strict_top_to_bottom_pass(
     click_sequence_max_steps: int,
     click_sequence_radius_factor: float,
     allow_internal_nav_click: bool,
+    strict_interactions_per_scroll: int,
 ) -> Tuple[Tuple[float, float], int, bool]:
     """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
@@ -1770,6 +1807,8 @@ async def run_strict_top_to_bottom_pass(
     surface_hover_max = max(surface_hover_min + 35, int(hover_max_ms * 0.75))
     hover_showcase_min = max(240, int(hover_min_ms * 0.95))
     hover_showcase_max = max(hover_showcase_min + 90, int(hover_max_ms * 1.20))
+    strict_interactions_per_scroll = max(1, min(int(strict_interactions_per_scroll), 4))
+    rounds_since_scroll = 0
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -1779,6 +1818,7 @@ async def run_strict_top_to_bottom_pass(
             break
 
         round_index += 1
+        interacted_this_round = False
 
         if round_index == 1 or (round_index - last_analysis_round) >= 8:
             try:
@@ -1995,6 +2035,7 @@ async def run_strict_top_to_bottom_pass(
                 visited_keys.add(target_key)
                 visited_families.add(target_family)
                 hovered_count += 1
+                interacted_this_round = True
                 recent_interactions.append((tx, ty, target_abs_y, round_index))
                 if len(recent_interactions) > 20:
                     recent_interactions.pop(0)
@@ -2115,13 +2156,26 @@ async def run_strict_top_to_bottom_pass(
             except Exception:
                 pass
 
-        await perform_smooth_scroll(
-            page=page,
-            viewport_height=viewport_height,
-            scroll_speed_factor=scroll_speed_factor,
-            scroll_pause_min_ms=scroll_pause_min_ms,
-            scroll_pause_max_ms=scroll_pause_max_ms,
-        )
+        should_scroll_now = True
+        if strict_interactions_per_scroll > 1 and interacted_this_round:
+            rounds_since_scroll += 1
+            if rounds_since_scroll < strict_interactions_per_scroll:
+                should_scroll_now = False
+            else:
+                rounds_since_scroll = 0
+        else:
+            rounds_since_scroll = 0
+
+        if should_scroll_now:
+            await perform_smooth_scroll(
+                page=page,
+                viewport_height=viewport_height,
+                scroll_speed_factor=scroll_speed_factor,
+                scroll_pause_min_ms=scroll_pause_min_ms,
+                scroll_pause_max_ms=scroll_pause_max_ms,
+            )
+        else:
+            await page.wait_for_timeout(random.randint(max(40, scroll_pause_min_ms), max(80, scroll_pause_max_ms + 30)))
 
         try:
             after_metrics = await get_scroll_metrics(page)
@@ -2149,14 +2203,15 @@ async def run_strict_top_to_bottom_pass(
                 f"stagnant={stagnant_rounds}, hovered={hovered_count}"
             )
 
-        if current_scroll_y <= last_scroll_y + 3:
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
+        if should_scroll_now:
+            if current_scroll_y <= last_scroll_y + 3:
+                stagnant_rounds += 1
+            else:
+                stagnant_rounds = 0
 
-        if stagnant_rounds >= 3:
-            await force_scroll_progress(page, viewport_height)
-            stagnant_rounds = 0
+            if stagnant_rounds >= 3:
+                await force_scroll_progress(page, viewport_height)
+                stagnant_rounds = 0
 
         last_scroll_y = max(last_scroll_y, current_scroll_y)
         analysis_max_abs_y = max(
@@ -2463,9 +2518,8 @@ async def collect_header_nav_targets(
     current_url = str(page.url or "")
     safe = [
         item for item in (raw or [])
-        if nav_signature(item) not in visited_nav_keys
-        and is_probable_top_nav_target(item, viewport_height)
-        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+        if is_probable_top_nav_target(item, viewport_height)
+        and is_safe_nav_tab_target(item, current_url)
         and not is_nav_tab_self_link(item, current_url)
     ]
 
@@ -2517,8 +2571,7 @@ async def collect_top_nav_targets(
     candidates = [
         item for item in targets
         if is_probable_top_nav_target(item, viewport_height)
-        and nav_signature(item) not in visited_nav_keys
-        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+        and is_safe_nav_tab_target(item, current_url)
         and not is_nav_tab_self_link(item, current_url)
     ]
 
@@ -2559,6 +2612,7 @@ async def visit_top_navigation_tabs(
 ) -> Tuple[Tuple[float, float], int]:
     """Проходит по вкладкам верхней навигации последовательно, а не случайно."""
     visited_count = 0
+    visited_nav_families: Set[str] = set()
     if max_nav_tabs_to_visit <= 0:
         return cursor_pos, visited_count
 
@@ -2584,12 +2638,23 @@ async def visit_top_navigation_tabs(
         if not nav_targets:
             break
 
-        target = nav_targets[0]
+        target: Optional[Dict[str, Any]] = None
+        for candidate in nav_targets:
+            if nav_family_key(candidate) in visited_nav_families:
+                continue
+            target = candidate
+            break
+
+        if target is None:
+            break
+
+        target_family = nav_family_key(target)
 
         # Дополнительная проверка: self-link мог просочиться из-за изменения URL
         current_url = str(page.url or "")
         if is_nav_tab_self_link(target, current_url):
             visited_nav_keys.add(nav_signature(target))
+            visited_nav_families.add(target_family)
             continue
 
         try:
@@ -2618,6 +2683,7 @@ async def visit_top_navigation_tabs(
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
                 visited_nav_keys.add(nav_signature(target))
+                visited_nav_families.add(target_family)
                 continue
             raise
 
@@ -2631,6 +2697,7 @@ async def visit_top_navigation_tabs(
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
                 visited_nav_keys.add(nav_signature(target))
+                visited_nav_families.add(target_family)
                 visited_count += 1
                 logger.info(f"🧭 Smart cursor: вкладка вызвала навигацию '{str(target.get('text', '')).strip()[:32]}'")
                 # Скроллим новую страницу и возвращаемся.
@@ -2681,6 +2748,7 @@ async def visit_top_navigation_tabs(
 
         signature = nav_signature(target)
         visited_nav_keys.add(signature)
+        visited_nav_families.add(target_family)
         if changed:
             visited_count += 1
             logger.info(f"🧭 Smart cursor: открыта вкладка '{str(target.get('text', '')).strip()[:32]}'")
@@ -2941,11 +3009,12 @@ async def run_smart_cursor(
     recent_points: List[Tuple[float, float]] = []
     clicked_nav_keys: Set[str] = set()
 
-    hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.68), 0.15, 1.0)
-    click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.54), 0.10, 1.0)
-    min_visibility_clarity = clamp(env_float("SMART_CURSOR_MIN_VISIBILITY_CLARITY", 0.50), 0.10, 1.0)
-    click_sequence_max_steps = max(1, min(env_int("SMART_CURSOR_CLICK_SEQUENCE_MAX_STEPS", 2), 4))
+    hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.60), 0.15, 1.0)
+    click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.46), 0.10, 1.0)
+    min_visibility_clarity = clamp(env_float("SMART_CURSOR_MIN_VISIBILITY_CLARITY", 0.42), 0.10, 1.0)
+    click_sequence_max_steps = max(1, min(env_int("SMART_CURSOR_CLICK_SEQUENCE_MAX_STEPS", 3), 4))
     click_sequence_radius_factor = clamp(env_float("SMART_CURSOR_CLICK_SEQUENCE_RADIUS_FACTOR", 0.30), 0.12, 0.55)
+    strict_interactions_per_scroll = max(1, min(env_int("SMART_CURSOR_STRICT_INTERACTIONS_PER_SCROLL", 2), 4))
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -2955,7 +3024,8 @@ async def run_smart_cursor(
     logger.info(
         "🧭 Smart cursor visibility config: "
         f"hover_ratio={hover_visible_ratio:.2f}, click_ratio={click_visible_ratio:.2f}, "
-        f"clarity={min_visibility_clarity:.2f}, click_chain_steps={click_sequence_max_steps}"
+        f"clarity={min_visibility_clarity:.2f}, click_chain_steps={click_sequence_max_steps}, "
+        f"strict_interactions_per_scroll={strict_interactions_per_scroll}"
     )
 
     # ════════════════════════════════════════════════════════════════
@@ -3055,6 +3125,7 @@ async def run_smart_cursor(
             click_sequence_max_steps=click_sequence_max_steps,
             click_sequence_radius_factor=click_sequence_radius_factor,
             allow_internal_nav_click=allow_internal_nav_click,
+            strict_interactions_per_scroll=strict_interactions_per_scroll,
         )
         hovered_count += strict_hovered
         if reached_bottom:
