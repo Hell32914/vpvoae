@@ -53,6 +53,30 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
 
 
+def normalized_site_host(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower().strip(".")
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_same_site_url(candidate_url: str, allowed_url: str) -> bool:
+    if not candidate_url or not allowed_url:
+        return False
+    try:
+        candidate_parts = urlparse(candidate_url)
+    except Exception:
+        return False
+    if candidate_parts.scheme not in {"http", "https"}:
+        return False
+    candidate_host = normalized_site_host(candidate_url)
+    allowed_host = normalized_site_host(allowed_url)
+    return bool(candidate_host and allowed_host and candidate_host == allowed_host)
+
+
 def cubic_bezier(t: float, p0: float, p1: float, p2: float, p3: float) -> float:
     mt = 1 - t
     return (mt ** 3) * p0 + 3 * (mt ** 2) * t * p1 + 3 * mt * (t ** 2) * p2 + (t ** 3) * p3
@@ -813,26 +837,26 @@ def is_navigation_like_href(href: str, current_url: str) -> bool:
     if resolved_parts.scheme not in {"http", "https"}:
         return False
 
-    if resolved_parts.netloc != current_parts.netloc:
+    if not is_same_site_url(resolved, current_url):
         return True
 
     # Если путь/параметры отличаются - это переход на другую страницу.
     return (resolved_parts.path != current_parts.path) or (resolved_parts.query != current_parts.query)
 
 
-def is_external_href(href: str, current_url: str) -> bool:
+def is_external_href(href: str, current_url: str, allowed_url: Optional[str] = None) -> bool:
     clean = href.strip().lower()
     if not clean or clean.startswith("#") or clean.startswith("javascript:"):
         return False
 
     resolved = urljoin(current_url, href)
-    current_parts = urlparse(current_url)
     resolved_parts = urlparse(resolved)
 
     if resolved_parts.scheme not in {"http", "https"}:
-        return False
+        return True
 
-    return resolved_parts.netloc != current_parts.netloc
+    reference_url = allowed_url or current_url
+    return not is_same_site_url(resolved, reference_url)
 
 
 def is_nav_tab_self_link(target: Dict[str, Any], current_url: str) -> bool:
@@ -845,7 +869,7 @@ def is_nav_tab_self_link(target: Dict[str, Any], current_url: str) -> bool:
     resolved_parts = urlparse(resolved)
     if resolved_parts.scheme not in ("http", "https"):
         return False
-    if resolved_parts.netloc != current_parts.netloc:
+    if not is_same_site_url(resolved, current_url):
         return False
     current_path = current_parts.path.rstrip("/")
     resolved_path = resolved_parts.path.rstrip("/")
@@ -882,7 +906,74 @@ async def _recover_after_nav(page, timeout: int = 15000) -> None:
         pass
 
 
-def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_internal_nav_click: bool) -> bool:
+async def restore_page_location(
+    page: Any,
+    restore_url: str,
+    restore_scroll_y: Optional[float] = None,
+    timeout: int = 15000,
+) -> bool:
+    """Возвращает страницу на заданный URL и, если нужно, восстанавливает скролл."""
+    if not restore_url:
+        return False
+
+    restored = False
+    try:
+        await page.goto(restore_url, wait_until="domcontentloaded", timeout=timeout)
+        restored = True
+    except Exception:
+        try:
+            await page.go_back(wait_until="domcontentloaded", timeout=min(timeout, 9000))
+            restored = str(page.url or "") == restore_url
+        except Exception:
+            restored = False
+
+    if not restored:
+        return False
+
+    await _recover_after_nav(page, timeout=timeout)
+    if restore_scroll_y is not None:
+        try:
+            await page.evaluate(
+                """(top) => window.scrollTo({ top, left: 0, behavior: 'auto' })""",
+                int(max(0.0, restore_scroll_y)),
+            )
+            await page.wait_for_timeout(random.randint(220, 420))
+        except Exception:
+            pass
+    return True
+
+
+async def ensure_page_within_allowed_site(
+    page: Any,
+    allowed_url: str,
+    fallback_url: Optional[str] = None,
+    fallback_scroll_y: Optional[float] = None,
+    timeout: int = 15000,
+) -> bool:
+    """Возвращает страницу обратно на разрешённый сайт, если навигация ушла наружу."""
+    current_url = str(page.url or "")
+    if not current_url or is_same_site_url(current_url, allowed_url):
+        return False
+
+    restore_url = fallback_url if fallback_url and is_same_site_url(fallback_url, allowed_url) else allowed_url
+    logger.warning(
+        "⛔ Site guard: обнаружен уход с разрешённого сайта, "
+        f"текущий URL={current_url}, восстанавливаем {restore_url}"
+    )
+    return await restore_page_location(
+        page,
+        restore_url,
+        restore_scroll_y=fallback_scroll_y,
+        timeout=timeout,
+    )
+
+
+def is_safe_inpage_click_target(
+    target: Dict[str, Any],
+    current_url: str,
+    allow_internal_nav_click: bool,
+    allowed_url: Optional[str] = None,
+) -> bool:
     """Разрешаем клик только по элементам, которые не уводят на другую страницу."""
     text = str(target.get("text", "")).strip().lower()
     href = str(target.get("href", "")).strip().lower()
@@ -898,7 +989,7 @@ def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_
     if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
         return False
 
-    if href and is_external_href(href, current_url):
+    if href and is_external_href(href, current_url, allowed_url=allowed_url):
         return False
 
     if href and is_navigation_like_href(href, current_url) and not allow_internal_nav_click:
@@ -914,7 +1005,7 @@ def is_safe_inpage_click_target(target: Dict[str, Any], current_url: str, allow_
     return score >= 55
 
 
-def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str) -> bool:
+def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str, allowed_url: Optional[str] = None) -> bool:
     """Безопасная фильтрация top-nav вкладок: разрешаем внутренние разделы, но исключаем внешние/commerce/system."""
     text = str(target.get("text", "")).strip().lower()
     href = str(target.get("href", "")).strip().lower()
@@ -931,7 +1022,7 @@ def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str) -> bool:
     if has_keyword(text, blocked_words) or has_keyword(href, blocked_words):
         return False
 
-    if href and is_external_href(href, current_url):
+    if href and is_external_href(href, current_url, allowed_url=allowed_url):
         return False
 
     width = float(target.get("width", 0.0))
@@ -1204,6 +1295,7 @@ async def perform_followup_click_sequence(
     recent_interactions: Optional[List[Tuple[float, float, float, int]]] = None,
     round_index: int = 0,
     scroll_y: float = 0.0,
+    allowed_url: Optional[str] = None,
 ) -> Tuple[Tuple[float, float], int]:
     """Пробует цепочку соседних кликов для локальных step-by-step интерактивов."""
     if max_followup_steps <= 0:
@@ -1217,6 +1309,13 @@ async def perform_followup_click_sequence(
     current_family = str(anchor_family)
 
     for step_index in range(max_followup_steps):
+        if allowed_url:
+            await ensure_page_within_allowed_site(
+                page,
+                allowed_url,
+                fallback_url=allowed_url,
+                timeout=12000,
+            )
         if (time.monotonic() - started_at) * 1000 >= 2600:
             break
         wait_min = max(90, int(hover_min_ms * 0.40))
@@ -1235,7 +1334,7 @@ async def perform_followup_click_sequence(
         )
         radius_limit = min(radius_limit, max(viewport_width, viewport_height) * 0.58)
 
-        ranked: List[Tuple[Tuple[int, int, float, float], Dict[str, Any]]] = []
+        ranked: List[Tuple[Tuple[int, int, int, int, float, float], Dict[str, Any]]] = []
         current_url = str(page.url or "")
 
         for item in nearby_targets:
@@ -1247,7 +1346,7 @@ async def perform_followup_click_sequence(
             if item_family in clicked_families or item_family == current_family:
                 continue
 
-            if not is_safe_inpage_click_target(item, current_url, allow_internal_nav_click):
+            if not is_safe_inpage_click_target(item, current_url, allow_internal_nav_click, allowed_url=allowed_url):
                 continue
 
             ix = clamp(_to_float(item.get("x"), current_x), 2, viewport_width - 2)
@@ -1268,14 +1367,19 @@ async def perform_followup_click_sequence(
 
             text_low = str(item.get("text", "")).strip().lower()
             hint = has_keyword(text_low, hover_click_words) or has_keyword(text_low, widget_action_words)
+            item_tag = str(item.get("tag", "")).strip().lower()
             compact = (_to_float(item.get("width"), 0.0) * _to_float(item.get("height"), 0.0)) <= 32000
             hover_like = bool(item.get("isHoverText", False)) or bool(item.get("isSurfaceHover", False))
+            button_like = item_tag in {"button", "summary"}
+            passive_hover = hover_like and not hint and not button_like
 
             rank_tuple = (
                 0 if hint else 1,
+                0 if button_like else 1,
                 0 if compact else 1,
+                1 if passive_hover else 0,
                 dist,
-                -target_sort_score(item) - (12.0 if hover_like else 0.0),
+                -target_sort_score(item),
             )
             ranked.append((rank_tuple, item))
 
@@ -1323,13 +1427,26 @@ async def perform_followup_click_sequence(
 
         performed += 1
 
-        if after_url != before_url and not allow_internal_nav_click:
-            try:
-                await page.go_back(wait_until="domcontentloaded", timeout=5000)
-                await page.wait_for_timeout(random.randint(240, 500))
-            except Exception:
-                pass
-            await _recover_after_nav(page)
+        navigated_offsite = bool(allowed_url) and after_url and not is_same_site_url(after_url, allowed_url)
+        navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
+
+        if navigated_offsite and allowed_url:
+            await ensure_page_within_allowed_site(
+                page,
+                allowed_url,
+                fallback_url=before_url,
+                fallback_scroll_y=scroll_y,
+                timeout=12000,
+            )
+            break
+
+        if navigated_internally and not allow_internal_nav_click:
+            await restore_page_location(
+                page,
+                before_url,
+                restore_scroll_y=scroll_y,
+                timeout=12000,
+            )
             break
 
         current_x = follow_x
@@ -1767,6 +1884,7 @@ async def run_strict_top_to_bottom_pass(
     click_sequence_max_steps: int,
     click_sequence_radius_factor: float,
     allow_internal_nav_click: bool,
+    site_url: str,
     strict_interactions_per_scroll: int,
     stall_timeout_ms: int,
 ) -> Tuple[Tuple[float, float], int, bool]:
@@ -1829,6 +1947,13 @@ async def run_strict_top_to_bottom_pass(
         interacted_this_round = False
         if interaction_pause_rounds > 0:
             interaction_pause_rounds -= 1
+
+        await ensure_page_within_allowed_site(
+            page,
+            site_url,
+            fallback_url=site_url,
+            timeout=15000,
+        )
 
         if round_index == 1 or (round_index - last_analysis_round) >= 8:
             try:
@@ -1937,7 +2062,12 @@ async def run_strict_top_to_bottom_pass(
 
                     if (
                         looks_clickable_trigger
-                        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click=allow_internal_nav_click)
+                        and is_safe_inpage_click_target(
+                            item,
+                            current_url,
+                            allow_internal_nav_click=allow_internal_nav_click,
+                            allowed_url=site_url,
+                        )
                         and is_target_clearly_visible(
                             item,
                             viewport_width,
@@ -2042,6 +2172,42 @@ async def run_strict_top_to_bottom_pass(
                     # Обязательная пауза показа результата hover перед продолжением спуска.
                     await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
 
+                hover_followup_count = 0
+                if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
+                    hover_followup_steps = max(1, min(click_sequence_max_steps, 2))
+                    cursor_pos, hover_followup_count = await perform_followup_click_sequence(
+                        page=page,
+                        cursor_pos=cursor_pos,
+                        anchor_x=tx,
+                        anchor_y=ty,
+                        anchor_key=target_key,
+                        anchor_family=target_family,
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                        clicked_keys=clicked_keys,
+                        clicked_families=clicked_families,
+                        hover_min_ms=hover_min_ms,
+                        hover_max_ms=hover_max_ms,
+                        max_followup_steps=hover_followup_steps,
+                        radius_factor=click_sequence_radius_factor,
+                        min_visible_ratio=click_visible_ratio,
+                        min_visibility_clarity=min_visibility_clarity,
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        hover_click_words=hover_click_words,
+                        widget_action_words=widget_action_words,
+                        visited_keys=visited_keys,
+                        visited_families=visited_families,
+                        recent_interactions=recent_interactions,
+                        round_index=round_index,
+                        scroll_y=float(scroll_y),
+                        allowed_url=site_url,
+                    )
+                    if hover_followup_count > 0:
+                        logger.info(
+                            "🖱️ Smart cursor: hover раскрыл локальные клики "
+                            f"(дополнительных шагов={hover_followup_count})"
+                        )
+
                 visited_keys.add(target_key)
                 visited_families.add(target_family)
                 hovered_count += 1
@@ -2066,9 +2232,15 @@ async def run_strict_top_to_bottom_pass(
 
                 should_click = (
                     inpage_click_enabled
+                    and hover_followup_count == 0
                     and target_key not in clicked_keys
                     and target_family not in clicked_families
-                    and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=allow_internal_nav_click)
+                    and is_safe_inpage_click_target(
+                        target,
+                        str(page.url or ""),
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        allowed_url=site_url,
+                    )
                     and is_target_clearly_visible(
                         target,
                         viewport_width,
@@ -2112,21 +2284,25 @@ async def run_strict_top_to_bottom_pass(
                     clicked_families.add(target_family)
 
                     after_url = str(page.url or "")
-                    if after_url != before_url:
-                        logger.info("🖱️ Smart cursor: пойман нежелательный переход, откатываемся назад")
-                        try:
-                            await page.go_back(wait_until="domcontentloaded", timeout=5000)
-                            await page.wait_for_timeout(random.randint(280, 520))
-                        except Exception:
-                            pass
-                        await _recover_after_nav(page)
-                        try:
-                            await page.evaluate(
-                                """(top) => window.scrollTo({ top, left: 0, behavior: 'auto' })""",
-                                int(before_scroll),
-                            )
-                        except Exception:
-                            pass
+                    navigated_offsite = after_url and not is_same_site_url(after_url, site_url)
+                    navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
+                    if navigated_offsite:
+                        logger.warning("⛔ Smart cursor: пойман внешний переход, возвращаемся на разрешённый сайт")
+                        await ensure_page_within_allowed_site(
+                            page,
+                            site_url,
+                            fallback_url=before_url,
+                            fallback_scroll_y=before_scroll,
+                            timeout=15000,
+                        )
+                    elif navigated_internally and not allow_internal_nav_click:
+                        logger.info("🖱️ Smart cursor: пойман нежелательный внутренний переход, откатываемся назад")
+                        await restore_page_location(
+                            page,
+                            before_url,
+                            restore_scroll_y=before_scroll,
+                            timeout=15000,
+                        )
 
                     followup_steps = max(0, click_sequence_max_steps - 1)
                     if followup_steps > 0 and (action_hint or is_local_trigger):
@@ -2155,6 +2331,7 @@ async def run_strict_top_to_bottom_pass(
                             recent_interactions=recent_interactions,
                             round_index=round_index,
                             scroll_y=float(scroll_y),
+                            allowed_url=site_url,
                         )
                         if followup_count > 0:
                             logger.info(
@@ -2407,6 +2584,7 @@ async def collect_header_nav_targets(
     viewport_width: int,
     viewport_height: int,
     allow_internal_nav_click: bool,
+    allowed_url: str,
     visited_nav_keys: Set[str],
 ) -> List[Dict[str, Any]]:
     """Целенаправленно собирает пункты верхнего меню/вкладок из header/nav-структур."""
@@ -2549,7 +2727,7 @@ async def collect_header_nav_targets(
     safe = [
         item for item in (raw or [])
         if is_probable_top_nav_target(item, viewport_height)
-        and is_safe_nav_tab_target(item, current_url)
+        and is_safe_nav_tab_target(item, current_url, allowed_url=allowed_url)
         and not is_nav_tab_self_link(item, current_url)
     ]
 
@@ -2570,6 +2748,7 @@ async def collect_top_nav_targets(
     viewport_width: int,
     viewport_height: int,
     allow_internal_nav_click: bool,
+    allowed_url: str,
     visited_nav_keys: Set[str],
 ) -> List[Dict[str, Any]]:
     """Собирает кандидатов верхней навигации и сортирует слева направо."""
@@ -2579,6 +2758,7 @@ async def collect_top_nav_targets(
             viewport_width,
             viewport_height,
             allow_internal_nav_click,
+            allowed_url,
             visited_nav_keys,
         )
     except Exception as exc:
@@ -2601,7 +2781,7 @@ async def collect_top_nav_targets(
     candidates = [
         item for item in targets
         if is_probable_top_nav_target(item, viewport_height)
-        and is_safe_nav_tab_target(item, current_url)
+        and is_safe_nav_tab_target(item, current_url, allowed_url=allowed_url)
         and not is_nav_tab_self_link(item, current_url)
     ]
 
@@ -2633,6 +2813,7 @@ async def visit_top_navigation_tabs(
     viewport_width: int,
     viewport_height: int,
     allow_internal_nav_click: bool,
+    allowed_url: str,
     visited_nav_keys: Set[str],
     max_nav_tabs_to_visit: int,
     per_tab_scroll_timeout_ms: int,
@@ -2646,9 +2827,15 @@ async def visit_top_navigation_tabs(
     if max_nav_tabs_to_visit <= 0:
         return cursor_pos, visited_count
 
-    original_url = str(page.url or "")
+    original_url = str(page.url or allowed_url)
 
     for _ in range(max_nav_tabs_to_visit):
+        await ensure_page_within_allowed_site(
+            page,
+            allowed_url,
+            fallback_url=original_url,
+            timeout=15000,
+        )
         # ── Вся итерация обёрнута для отказоустойчивости ──
         try:
             nav_targets = await collect_top_nav_targets(
@@ -2656,6 +2843,7 @@ async def visit_top_navigation_tabs(
                 viewport_width,
                 viewport_height,
                 allow_internal_nav_click,
+                allowed_url,
                 visited_nav_keys,
             )
         except Exception as exc:
@@ -3002,6 +3190,7 @@ async def move_mouse_human_like(
 
 async def run_smart_cursor(
     page: Any,
+    site_url: str,
     viewport_width: int,
     viewport_height: int,
     total_time_ms: int,
@@ -3083,6 +3272,8 @@ async def run_smart_cursor(
             if clicked_key:
                 clicked_entry_keys.add(clicked_key)
 
+    await ensure_page_within_allowed_site(page, site_url, fallback_url=site_url, timeout=15000)
+
     strict_mode_active = strict_top_to_bottom_mode or always_descend
     if strict_mode_active:
         if always_descend and not strict_top_to_bottom_mode:
@@ -3125,6 +3316,7 @@ async def run_smart_cursor(
             click_sequence_max_steps=click_sequence_max_steps,
             click_sequence_radius_factor=click_sequence_radius_factor,
             allow_internal_nav_click=allow_internal_nav_click,
+            site_url=site_url,
             strict_interactions_per_scroll=strict_interactions_per_scroll,
             stall_timeout_ms=strict_stall_timeout_ms,
         )
@@ -3158,6 +3350,7 @@ async def run_smart_cursor(
                             viewport_width=viewport_width,
                             viewport_height=viewport_height,
                             allow_internal_nav_click=allow_internal_nav_click,
+                            allowed_url=site_url,
                             visited_nav_keys=clicked_nav_keys,
                             max_nav_tabs_to_visit=nav_tabs_max_visits,
                             per_tab_scroll_timeout_ms=per_tab_budget_ms,
@@ -3356,7 +3549,7 @@ async def run_smart_cursor(
                 cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
                     page, cursor_pos,
                     viewport_width, viewport_height,
-                    allow_internal_nav_click, clicked_nav_keys,
+                    allow_internal_nav_click, site_url, clicked_nav_keys,
                     nav_tabs_max_visits, nav_tab_scroll_timeout_ms,
                     scroll_speed_factor, scroll_pause_min_ms, scroll_pause_max_ms,
                 )
@@ -3404,6 +3597,13 @@ async def run_smart_cursor(
         while (time.monotonic() - phase3_start) * 1000 < phase3_budget_ms:
             round_index += 1
 
+            await ensure_page_within_allowed_site(
+                page,
+                site_url,
+                fallback_url=site_url,
+                timeout=15000,
+            )
+
             if round_index % 3 == 0:
                 try:
                     cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
@@ -3435,7 +3635,7 @@ async def run_smart_cursor(
 
             safe_click_candidates = [
                 item for item in candidates
-                if is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+                if is_safe_inpage_click_target(item, current_url, allow_internal_nav_click, allowed_url=site_url)
                 and is_target_clearly_visible(
                     item,
                     viewport_width,
@@ -3547,7 +3747,7 @@ async def run_smart_cursor(
                     inpage_click_enabled
                     and target_key not in clicked_inpage_keys
                     and target_family not in clicked_inpage_families
-                    and is_safe_inpage_click_target(target, current_url, allow_internal_nav_click)
+                    and is_safe_inpage_click_target(target, current_url, allow_internal_nav_click, allowed_url=site_url)
                     and is_target_clearly_visible(
                         target,
                         viewport_width,
@@ -3579,7 +3779,39 @@ async def run_smart_cursor(
                 if target_tag in {"button", "summary"} and not target_href:
                     click_probability = max(click_probability, 0.90)
 
-                if should_click and random.random() < click_probability:
+                hover_followup_count = 0
+                if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
+                    hover_followup_steps = max(1, min(click_sequence_max_steps, 2))
+                    cursor_pos, hover_followup_count = await perform_followup_click_sequence(
+                        page=page,
+                        cursor_pos=cursor_pos,
+                        anchor_x=tx,
+                        anchor_y=ty,
+                        anchor_key=target_key,
+                        anchor_family=target_family,
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                        clicked_keys=clicked_inpage_keys,
+                        clicked_families=clicked_inpage_families,
+                        hover_min_ms=hover_min_ms,
+                        hover_max_ms=hover_max_ms,
+                        max_followup_steps=hover_followup_steps,
+                        radius_factor=click_sequence_radius_factor,
+                        min_visible_ratio=click_visible_ratio,
+                        min_visibility_clarity=min_visibility_clarity,
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        hover_click_words=hover_click_words,
+                        widget_action_words=widget_action_words,
+                        visited_keys=visited_keys,
+                        allowed_url=site_url,
+                    )
+                    if hover_followup_count > 0:
+                        logger.info(
+                            "🖱️ Smart cursor: phase-3 hover раскрыл локальные клики "
+                            f"(дополнительных шагов={hover_followup_count})"
+                        )
+
+                if should_click and hover_followup_count == 0 and random.random() < click_probability:
                     before_url = str(page.url or "")
                     try:
                         await page.mouse.click(tx, ty, delay=random.randint(35, 110))
@@ -3600,13 +3832,23 @@ async def run_smart_cursor(
                         pass
 
                     after_url = str(page.url or "")
-                    if after_url != before_url and is_navigation_like_href(after_url, before_url) and not allow_internal_nav_click:
-                        logger.info("🖱️ Smart cursor: обнаружен переход, откатываемся назад")
-                        try:
-                            await page.go_back(wait_until="domcontentloaded", timeout=3000)
-                            await page.wait_for_timeout(random.randint(250, 550))
-                        except Exception:
-                            pass
+                    navigated_offsite = after_url and not is_same_site_url(after_url, site_url)
+                    navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
+                    if navigated_offsite:
+                        logger.warning("⛔ Smart cursor: phase-3 поймал внешний переход, возвращаемся назад")
+                        await ensure_page_within_allowed_site(
+                            page,
+                            site_url,
+                            fallback_url=before_url,
+                            timeout=15000,
+                        )
+                    elif navigated_internally and not allow_internal_nav_click:
+                        logger.info("🖱️ Smart cursor: обнаружен внутренний переход, откатываемся назад")
+                        await restore_page_location(
+                            page,
+                            before_url,
+                            timeout=12000,
+                        )
                     elif after_url != before_url and allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: выполнен внутренний переход по интерактиву")
                     else:
@@ -3633,6 +3875,7 @@ async def run_smart_cursor(
                                 hover_click_words=hover_click_words,
                                 widget_action_words=widget_action_words,
                                 visited_keys=visited_keys,
+                                allowed_url=site_url,
                             )
                             if followup_count > 0:
                                 logger.info(
@@ -3777,6 +4020,21 @@ async def main():
                 device_scale_factor=1
             )
 
+            async def route_main_document(route, request) -> None:
+                try:
+                    is_navigation = bool(request.is_navigation_request()) and request.resource_type == "document"
+                    frame = request.frame
+                    is_top_level = getattr(frame, "parent_frame", None) is None
+                    if is_navigation and is_top_level and not is_same_site_url(request.url, target_url):
+                        logger.warning(f"⛔ Site guard: блокируем внешний top-level переход {request.url}")
+                        await route.abort()
+                        return
+                except Exception:
+                    pass
+                await route.continue_()
+
+            await context.route("**/*", route_main_document)
+
             if visible_cursor_enabled:
                 await context.add_init_script(
                     """
@@ -3885,8 +4143,10 @@ async def main():
                 logger.info(
                     f"🧭 Smart cursor активирован: budget={smart_cursor_timeout}ms, max_targets={smart_cursor_max_targets}, scroll_to_end={scroll_to_end}"
                 )
+                allowed_site_url = str(page.url or target_url)
                 await run_smart_cursor(
                     page=page,
+                    site_url=allowed_site_url,
                     viewport_width=viewport_width,
                     viewport_height=viewport_height,
                     total_time_ms=smart_cursor_timeout,
