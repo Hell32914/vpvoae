@@ -1061,11 +1061,14 @@ def is_safe_inpage_click_target(
     if tag in {"input", "textarea", "select"}:
         return False
 
-    purchase_words = (
+    blocked_action_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
+        "download", "install", "get started", "sign up", "sign in", "log in", "register",
+        "free trial", "get app", "app store", "google play", "try free", "start free",
+        "get it", "launch", "deploy",
     )
-    if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
+    if has_keyword(text, blocked_action_words) or has_keyword(href, blocked_action_words):
         return False
 
     if href and is_external_href(href, current_url, allowed_url=allowed_url):
@@ -1096,7 +1099,9 @@ def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str, allowed_url
     blocked_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
-        "login", "sign in", "account", "privacy", "terms", "cookie",
+        "login", "sign in", "log in", "account", "privacy", "terms", "cookie",
+        "download", "install", "sign up", "register", "free trial", "get app",
+        "app store", "google play", "try free", "start free", "get it", "launch", "deploy",
     )
     if has_keyword(text, blocked_words) or has_keyword(href, blocked_words):
         return False
