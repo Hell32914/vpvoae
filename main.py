@@ -3034,8 +3034,21 @@ async def visit_top_navigation_tabs(
     scroll_speed_factor: float,
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
+    hover_min_ms: int = 220,
+    hover_max_ms: int = 760,
+    inpage_click_enabled: bool = True,
+    inpage_click_probability: float = 0.18,
+    bottom_stable_rounds_required: int = 4,
+    scroll_finish_timeout_ms: int = 45000,
+    hover_visible_ratio: float = 0.60,
+    click_visible_ratio: float = 0.46,
+    min_visibility_clarity: float = 0.42,
+    click_sequence_max_steps: int = 2,
+    click_sequence_radius_factor: float = 0.30,
+    strict_interactions_per_scroll: int = 2,
+    stall_timeout_ms: int = 10000,
 ) -> Tuple[Tuple[float, float], int]:
-    """Проходит по вкладкам верхней навигации последовательно, а не случайно."""
+    """Проходит по вкладкам верхней навигации последовательно с hover-эффектами на каждой странице."""
     visited_count = 0
     visited_nav_families: Set[str] = set()
     if max_nav_tabs_to_visit <= 0:
@@ -3195,13 +3208,35 @@ async def visit_top_navigation_tabs(
 
         if changed:
             try:
-                await force_scroll_to_page_end(
-                    page,
-                    viewport_height,
-                    scroll_speed_factor,
-                    scroll_pause_min_ms,
-                    scroll_pause_max_ms,
-                    per_tab_scroll_timeout_ms,
+                cursor_pos, _tab_hovered, _tab_bottom = await run_strict_top_to_bottom_pass(
+                    page=page,
+                    cursor_pos=cursor_pos,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    total_time_ms=per_tab_scroll_timeout_ms,
+                    max_targets=0,
+                    hover_min_ms=hover_min_ms,
+                    hover_max_ms=hover_max_ms,
+                    bottom_stable_rounds_required=bottom_stable_rounds_required,
+                    scroll_speed_factor=scroll_speed_factor,
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                    inpage_click_enabled=inpage_click_enabled,
+                    inpage_click_probability=inpage_click_probability,
+                    scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                    require_bottom=True,
+                    require_bottom_max_ms=per_tab_scroll_timeout_ms,
+                    strict_allow_clicks=True,
+                    bottom_debug=False,
+                    hover_visible_ratio=hover_visible_ratio,
+                    click_visible_ratio=click_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    click_sequence_max_steps=click_sequence_max_steps,
+                    click_sequence_radius_factor=click_sequence_radius_factor,
+                    allow_internal_nav_click=allow_internal_nav_click,
+                    site_url=allowed_url,
+                    strict_interactions_per_scroll=strict_interactions_per_scroll,
+                    stall_timeout_ms=stall_timeout_ms,
                 )
             except Exception as exc:
                 if _is_nav_error(exc):
@@ -3510,12 +3545,12 @@ async def run_smart_cursor(
             scroll_speed_factor=scroll_speed_factor,
             scroll_pause_min_ms=scroll_pause_min_ms,
             scroll_pause_max_ms=scroll_pause_max_ms,
-            inpage_click_enabled=False,
+            inpage_click_enabled=True,
             inpage_click_probability=inpage_click_probability,
             scroll_finish_timeout_ms=scroll_finish_timeout_ms,
             require_bottom=(smart_cursor_require_bottom or always_descend),
             require_bottom_max_ms=min(smart_cursor_require_bottom_max_ms, strict_main_budget_ms),
-            strict_allow_clicks=strict_top_to_bottom_allow_clicks,
+            strict_allow_clicks=True,
             bottom_debug=bottom_debug,
             hover_visible_ratio=hover_visible_ratio,
             click_visible_ratio=click_visible_ratio,
@@ -3533,97 +3568,57 @@ async def run_smart_cursor(
         else:
             logger.warning("⚠️ Smart cursor: STRICT проход завершился по hard-timeout до достижения конца страницы")
 
-        if reached_bottom and inpage_click_enabled:
+        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)
             remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
-            min_nav_reserve_ms = 4500 if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 else 0
-            interaction_budget_ms = max(0, remaining_ms - min_nav_reserve_ms)
-
-            if interaction_budget_ms >= 5000:
-                logger.info("🧭 Smart cursor: STRICT postpass — локальные интерактивы на главной после полного прохода")
+            nav_budget_ms = remaining_ms
+            if nav_budget_ms >= 4500:
+                logger.info("🧭 Smart cursor: обход вкладок навигации с hover-эффектами")
                 try:
                     await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
                     await page.wait_for_timeout(random.randint(200, 420))
                 except Exception:
                     pass
 
+                per_tab_budget_ms = max(
+                    1700,
+                    min(nav_tab_scroll_timeout_ms, int(nav_budget_ms / max(1, nav_tabs_max_visits))),
+                )
                 try:
-                    cursor_pos, strict_interaction_count, _ = await run_strict_top_to_bottom_pass(
+                    cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
                         page=page,
                         cursor_pos=cursor_pos,
                         viewport_width=viewport_width,
                         viewport_height=viewport_height,
-                        total_time_ms=interaction_budget_ms,
-                        max_targets=max_targets,
-                        hover_min_ms=hover_min_ms,
-                        hover_max_ms=hover_max_ms,
-                        bottom_stable_rounds_required=bottom_stable_rounds_required,
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        allowed_url=site_url,
+                        visited_nav_keys=clicked_nav_keys,
+                        max_nav_tabs_to_visit=nav_tabs_max_visits,
+                        per_tab_scroll_timeout_ms=per_tab_budget_ms,
                         scroll_speed_factor=scroll_speed_factor,
                         scroll_pause_min_ms=scroll_pause_min_ms,
                         scroll_pause_max_ms=scroll_pause_max_ms,
-                        inpage_click_enabled=True,
+                        hover_min_ms=hover_min_ms,
+                        hover_max_ms=hover_max_ms,
+                        inpage_click_enabled=inpage_click_enabled,
                         inpage_click_probability=inpage_click_probability,
+                        bottom_stable_rounds_required=bottom_stable_rounds_required,
                         scroll_finish_timeout_ms=scroll_finish_timeout_ms,
-                        require_bottom=False,
-                        require_bottom_max_ms=interaction_budget_ms,
-                        strict_allow_clicks=strict_top_to_bottom_allow_clicks,
-                        bottom_debug=bottom_debug,
                         hover_visible_ratio=hover_visible_ratio,
                         click_visible_ratio=click_visible_ratio,
                         min_visibility_clarity=min_visibility_clarity,
                         click_sequence_max_steps=click_sequence_max_steps,
                         click_sequence_radius_factor=click_sequence_radius_factor,
-                        allow_internal_nav_click=allow_internal_nav_click,
-                        site_url=site_url,
-                        strict_interactions_per_scroll=1,
-                        stall_timeout_ms=max(4500, strict_stall_timeout_ms),
+                        strict_interactions_per_scroll=strict_interactions_per_scroll,
+                        stall_timeout_ms=strict_stall_timeout_ms,
                     )
-                    hovered_count += strict_interaction_count
-                except Exception as interaction_err:
-                    logger.warning(f"⚠️ Smart cursor: ошибка STRICT postpass интерактивов: {interaction_err}")
+                    if visited_nav_count > 0:
+                        logger.info(f"🧭 Smart cursor: пройдено вкладок с hover-эффектами: {visited_nav_count}")
+                except Exception as nav_err:
+                    logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок: {nav_err}")
                     await _recover_after_nav(page)
-
-        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0:
-            if reached_bottom:
-                elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
-                nav_budget_ms = remaining_ms
-                if nav_budget_ms >= 4500:
-                    logger.info("🧭 Smart cursor: STRICT postpass — обход вкладок после полного прохода главной")
-                    try:
-                        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
-                        await page.wait_for_timeout(random.randint(200, 420))
-                    except Exception:
-                        pass
-
-                    per_tab_budget_ms = max(
-                        1700,
-                        min(nav_tab_scroll_timeout_ms, int(nav_budget_ms / max(1, nav_tabs_max_visits))),
-                    )
-                    try:
-                        cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
-                            page=page,
-                            cursor_pos=cursor_pos,
-                            viewport_width=viewport_width,
-                            viewport_height=viewport_height,
-                            allow_internal_nav_click=allow_internal_nav_click,
-                            allowed_url=site_url,
-                            visited_nav_keys=clicked_nav_keys,
-                            max_nav_tabs_to_visit=nav_tabs_max_visits,
-                            per_tab_scroll_timeout_ms=per_tab_budget_ms,
-                            scroll_speed_factor=scroll_speed_factor,
-                            scroll_pause_min_ms=scroll_pause_min_ms,
-                            scroll_pause_max_ms=scroll_pause_max_ms,
-                        )
-                        if visited_nav_count > 0:
-                            logger.info(f"🧭 Smart cursor: STRICT postpass — пройдено вкладок {visited_nav_count}")
-                    except Exception as nav_err:
-                        logger.warning(f"⚠️ Smart cursor: ошибка STRICT postpass вкладок: {nav_err}")
-                        await _recover_after_nav(page)
-                else:
-                    logger.warning("⚠️ Smart cursor: не осталось бюджета для обхода вкладок после главной")
             else:
-                logger.warning("⚠️ Smart cursor: обход вкладок пропущен, т.к. главная не пройдена до конца")
+                logger.warning("⚠️ Smart cursor: не осталось бюджета для обхода вкладок")
 
         logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
         return hovered_count
@@ -3809,6 +3804,19 @@ async def run_smart_cursor(
                     allow_internal_nav_click, site_url, clicked_nav_keys,
                     nav_tabs_max_visits, nav_tab_scroll_timeout_ms,
                     scroll_speed_factor, scroll_pause_min_ms, scroll_pause_max_ms,
+                    hover_min_ms=hover_min_ms,
+                    hover_max_ms=hover_max_ms,
+                    inpage_click_enabled=inpage_click_enabled,
+                    inpage_click_probability=inpage_click_probability,
+                    bottom_stable_rounds_required=bottom_stable_rounds_required,
+                    scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                    hover_visible_ratio=hover_visible_ratio,
+                    click_visible_ratio=click_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    click_sequence_max_steps=click_sequence_max_steps,
+                    click_sequence_radius_factor=click_sequence_radius_factor,
+                    strict_interactions_per_scroll=strict_interactions_per_scroll,
+                    stall_timeout_ms=strict_stall_timeout_ms,
                 )
                 if visited_nav_count > 0:
                     logger.info(f"🧭 Smart cursor: пройдено вкладок {visited_nav_count}")
@@ -4189,7 +4197,7 @@ async def main():
         allow_internal_nav_click = env_bool('SMART_CURSOR_ALLOW_INTERNAL_NAV_CLICK', False)
         strict_top_to_bottom_mode = env_bool('SMART_CURSOR_STRICT_TOP_TO_BOTTOM', True)
         smart_cursor_always_descend = env_bool('SMART_CURSOR_ALWAYS_DESCEND', True)
-        strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', False)
+        strict_top_to_bottom_allow_clicks = env_bool('SMART_CURSOR_STRICT_ALLOW_CLICKS', True)
         smart_cursor_require_bottom = env_bool('SMART_CURSOR_REQUIRE_BOTTOM', True)
         smart_cursor_require_bottom_max_ms = int(os.getenv('SMART_CURSOR_REQUIRE_BOTTOM_MAX_MS', '900000'))
         smart_cursor_bottom_debug = env_bool('SMART_CURSOR_BOTTOM_DEBUG', False)
