@@ -1386,6 +1386,11 @@ async def run_strict_top_to_bottom_pass(
         "accept", "reset", "submit", "next", "confirm", "apply",
         "calculate", "done", "save", "select", "choose", "finish",
     )
+    hover_click_words = (
+        "click", "tap", "press", "here", "open", "show", "reveal",
+        "start", "play", "go", "next", "more", "toggle", "menu",
+        "try", "view", "explore", "activate", "continue", "enter",
+    )
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -1559,15 +1564,36 @@ async def run_strict_top_to_bottom_pass(
                 visited_keys.add(target_key)
                 hovered_count += 1
 
+                target_text = str(target.get("text", ""))
+                target_href = str(target.get("href", "")).strip().lower()
+                target_tag = str(target.get("tag", "")).strip().lower()
+                action_hint = has_keyword(target_text, hover_click_words)
+                is_local_trigger = (
+                    target_tag in {"button", "summary"}
+                    or (
+                        not target_href
+                        and (action_hint or (target_width * target_height <= 26000 and not is_surface_hover))
+                    )
+                )
+
                 should_click = (
-                    strict_allow_clicks
-                    and inpage_click_enabled
+                    inpage_click_enabled
                     and target_key not in clicked_keys
                     and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=False)
+                    and (strict_allow_clicks or action_hint or is_local_trigger)
                 )
-                click_probability = min(inpage_click_probability, 0.24)
-                if has_keyword(str(target.get("text", "")), widget_action_words):
-                    click_probability = max(click_probability, 0.34)
+
+                click_probability = clamp(inpage_click_probability, 0.0, 1.0)
+                if strict_allow_clicks:
+                    click_probability = max(click_probability, 0.42)
+                if is_local_trigger:
+                    click_probability = max(click_probability, 0.62)
+                if action_hint:
+                    click_probability = max(click_probability, 0.86)
+                if has_keyword(target_text, widget_action_words):
+                    click_probability = max(click_probability, 0.72)
+                if is_surface_hover and not action_hint:
+                    click_probability = min(click_probability, 0.38)
 
                 if should_click and random.random() < click_probability:
                     before_url = str(page.url or "")
@@ -1597,6 +1623,67 @@ async def run_strict_top_to_bottom_pass(
                             )
                         except Exception:
                             pass
+
+                    # Универсальный follow-up: если первый клик открыл локальный интерактив рядом,
+                    # пробуем второй клик по ближайшему безопасному элементу.
+                    if action_hint or is_local_trigger:
+                        try:
+                            await page.wait_for_timeout(random.randint(170, 420))
+                            nearby_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 28)
+                        except Exception as exc:
+                            if _is_nav_error(exc):
+                                await _recover_after_nav(page)
+                                nearby_targets = []
+                            else:
+                                nearby_targets = []
+
+                        nearby_candidates: List[Tuple[Dict[str, Any], float]] = []
+                        radius_limit = max(180.0, min(viewport_width, viewport_height) * 0.28)
+                        for item in nearby_targets:
+                            item_key = str(item.get("key", ""))
+                            if not item_key or item_key in clicked_keys or item_key == target_key:
+                                continue
+                            if not is_safe_inpage_click_target(item, str(page.url or ""), allow_internal_nav_click=False):
+                                continue
+
+                            ix = float(item.get("x", tx))
+                            iy = float(item.get("y", ty))
+                            dist = math.hypot(ix - tx, iy - ty)
+                            if dist > radius_limit:
+                                continue
+                            nearby_candidates.append((item, dist))
+
+                        if nearby_candidates:
+                            def _nearby_rank(entry: Tuple[Dict[str, Any], float]) -> Tuple[int, float, float]:
+                                item, dist = entry
+                                txt = str(item.get("text", ""))
+                                hint = has_keyword(txt, hover_click_words) or has_keyword(txt, widget_action_words)
+                                return (0 if hint else 1, dist, -target_sort_score(item))
+
+                            nearby_candidates.sort(key=_nearby_rank)
+                            follow_target = nearby_candidates[0][0]
+                            fk = str(follow_target.get("key", ""))
+                            ftx = clamp(float(follow_target.get("x", tx)), 2, viewport_width - 2)
+                            fty = clamp(float(follow_target.get("y", ty)), 2, viewport_height - 2)
+
+                            try:
+                                cursor_pos = await move_mouse_human_like(
+                                    page=page,
+                                    start=cursor_pos,
+                                    end=(ftx, fty),
+                                    viewport_width=viewport_width,
+                                    viewport_height=viewport_height,
+                                    duration_ms=random.randint(150, 420),
+                                )
+                                await page.wait_for_timeout(random.randint(max(120, micro_hover_min), max(220, micro_hover_max)))
+                                await page.mouse.click(ftx, fty, delay=random.randint(30, 95))
+                                await page.wait_for_timeout(random.randint(140, 320))
+                                clicked_keys.add(fk)
+                                visited_keys.add(fk)
+                                logger.info("🖱️ Smart cursor: выполнен follow-up клик по соседней hover-цели")
+                            except Exception as exc:
+                                if _is_nav_error(exc):
+                                    await _recover_after_nav(page)
 
         if round_index % 4 == 0:
             try:
@@ -2341,6 +2428,14 @@ async def move_mouse_human_like(
         y = clamp(y, 1, viewport_height - 1)
 
         await page.mouse.move(x, y)
+        if i == 1 or i == steps or (i % 3) == 0:
+            try:
+                await page.evaluate(
+                    """([mx, my]) => { if (window.__vpvoaeMoveCursor) window.__vpvoaeMoveCursor(mx, my); }""",
+                    [x, y],
+                )
+            except Exception:
+                pass
         per_step_delay = max(6, int(duration_ms / steps + random.uniform(-2, 6)))
         await page.wait_for_timeout(per_step_delay)
 
@@ -2868,6 +2963,8 @@ async def main():
         screenshot_timeout_ms = int(os.getenv('SCREENSHOT_TIMEOUT_MS', '8000'))
         browser_fullscreen = env_bool('BROWSER_FULLSCREEN', True)
         browser_app_mode = env_bool('BROWSER_APP_MODE', True)
+        browser_performance_mode = env_bool('BROWSER_PERFORMANCE_MODE', True)
+        visible_cursor_enabled = env_bool('VISIBLE_CURSOR_ENABLED', True)
 
         if hover_max_ms < hover_min_ms:
             hover_max_ms = hover_min_ms
@@ -2901,6 +2998,8 @@ async def main():
         logger.info(f"📸 Screenshot: {'ENABLED' if screenshot_enabled else 'DISABLED'} (timeout={screenshot_timeout_ms}ms)")
         logger.info(f"🖥️ Browser fullscreen: {'ENABLED' if browser_fullscreen else 'DISABLED'}")
         logger.info(f"🧱 Browser app mode: {'ENABLED' if browser_app_mode else 'DISABLED'}")
+        logger.info(f"⚡ Browser performance mode: {'ENABLED' if browser_performance_mode else 'DISABLED'}")
+        logger.info(f"🖱️ Visible cursor overlay: {'ENABLED' if visible_cursor_enabled else 'DISABLED'}")
         
         async with async_playwright() as p:
             logger.info("🌐 Запуск браузера на виртуальном дисплее...")
@@ -2917,6 +3016,20 @@ async def main():
                 '--hide-crash-restore-bubble',
                 '--disable-infobars',
             ]
+
+            if browser_performance_mode:
+                browser_args.extend([
+                    '--ignore-gpu-blocklist',
+                    '--enable-webgl',
+                    '--enable-unsafe-swiftshader',
+                    '--use-angle=swiftshader',
+                    '--enable-gpu-rasterization',
+                    '--enable-zero-copy',
+                    '--disable-renderer-backgrounding',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-background-timer-throttling',
+                ])
+
             if browser_app_mode:
                 browser_args.append('--app=data:,')
 
@@ -2929,7 +3042,76 @@ async def main():
                 viewport={'width': viewport_width, 'height': viewport_height},
                 device_scale_factor=1
             )
+
+            if visible_cursor_enabled:
+                await context.add_init_script(
+                    """
+                    (() => {
+                        function ensureCursor() {
+                            let el = document.getElementById('__vpvoae_visible_cursor');
+                            if (!el) {
+                                el = document.createElement('div');
+                                el.id = '__vpvoae_visible_cursor';
+                                el.setAttribute('aria-hidden', 'true');
+                                el.style.position = 'fixed';
+                                el.style.left = '0';
+                                el.style.top = '0';
+                                el.style.width = '22px';
+                                el.style.height = '22px';
+                                el.style.pointerEvents = 'none';
+                                el.style.zIndex = '2147483647';
+                                el.style.opacity = '0.98';
+                                el.style.transform = 'translate3d(-100px,-100px,0)';
+                                el.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.55))';
+                                el.innerHTML = '<svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><path d="M2 1.5L2 16.2L6.7 12.2L9.8 19.8L12.6 18.7L9.6 11.3L16.6 11.3L2 1.5Z" fill="#ffffff" stroke="#111111" stroke-width="1.2" stroke-linejoin="round"/></svg>';
+                            }
+
+                            if (!el.isConnected) {
+                                (document.documentElement || document.body).appendChild(el);
+                            } else if (el.parentElement !== (document.documentElement || document.body)) {
+                                el.remove();
+                                (document.documentElement || document.body).appendChild(el);
+                            }
+
+                            return el;
+                        }
+
+                        function moveCursor(x, y) {
+                            const el = ensureCursor();
+                            const mx = Number.isFinite(x) ? Math.round(x) : 0;
+                            const my = Number.isFinite(y) ? Math.round(y) : 0;
+                            el.style.transform = `translate3d(${mx}px, ${my}px, 0)`;
+                        }
+
+                        window.__vpvoaeEnsureCursor = ensureCursor;
+                        window.__vpvoaeMoveCursor = moveCursor;
+
+                        const pointerHandler = (ev) => {
+                            const ex = Number(ev && ev.clientX);
+                            const ey = Number(ev && ev.clientY);
+                            moveCursor(Number.isFinite(ex) ? ex : 0, Number.isFinite(ey) ? ey : 0);
+                        };
+
+                        window.addEventListener('mousemove', pointerHandler, { passive: true });
+                        window.addEventListener('pointermove', pointerHandler, { passive: true });
+                        window.addEventListener('scroll', () => ensureCursor(), { passive: true });
+
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', () => ensureCursor(), { once: true });
+                        } else {
+                            ensureCursor();
+                        }
+                    })();
+                    """
+                )
+
             page = await context.new_page()
+
+            if visible_cursor_enabled:
+                try:
+                    await page.evaluate("""() => { if (window.__vpvoaeEnsureCursor) window.__vpvoaeEnsureCursor(); }""")
+                except Exception:
+                    pass
 
             logger.info(f"📄 Открываем целевой сайт: {target_url}")
             # Сначала быстрый DOM-ready, затем короткая попытка дождаться networkidle.
@@ -2943,6 +3125,11 @@ async def main():
                     await page.wait_for_load_state("networkidle", timeout=min(12000, max(2500, int(load_timeout * 0.35))))
                 except Exception:
                     pass
+                if visible_cursor_enabled:
+                    try:
+                        await page.evaluate("""() => { if (window.__vpvoaeEnsureCursor) window.__vpvoaeEnsureCursor(); }""")
+                    except Exception:
+                        pass
                 logger.info("✅ Сайт загружен успешно")
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️  Таймаут при загрузке ({load_timeout}ms), продолжаем...")

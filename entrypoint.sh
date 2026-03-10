@@ -58,11 +58,42 @@ echo "=========================================="
 
 OUTPUT_PATH=${OUTPUT_PATH:-/app/output}
 VIDEO_OUTPUT_FILE="${OUTPUT_PATH}/recording_$(date +%Y%m%d_%H%M%S).mp4"
-FFMPEG_FRAMERATE=${FFMPEG_FRAMERATE:-24}
+FFMPEG_FRAMERATE=${FFMPEG_FRAMERATE:-15}
 FFMPEG_PRESET=${FFMPEG_PRESET:-ultrafast}
-FFMPEG_CRF=${FFMPEG_CRF:-23}
+FFMPEG_CRF=${FFMPEG_CRF:-24}
 FFMPEG_CROP_TOP=${FFMPEG_CROP_TOP:-0}
 FFMPEG_AUTO_CROP_BROWSER_UI=${FFMPEG_AUTO_CROP_BROWSER_UI:-true}
+FFMPEG_DRAW_MOUSE=${FFMPEG_DRAW_MOUSE:-0}
+FFMPEG_THREADS=${FFMPEG_THREADS:-2}
+FFMPEG_NICE_LEVEL=${FFMPEG_NICE_LEVEL:-10}
+
+if ! [[ "$FFMPEG_FRAMERATE" =~ ^[0-9]+$ ]]; then
+  FFMPEG_FRAMERATE=18
+fi
+if [ "$FFMPEG_FRAMERATE" -lt 8 ]; then
+  FFMPEG_FRAMERATE=8
+fi
+if [ "$FFMPEG_FRAMERATE" -gt 60 ]; then
+  FFMPEG_FRAMERATE=60
+fi
+if ! [[ "$FFMPEG_THREADS" =~ ^[0-9]+$ ]]; then
+  FFMPEG_THREADS=2
+fi
+if [ "$FFMPEG_THREADS" -lt 1 ]; then
+  FFMPEG_THREADS=1
+fi
+if ! [[ "$FFMPEG_NICE_LEVEL" =~ ^-?[0-9]+$ ]]; then
+  FFMPEG_NICE_LEVEL=10
+fi
+if [ "$FFMPEG_NICE_LEVEL" -lt -20 ]; then
+  FFMPEG_NICE_LEVEL=-20
+fi
+if [ "$FFMPEG_NICE_LEVEL" -gt 19 ]; then
+  FFMPEG_NICE_LEVEL=19
+fi
+if [ "$FFMPEG_DRAW_MOUSE" != "0" ] && [ "$FFMPEG_DRAW_MOUSE" != "1" ]; then
+  FFMPEG_DRAW_MOUSE=0
+fi
 
 # На некоторых окружениях X11 браузерные панели остаются видимыми даже в kiosk/fullscreen.
 # Включаем безопасный автокроп верхней полосы, если явный crop не задан.
@@ -95,14 +126,16 @@ fi
 
 # Запускаем FFmpeg в фоне для захвата видео с виртуального дисплея.
 # По умолчанию crop отключен, чтобы верхняя навигация сайта попадала в запись.
-ffmpeg -f x11grab \
+nice -n "$FFMPEG_NICE_LEVEL" ffmpeg -f x11grab \
   -video_size ${SCREEN_WIDTH}x${SCREEN_HEIGHT} \
     -framerate "$FFMPEG_FRAMERATE" \
+    -draw_mouse "$FFMPEG_DRAW_MOUSE" \
   -i :99 \
   "${FILTER_ARGS[@]}" \
   -c:v libx264 \
     -preset "$FFMPEG_PRESET" \
     -crf "$FFMPEG_CRF" \
+    -threads "$FFMPEG_THREADS" \
   -pix_fmt yuv420p \
   -y \
   "$VIDEO_OUTPUT_FILE" > /tmp/ffmpeg.log 2>&1 &
@@ -115,6 +148,9 @@ else
   echo "   Crop top: disabled"
 fi
 echo "   Auto crop browser UI: ${FFMPEG_AUTO_CROP_BROWSER_UI}"
+echo "   Draw X11 mouse: ${FFMPEG_DRAW_MOUSE}"
+echo "   FFmpeg threads: ${FFMPEG_THREADS}"
+echo "   FFmpeg nice level: ${FFMPEG_NICE_LEVEL}"
 
 sleep 2
 
