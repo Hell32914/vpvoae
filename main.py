@@ -1721,6 +1721,23 @@ async def collect_document_interaction_targets(
                 '[class*="letter"]',
                 '[data-char]',
                 '[data-letter]',
+                '[role="tab"]',
+                '[role="tablist"]',
+                '[role="tabpanel"]',
+                '[data-slide]',
+                '[data-index]',
+                '[class*="gallery"]',
+                '[class*="slider"]',
+                '[class*="carousel"]',
+                '[class*="swiper"]',
+                '[class*="lightbox"]',
+                '[class*="phone"]',
+                '[class*="mockup"]',
+                '[class*="device"]',
+                '[class*="screen"]',
+                '[class*="preview"]',
+                'img',
+                'li',
                 'h1',
                 'h2',
                 'h3',
@@ -1818,7 +1835,8 @@ async def collect_document_interaction_targets(
                     tag === 'canvas'
                     || tag === 'video'
                     || tag === 'model-viewer'
-                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase/.test(hint)
+                    || tag === 'img'
+                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase|gallery|carousel|slider|swiper|tab|phone|device|mockup|preview|screen|app|demo|lightbox/.test(hint)
                 );
 
                 const largeEnough = (
@@ -2149,8 +2167,8 @@ async def run_strict_top_to_bottom_pass(
 
         can_interact = ((max_targets <= 0) or (hovered_count < max_targets)) and interaction_pause_rounds <= 0
         if can_interact and analysis_targets:
-            viewport_top = scroll_y + int(viewport_height * 0.10)
-            viewport_bottom = scroll_y + int(viewport_height * 0.90)
+            viewport_top = scroll_y + int(viewport_height * 0.18)
+            viewport_bottom = scroll_y + int(viewport_height * 0.82)
             current_url = str(page.url or "")
 
             candidates: List[Dict[str, Any]] = []
@@ -2257,6 +2275,31 @@ async def run_strict_top_to_bottom_pass(
                     pool = shortlist_progress_targets(candidates, band_px=180.0, limit=min(6, len(candidates)))
                 target = pool[0]
 
+                # ── Подкрутка скролла, чтобы цель была видна в центральной зоне экрана ──
+                _target_abs_y_raw = float(target.get("absY", scroll_y + viewport_height * 0.5))
+                _ty_raw = _target_abs_y_raw - scroll_y
+                _safe_top = viewport_height * 0.22
+                _safe_bottom = viewport_height * 0.78
+                if _ty_raw < _safe_top or _ty_raw > _safe_bottom:
+                    # Цель слишком близко к краю экрана — подкручиваем, чтобы она стала по центру.
+                    desired_scroll = max(0, int(_target_abs_y_raw - viewport_height * 0.45))
+                    scroll_delta = desired_scroll - scroll_y
+                    if abs(scroll_delta) > 30:
+                        try:
+                            _steps = random.randint(3, 5)
+                            _step_size = int(scroll_delta / _steps)
+                            for _si in range(_steps):
+                                _d = _step_size + random.randint(-8, 8)
+                                await page.mouse.wheel(0, _d)
+                                await page.wait_for_timeout(random.randint(18, 45))
+                            await page.wait_for_timeout(random.randint(80, 180))
+                            _new_metrics = await get_scroll_metrics(page)
+                            scroll_y = max(scroll_y, int(_new_metrics.get("scrollY", scroll_y)))
+                        except Exception as _exc:
+                            if _is_nav_error(_exc):
+                                await _recover_after_nav(page)
+                                continue
+
                 tx = clamp(float(target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
                 ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
                 target_abs_y = float(target.get("absY", scroll_y + ty))
@@ -2266,172 +2309,19 @@ async def run_strict_top_to_bottom_pass(
                 is_surface_hover = bool(target.get("isSurfaceHover", False))
                 target_width = float(target.get("width", 0.0))
                 target_height = float(target.get("height", 0.0))
-                sweep_points: List[Tuple[float, float]] = []
-
-                if is_surface_hover and (target_width >= 120 or target_height >= 90):
-                    span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
-                    span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
-                    sweep_points = [
-                        (clamp(tx - span_x, 2, viewport_width - 2), ty),
-                        (tx, clamp(ty - span_y, 2, viewport_height - 2)),
-                        (clamp(tx + span_x, 2, viewport_width - 2), ty),
-                        (tx, clamp(ty + span_y, 2, viewport_height - 2)),
-                        (tx, ty),
-                    ]
-                    if target_width >= 220 and target_height >= 120:
-                        sweep_points.extend([
-                            (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
-                            (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
-                        ])
-                elif is_hover_text and target_width >= 110:
-                    half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
-                    sweep_points = [
-                        (clamp(tx - half_span, 2, viewport_width - 2), ty),
-                        (tx, ty),
-                        (clamp(tx + half_span, 2, viewport_width - 2), ty),
-                    ]
-                else:
-                    sweep_points = [(tx, ty)]
-
-                hover_changed = False
-                try:
-                    before_hover_snapshot = await get_page_activity_snapshot(page)
-                except Exception as exc:
-                    if _is_nav_error(exc):
-                        await _recover_after_nav(page)
-                        continue
-                    before_hover_snapshot = {"url": str(page.url or ""), "scrollY": scroll_y, "height": 0, "title": "", "text": "", "media": "", "active": ""}
-
-                try:
-                    for i, point in enumerate(sweep_points):
-                        cursor_pos = await move_mouse_human_like(
-                            page=page,
-                            start=cursor_pos,
-                            end=point,
-                            viewport_width=viewport_width,
-                            viewport_height=viewport_height,
-                            duration_ms=(
-                                random.randint(90, 260)
-                                if is_surface_hover
-                                else random.randint(130, 420)
-                                if is_hover_text
-                                else random.randint(220, 640)
-                            ),
-                        )
-                        if is_surface_hover:
-                            # Для WebGL/canvas-областей делаем серию коротких движений, чтобы гарантированно вызвать реакцию сцены.
-                            await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
-                        elif is_hover_text:
-                            # Короткий sweep по буквам/символам, чтобы активировать hover-анимации.
-                            await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
-                        elif i == len(sweep_points) - 1:
-                            await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
-                except Exception as exc:
-                    if _is_nav_error(exc):
-                        await _recover_after_nav(page)
-                        continue
-                    if bottom_debug:
-                        logger.info(f"🧭 Hover interaction skipped due to error: {exc}")
-                    continue
-
-                try:
-                    after_hover_snapshot = await get_page_activity_snapshot(page)
-                    hover_changed = page_state_changed(before_hover_snapshot, after_hover_snapshot)
-                except Exception as exc:
-                    if _is_nav_error(exc):
-                        await _recover_after_nav(page)
-                        continue
-                    hover_changed = False
-
-                if is_surface_hover or is_hover_text:
-                    if hover_changed:
-                        # Даем время показать заметно изменившийся hover-результат.
-                        await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
-                    else:
-                        await page.wait_for_timeout(random.randint(max(60, micro_hover_min), max(110, micro_hover_max)))
-
-                hover_followup_count = 0
-                if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
-                    hover_followup_steps = max(2, min(click_sequence_max_steps + 2, 5))
-                    cursor_pos, hover_followup_count = await perform_followup_click_sequence(
-                        page=page,
-                        cursor_pos=cursor_pos,
-                        anchor_x=tx,
-                        anchor_y=ty,
-                        anchor_key=target_key,
-                        anchor_family=target_family,
-                        viewport_width=viewport_width,
-                        viewport_height=viewport_height,
-                        clicked_keys=clicked_keys,
-                        clicked_families=clicked_families,
-                        hover_min_ms=hover_min_ms,
-                        hover_max_ms=hover_max_ms,
-                        max_followup_steps=hover_followup_steps,
-                        radius_factor=click_sequence_radius_factor,
-                        min_visible_ratio=click_visible_ratio,
-                        min_visibility_clarity=min_visibility_clarity,
-                        allow_internal_nav_click=allow_internal_nav_click,
-                        hover_click_words=hover_click_words,
-                        widget_action_words=widget_action_words,
-                        visited_keys=visited_keys,
-                        visited_families=visited_families,
-                        recent_interactions=recent_interactions,
-                        round_index=round_index,
-                        scroll_y=float(scroll_y),
-                        allowed_url=site_url,
-                    )
-                    if hover_followup_count > 0:
-                        logger.info(
-                            "🖱️ Smart cursor: hover раскрыл локальные клики "
-                            f"(дополнительных шагов={hover_followup_count})"
-                        )
-
-                hover_result_consumed = (not inpage_click_enabled) or hover_changed or hover_followup_count > 0 or not (is_surface_hover or is_hover_text)
-                if hover_result_consumed:
-                    visited_keys.add(target_key)
-                    visited_families.add(target_family)
-                hovered_count += 1
-                interacted_this_round = True
-                no_progress_rounds = 0
-                last_progress_at = time.monotonic()
-                recent_interactions.append((tx, ty, target_abs_y, round_index))
-                if len(recent_interactions) > 20:
-                    recent_interactions.pop(0)
-
                 target_text = str(target.get("text", ""))
                 target_text_low = target_text.strip().lower()
                 target_href = str(target.get("href", "")).strip().lower()
                 target_tag = str(target.get("tag", "")).strip().lower()
-                action_hint = has_keyword(target_text_low, hover_click_words)
-                repeatable_control = is_probable_repeatable_control(target)
-                is_local_trigger = (
-                    target_tag in {"button", "summary"}
-                    or (
-                        not target_href
-                        and (action_hint or (target_width * target_height <= 26000 and not is_surface_hover))
-                    )
-                )
-                force_click_after_stale_hover = (
-                    (is_surface_hover or is_hover_text)
-                    and not hover_changed
-                    and hover_followup_count == 0
-                    and is_safe_inpage_click_target(
-                        target,
-                        str(page.url or ""),
-                        allow_internal_nav_click=allow_internal_nav_click,
-                        allowed_url=site_url,
-                    )
-                    and (strict_allow_clicks or is_local_trigger or repeatable_control or target_tag in {"button", "summary", "a"})
-                )
 
-                should_click = (
+                # ── Определяем, безопасно ли кликать по этому элементу ──
+                target_click_safe = (
                     inpage_click_enabled
-                    and hover_followup_count == 0
                     and target_key not in clicked_keys
                     and target_family not in clicked_families
                     and is_safe_inpage_click_target(
                         target,
-                        str(page.url or ""),
+                        current_url,
                         allow_internal_nav_click=allow_internal_nav_click,
                         allowed_url=site_url,
                     )
@@ -2443,115 +2333,295 @@ async def run_strict_top_to_bottom_pass(
                         min_visibility_clarity=min_visibility_clarity,
                         resolved_y=ty,
                     )
-                    and (strict_allow_clicks or action_hint or is_local_trigger or repeatable_control or force_click_after_stale_hover)
                 )
 
-                click_probability = clamp(inpage_click_probability, 0.0, 1.0)
-                if strict_allow_clicks:
-                    click_probability = max(click_probability, 0.42)
-                if is_local_trigger:
-                    click_probability = max(click_probability, 0.82)
-                if action_hint:
-                    click_probability = 1.0
-                if has_keyword(target_text, widget_action_words):
-                    click_probability = max(click_probability, 0.88)
-                if is_surface_hover and not action_hint:
-                    click_probability = min(click_probability, 0.32)
-                if is_surface_hover and is_local_trigger:
-                    click_probability = max(click_probability, 0.58)
-                if is_hover_text and is_local_trigger:
-                    click_probability = max(click_probability, 0.94)
-                if target_tag in {"button", "summary"} and not target_href:
-                    click_probability = max(click_probability, 0.92)
-                if force_click_after_stale_hover:
-                    click_probability = 1.0
-                    logger.info("🖱️ Smart cursor: hover не дал реакции, пробуем прямой клик по локальному control")
+                # ── Шаг 0: перемещаем курсор к цели ──
+                try:
+                    before_snapshot = await get_page_activity_snapshot(page)
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                        continue
+                    before_snapshot = {"url": str(page.url or ""), "scrollY": scroll_y, "height": 0, "title": "", "text": "", "media": "", "active": ""}
 
-                if should_click and random.random() < click_probability:
+                try:
+                    cursor_pos = await move_mouse_human_like(
+                        page=page,
+                        start=cursor_pos,
+                        end=(tx, ty),
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                        duration_ms=random.randint(200, 540),
+                    )
+                    await page.wait_for_timeout(random.randint(60, 160))
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                        continue
+                    continue
+
+                click_changed = False
+                hover_changed = False
+                followup_total = 0
+
+                # ════════════════════════════════════════════════════════
+                # CLICK-FIRST: сначала пробуем клик, если элемент безопасен
+                # ════════════════════════════════════════════════════════
+                if target_click_safe:
                     before_url = str(page.url or "")
                     before_scroll = scroll_y
-                    before_click_snapshot = before_hover_snapshot if force_click_after_stale_hover else await get_page_activity_snapshot(page)
                     try:
                         await page.mouse.click(tx, ty, delay=random.randint(35, 105))
-                        await page.wait_for_timeout(random.randint(130, 300))
+                        await page.wait_for_timeout(random.randint(250, 500))
                     except Exception as exc:
                         if _is_nav_error(exc):
                             await _recover_after_nav(page)
+                            visited_keys.add(target_key)
+                            visited_families.add(target_family)
+                            hovered_count += 1
+                            interacted_this_round = True
                             continue
 
                     after_url = str(page.url or "")
                     try:
                         after_click_snapshot = await get_page_activity_snapshot(page)
-                        click_changed = page_state_changed(before_click_snapshot, after_click_snapshot)
+                        click_changed = page_state_changed(before_snapshot, after_click_snapshot)
                     except Exception as exc:
                         if _is_nav_error(exc):
                             await _recover_after_nav(page)
+                            visited_keys.add(target_key)
+                            visited_families.add(target_family)
+                            hovered_count += 1
+                            interacted_this_round = True
                             continue
                         click_changed = False
 
                     effective_click_change = click_changed or (after_url != before_url)
-                    if effective_click_change:
-                        clicked_keys.add(target_key)
-                        clicked_families.add(target_family)
-                        visited_keys.add(target_key)
-                        visited_families.add(target_family)
 
+                    # ── Защита от ухода на внешний сайт ──
                     navigated_offsite = after_url and not is_same_site_url(after_url, site_url)
                     navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
                     if navigated_offsite:
-                        logger.warning("⛔ Smart cursor: пойман внешний переход, возвращаемся на разрешённый сайт")
+                        logger.warning("⛔ Smart cursor: пойман внешний переход, возвращаемся")
                         await ensure_page_within_allowed_site(
-                            page,
-                            site_url,
-                            fallback_url=before_url,
-                            fallback_scroll_y=before_scroll,
-                            timeout=15000,
+                            page, site_url, fallback_url=before_url,
+                            fallback_scroll_y=before_scroll, timeout=15000,
                         )
+                        visited_keys.add(target_key)
+                        visited_families.add(target_family)
+                        clicked_keys.add(target_key)
+                        clicked_families.add(target_family)
+                        hovered_count += 1
+                        interacted_this_round = True
+                        no_progress_rounds = 0
+                        last_progress_at = time.monotonic()
+                        recent_interactions.append((tx, ty, target_abs_y, round_index))
+                        if len(recent_interactions) > 20:
+                            recent_interactions.pop(0)
+                        continue
                     elif navigated_internally and not allow_internal_nav_click:
-                        logger.info("🖱️ Smart cursor: пойман нежелательный внутренний переход, откатываемся назад")
-                        await restore_page_location(
-                            page,
-                            before_url,
-                            restore_scroll_y=before_scroll,
-                            timeout=15000,
-                        )
-                    elif not effective_click_change:
-                        logger.info("🧭 Smart cursor: локальный клик не изменил состояние, идем дальше без фиксации цели")
+                        logger.info("🖱️ Smart cursor: пойман внутренний переход, откатываемся")
+                        await restore_page_location(page, before_url, restore_scroll_y=before_scroll, timeout=15000)
+                        visited_keys.add(target_key)
+                        visited_families.add(target_family)
+                        clicked_keys.add(target_key)
+                        clicked_families.add(target_family)
+                        hovered_count += 1
+                        interacted_this_round = True
+                        no_progress_rounds = 0
+                        last_progress_at = time.monotonic()
+                        recent_interactions.append((tx, ty, target_abs_y, round_index))
+                        if len(recent_interactions) > 20:
+                            recent_interactions.pop(0)
+                        continue
 
-                    followup_steps = max(1, min(click_sequence_max_steps + 1, 5))
-                    if followup_steps > 0 and effective_click_change and (action_hint or is_local_trigger or repeatable_control):
-                        cursor_pos, followup_count = await perform_followup_click_sequence(
-                            page=page,
-                            cursor_pos=cursor_pos,
-                            anchor_x=tx,
-                            anchor_y=ty,
-                            anchor_key=target_key,
-                            anchor_family=target_family,
-                            viewport_width=viewport_width,
-                            viewport_height=viewport_height,
-                            clicked_keys=clicked_keys,
-                            clicked_families=clicked_families,
-                            hover_min_ms=hover_min_ms,
-                            hover_max_ms=hover_max_ms,
-                            max_followup_steps=followup_steps,
-                            radius_factor=click_sequence_radius_factor,
-                            min_visible_ratio=click_visible_ratio,
-                            min_visibility_clarity=min_visibility_clarity,
-                            allow_internal_nav_click=allow_internal_nav_click,
-                            hover_click_words=hover_click_words,
-                            widget_action_words=widget_action_words,
-                            visited_keys=visited_keys,
-                            visited_families=visited_families,
-                            recent_interactions=recent_interactions,
-                            round_index=round_index,
-                            scroll_y=float(scroll_y),
-                            allowed_url=site_url,
-                        )
-                        if followup_count > 0:
-                            logger.info(
-                                "🖱️ Smart cursor: выполнена цепочка локальных кликов "
-                                f"(дополнительных шагов={followup_count})"
+                    if effective_click_change:
+                        clicked_keys.add(target_key)
+                        clicked_families.add(target_family)
+                        logger.info(f"🖱️ Smart cursor: клик изменил состояние '{target_text[:30]}'")
+                        # Даём время на анимацию после изменения.
+                        await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+
+                        # ── Анализ новых элементов, появившихся после клика ──
+                        try:
+                            new_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 30)
+                        except Exception as exc:
+                            if _is_nav_error(exc):
+                                await _recover_after_nav(page)
+                            new_targets = []
+
+                        deep_clicks = 0
+                        deep_limit = max(2, min(click_sequence_max_steps + 2, 6))
+                        for new_item in new_targets:
+                            if deep_clicks >= deep_limit:
+                                break
+                            ni_key = str(new_item.get("key", ""))
+                            ni_family = strict_target_family_key(new_item)
+                            if not ni_key or ni_key in clicked_keys or ni_key in visited_keys:
+                                continue
+                            if ni_family in clicked_families or ni_family in visited_families:
+                                continue
+                            ni_x = clamp(_to_float(new_item.get("x"), tx), 2, viewport_width - 2)
+                            ni_y = clamp(_to_float(new_item.get("y"), ty), 2, viewport_height - 2)
+                            dist = math.hypot(ni_x - tx, ni_y - ty)
+                            if dist > max(180.0, min(viewport_width, viewport_height) * 0.45):
+                                continue
+                            if not is_safe_inpage_click_target(
+                                new_item, str(page.url or ""),
+                                allow_internal_nav_click=allow_internal_nav_click,
+                                allowed_url=site_url,
+                            ):
+                                continue
+                            if not is_target_clearly_visible(
+                                new_item, viewport_width, viewport_height,
+                                min_visible_ratio=click_visible_ratio,
+                                min_visibility_clarity=min_visibility_clarity,
+                                resolved_y=ni_y,
+                            ):
+                                continue
+                            try:
+                                ni_before = await get_page_activity_snapshot(page)
+                                cursor_pos = await move_mouse_human_like(
+                                    page, cursor_pos, (ni_x, ni_y),
+                                    viewport_width, viewport_height,
+                                    random.randint(160, 380),
+                                )
+                                await page.wait_for_timeout(random.randint(60, 150))
+                                await page.mouse.click(ni_x, ni_y, delay=random.randint(30, 90))
+                                await page.wait_for_timeout(random.randint(250, 500))
+                                ni_after = await get_page_activity_snapshot(page)
+                                ni_changed = page_state_changed(ni_before, ni_after)
+                            except Exception as exc:
+                                if _is_nav_error(exc):
+                                    await _recover_after_nav(page)
+                                    break
+                                continue
+
+                            # Проверяем, не ушли ли мы на внешний/внутренний URL.
+                            ni_after_url = str(page.url or "")
+                            if ni_after_url and not is_same_site_url(ni_after_url, site_url):
+                                await ensure_page_within_allowed_site(
+                                    page, site_url, fallback_url=before_url,
+                                    fallback_scroll_y=before_scroll, timeout=12000,
+                                )
+                                break
+                            if ni_after_url != before_url and is_navigation_like_href(ni_after_url, before_url) and not allow_internal_nav_click:
+                                await restore_page_location(page, before_url, restore_scroll_y=before_scroll, timeout=12000)
+                                break
+
+                            clicked_keys.add(ni_key)
+                            clicked_families.add(ni_family)
+                            visited_keys.add(ni_key)
+                            visited_families.add(ni_family)
+                            if ni_changed:
+                                deep_clicks += 1
+                                await page.wait_for_timeout(random.randint(180, 400))
+
+                        followup_total = deep_clicks
+                        if followup_total > 0:
+                            logger.info(f"🖱️ Smart cursor: после клика найдено и нажато новых элементов: {followup_total}")
+
+                        # Дополнительно пробуем цепочку perform_followup_click_sequence
+                        if followup_total == 0:
+                            followup_steps = max(2, min(click_sequence_max_steps + 2, 5))
+                            cursor_pos, seq_count = await perform_followup_click_sequence(
+                                page=page, cursor_pos=cursor_pos,
+                                anchor_x=tx, anchor_y=ty,
+                                anchor_key=target_key, anchor_family=target_family,
+                                viewport_width=viewport_width, viewport_height=viewport_height,
+                                clicked_keys=clicked_keys, clicked_families=clicked_families,
+                                hover_min_ms=hover_min_ms, hover_max_ms=hover_max_ms,
+                                max_followup_steps=followup_steps,
+                                radius_factor=click_sequence_radius_factor,
+                                min_visible_ratio=click_visible_ratio,
+                                min_visibility_clarity=min_visibility_clarity,
+                                allow_internal_nav_click=allow_internal_nav_click,
+                                hover_click_words=hover_click_words,
+                                widget_action_words=widget_action_words,
+                                visited_keys=visited_keys, visited_families=visited_families,
+                                recent_interactions=recent_interactions,
+                                round_index=round_index, scroll_y=float(scroll_y),
+                                allowed_url=site_url,
                             )
+                            followup_total += seq_count
+
+                # ════════════════════════════════════════════════════════
+                # HOVER FALLBACK: если клик не дал изменений или не был выполнен
+                # ════════════════════════════════════════════════════════
+                if not click_changed and (is_surface_hover or is_hover_text):
+                    sweep_points: List[Tuple[float, float]] = []
+                    if is_surface_hover and (target_width >= 120 or target_height >= 90):
+                        span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
+                        span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
+                        sweep_points = [
+                            (clamp(tx - span_x, 2, viewport_width - 2), ty),
+                            (tx, clamp(ty - span_y, 2, viewport_height - 2)),
+                            (clamp(tx + span_x, 2, viewport_width - 2), ty),
+                            (tx, clamp(ty + span_y, 2, viewport_height - 2)),
+                            (tx, ty),
+                        ]
+                        if target_width >= 220 and target_height >= 120:
+                            sweep_points.extend([
+                                (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
+                                (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
+                            ])
+                    elif is_hover_text and target_width >= 110:
+                        half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
+                        sweep_points = [
+                            (clamp(tx - half_span, 2, viewport_width - 2), ty),
+                            (tx, ty),
+                            (clamp(tx + half_span, 2, viewport_width - 2), ty),
+                        ]
+                    else:
+                        sweep_points = [(tx, ty)]
+
+                    try:
+                        for i, point in enumerate(sweep_points):
+                            cursor_pos = await move_mouse_human_like(
+                                page=page, start=cursor_pos, end=point,
+                                viewport_width=viewport_width, viewport_height=viewport_height,
+                                duration_ms=(
+                                    random.randint(90, 260) if is_surface_hover
+                                    else random.randint(130, 420) if is_hover_text
+                                    else random.randint(220, 640)
+                                ),
+                            )
+                            if is_surface_hover:
+                                await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
+                            elif is_hover_text:
+                                await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
+                            elif i == len(sweep_points) - 1:
+                                await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                    except Exception as exc:
+                        if _is_nav_error(exc):
+                            await _recover_after_nav(page)
+                            visited_keys.add(target_key)
+                            visited_families.add(target_family)
+                            hovered_count += 1
+                            interacted_this_round = True
+                            continue
+
+                    try:
+                        after_hover_snapshot = await get_page_activity_snapshot(page)
+                        hover_changed = page_state_changed(before_snapshot, after_hover_snapshot)
+                    except Exception as exc:
+                        if _is_nav_error(exc):
+                            await _recover_after_nav(page)
+                        hover_changed = False
+
+                    if hover_changed:
+                        await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+
+                # ── Финализация: регистрируем цель как обработанную ──
+                visited_keys.add(target_key)
+                visited_families.add(target_family)
+                hovered_count += 1
+                interacted_this_round = True
+                no_progress_rounds = 0
+                last_progress_at = time.monotonic()
+                recent_interactions.append((tx, ty, target_abs_y, round_index))
+                if len(recent_interactions) > 20:
+                    recent_interactions.pop(0)
 
         if round_index % 4 == 0:
             try:
