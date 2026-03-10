@@ -549,9 +549,12 @@ async def try_click_entry_element(
 ) -> Tuple[Tuple[float, float], bool, Optional[str]]:
     """Пытается кликнуть по входному элементу, если страница заблокирована welcome/gate-экраном."""
     current_url = str(page.url or "")
-    entry_words = (
-        "enter", "start", "continue", "explore", "open", "go", "begin", "launch", "proceed",
-        "skip", "next", "accept", "agree", "allow", "ok", "войти", "начать", "продолж", "далее", "принять",
+    strong_entry_words = (
+        "enter", "start", "explore", "begin", "launch", "proceed", "accept", "agree",
+        "allow", "войти", "начать", "принять",
+    )
+    weak_entry_words = (
+        "continue", "open", "go", "skip", "next", "ok", "продолж", "далее",
     )
     purchase_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
@@ -582,8 +585,6 @@ async def try_click_entry_element(
         text = str(candidate.get("text", "")).strip().lower()
         text_compact = " ".join(text.split())
         href = str(candidate.get("href", "")).strip().lower()
-        has_entry_hint = has_keyword(text, entry_words) or has_keyword(href, entry_words)
-
         if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
             continue
 
@@ -599,14 +600,18 @@ async def try_click_entry_element(
         y = float(candidate.get("y", 0.0))
         z_index = float(candidate.get("zIndex", 0.0))
         center_dist = math.hypot(x - viewport_width / 2, y - viewport_height / 2)
+        overlay_like = z_index >= 12
+        compact_gate = area <= 18000 and width <= 220 and height <= 140
+        centered_gate = center_dist <= math.hypot(viewport_width, viewport_height) * 0.24
+
+        strong_entry_hint = has_keyword(text, strong_entry_words) or has_keyword(href, strong_entry_words)
+        weak_entry_hint = has_keyword(text, weak_entry_words) or has_keyword(href, weak_entry_words)
+        has_entry_hint = strong_entry_hint or (weak_entry_hint and centered_gate and (overlay_like or compact_gate))
 
         # Без явных признаков входа не кликаем контентные карточки/превью.
         if not has_entry_hint:
             short_text = len(text_compact) <= 20
             tiny_copy = len(text_compact.split()) <= 4
-            centered_gate = center_dist <= math.hypot(viewport_width, viewport_height) * 0.24
-            overlay_like = z_index >= 12
-            compact_gate = area <= 18000 and width <= 220 and height <= 140
             if href:
                 continue
             if not (
@@ -2239,9 +2244,8 @@ async def run_strict_top_to_bottom_pass(
                     if bool(item.get("isSurfaceHover", False)) or bool(item.get("isHoverText", False))
                 ]
 
-                # В режиме спуска: если hover найден, сначала обязательно показываем его,
-                # и только затем продолжаем скролл вниз.
-                if priority_click_candidates:
+                # В hover-only проходе не прыгаем в click-first ветку до завершения главной страницы.
+                if inpage_click_enabled and priority_click_candidates:
                     pool = shortlist_progress_targets(priority_click_candidates, band_px=150.0, limit=min(6, len(priority_click_candidates)))
                 elif surface_hover_candidates:
                     pool = shortlist_progress_targets(surface_hover_candidates, band_px=170.0, limit=min(6, len(surface_hover_candidates)))
@@ -2382,7 +2386,7 @@ async def run_strict_top_to_bottom_pass(
                             f"(дополнительных шагов={hover_followup_count})"
                         )
 
-                hover_result_consumed = hover_changed or hover_followup_count > 0 or not (is_surface_hover or is_hover_text)
+                hover_result_consumed = (not inpage_click_enabled) or hover_changed or hover_followup_count > 0 or not (is_surface_hover or is_hover_text)
                 if hover_result_consumed:
                     visited_keys.add(target_key)
                     visited_families.add(target_family)
@@ -3491,14 +3495,7 @@ async def run_smart_cursor(
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
 
         strict_total_budget_ms = max(8000, int(total_time_ms))
-        reserve_for_nav_ms = 0
-        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 and strict_total_budget_ms > 14000:
-            reserve_for_nav_ms = min(
-                max(6000, int(strict_total_budget_ms * 0.24)),
-                max(6000, nav_tabs_max_visits * max(1600, int(nav_tab_scroll_timeout_ms * 0.40))),
-            )
-
-        strict_main_budget_ms = max(8000, strict_total_budget_ms - reserve_for_nav_ms)
+        strict_main_budget_ms = strict_total_budget_ms
 
         cursor_pos, strict_hovered, reached_bottom = await run_strict_top_to_bottom_pass(
             page=page,
@@ -3513,7 +3510,7 @@ async def run_smart_cursor(
             scroll_speed_factor=scroll_speed_factor,
             scroll_pause_min_ms=scroll_pause_min_ms,
             scroll_pause_max_ms=scroll_pause_max_ms,
-            inpage_click_enabled=inpage_click_enabled,
+            inpage_click_enabled=False,
             inpage_click_probability=inpage_click_probability,
             scroll_finish_timeout_ms=scroll_finish_timeout_ms,
             require_bottom=(smart_cursor_require_bottom or always_descend),
@@ -3536,11 +3533,61 @@ async def run_smart_cursor(
         else:
             logger.warning("⚠️ Smart cursor: STRICT проход завершился по hard-timeout до достижения конца страницы")
 
+        if reached_bottom and inpage_click_enabled:
+            elapsed_ms = int((time.monotonic() - start_time) * 1000)
+            remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
+            min_nav_reserve_ms = 4500 if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 else 0
+            interaction_budget_ms = max(0, remaining_ms - min_nav_reserve_ms)
+
+            if interaction_budget_ms >= 5000:
+                logger.info("🧭 Smart cursor: STRICT postpass — локальные интерактивы на главной после полного прохода")
+                try:
+                    await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+                    await page.wait_for_timeout(random.randint(200, 420))
+                except Exception:
+                    pass
+
+                try:
+                    cursor_pos, strict_interaction_count, _ = await run_strict_top_to_bottom_pass(
+                        page=page,
+                        cursor_pos=cursor_pos,
+                        viewport_width=viewport_width,
+                        viewport_height=viewport_height,
+                        total_time_ms=interaction_budget_ms,
+                        max_targets=max_targets,
+                        hover_min_ms=hover_min_ms,
+                        hover_max_ms=hover_max_ms,
+                        bottom_stable_rounds_required=bottom_stable_rounds_required,
+                        scroll_speed_factor=scroll_speed_factor,
+                        scroll_pause_min_ms=scroll_pause_min_ms,
+                        scroll_pause_max_ms=scroll_pause_max_ms,
+                        inpage_click_enabled=True,
+                        inpage_click_probability=inpage_click_probability,
+                        scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                        require_bottom=False,
+                        require_bottom_max_ms=interaction_budget_ms,
+                        strict_allow_clicks=strict_top_to_bottom_allow_clicks,
+                        bottom_debug=bottom_debug,
+                        hover_visible_ratio=hover_visible_ratio,
+                        click_visible_ratio=click_visible_ratio,
+                        min_visibility_clarity=min_visibility_clarity,
+                        click_sequence_max_steps=click_sequence_max_steps,
+                        click_sequence_radius_factor=click_sequence_radius_factor,
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        site_url=site_url,
+                        strict_interactions_per_scroll=1,
+                        stall_timeout_ms=max(4500, strict_stall_timeout_ms),
+                    )
+                    hovered_count += strict_interaction_count
+                except Exception as interaction_err:
+                    logger.warning(f"⚠️ Smart cursor: ошибка STRICT postpass интерактивов: {interaction_err}")
+                    await _recover_after_nav(page)
+
         if nav_tabs_visit_enabled and nav_tabs_max_visits > 0:
             if reached_bottom:
                 elapsed_ms = int((time.monotonic() - start_time) * 1000)
                 remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
-                nav_budget_ms = max(0, min(max(reserve_for_nav_ms, 0), remaining_ms))
+                nav_budget_ms = remaining_ms
                 if nav_budget_ms >= 4500:
                     logger.info("🧭 Smart cursor: STRICT postpass — обход вкладок после полного прохода главной")
                     try:
