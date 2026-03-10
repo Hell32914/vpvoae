@@ -1245,6 +1245,29 @@ def is_probable_repeatable_control(target: Dict[str, Any]) -> bool:
     return False
 
 
+def target_progress_y(target: Dict[str, Any]) -> float:
+    return float(target.get("absY", target.get("y", 0.0)))
+
+
+def shortlist_progress_targets(targets: List[Dict[str, Any]], band_px: float, limit: int) -> List[Dict[str, Any]]:
+    """Сохраняет последовательное движение сверху вниз вместо случайных скачков по viewport."""
+    if not targets:
+        return []
+
+    ordered = sorted(
+        targets,
+        key=lambda item: (
+            target_progress_y(item),
+            float(item.get("x", 0.0)),
+            -target_sort_score(item),
+        ),
+    )
+    anchor_y = target_progress_y(ordered[0])
+    band_limit = max(40.0, float(band_px))
+    band = [item for item in ordered if target_progress_y(item) <= anchor_y + band_limit]
+    return band[: max(1, limit)]
+
+
 async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
     """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
     return await page.evaluate(
@@ -1535,22 +1558,25 @@ async def perform_followup_click_sequence(
             continue
 
         local_changed = page_state_changed(before_snapshot, after_snapshot)
+        effective_change = local_changed or (after_url != before_url)
         family_repeat_counts[follow_family] = family_repeat_counts.get(follow_family, 0) + 1
         family_last_changed[follow_family] = local_changed
 
-        clicked_keys.add(follow_key)
-        clicked_families.add(follow_family)
-        if visited_keys is not None:
-            visited_keys.add(follow_key)
-        if visited_families is not None:
-            visited_families.add(follow_family)
+        if effective_change:
+            clicked_keys.add(follow_key)
+            clicked_families.add(follow_family)
+            if visited_keys is not None:
+                visited_keys.add(follow_key)
+            if visited_families is not None:
+                visited_families.add(follow_family)
 
         if recent_interactions is not None:
             recent_interactions.append((follow_x, follow_y, float(scroll_y + follow_y), round_index))
             if len(recent_interactions) > 20:
                 recent_interactions.pop(0)
 
-        performed += 1
+        if effective_change:
+            performed += 1
 
         navigated_offsite = bool(allowed_url) and after_url and not is_same_site_url(after_url, allowed_url)
         navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
@@ -2178,9 +2204,11 @@ async def run_strict_top_to_bottom_pass(
                     button_like = tag in {"button", "summary"}
                     no_nav_href = (not href) or href.startswith("#") or href.startswith("javascript:")
                     compact = area <= 30000 and width <= 260 and height <= 170
+                    repeatable_control = is_probable_repeatable_control(item)
 
                     looks_clickable_trigger = (
                         action_hint
+                        or repeatable_control
                         or (button_like and compact)
                         or (no_nav_href and compact and txt and len(txt) <= 24)
                     )
@@ -2214,16 +2242,16 @@ async def run_strict_top_to_bottom_pass(
                 # В режиме спуска: если hover найден, сначала обязательно показываем его,
                 # и только затем продолжаем скролл вниз.
                 if priority_click_candidates:
-                    pool = sorted(priority_click_candidates, key=target_sort_score, reverse=True)[: min(7, len(priority_click_candidates))]
+                    pool = shortlist_progress_targets(priority_click_candidates, band_px=150.0, limit=min(6, len(priority_click_candidates)))
                 elif surface_hover_candidates:
-                    pool = sorted(surface_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(surface_hover_candidates))]
+                    pool = shortlist_progress_targets(surface_hover_candidates, band_px=170.0, limit=min(6, len(surface_hover_candidates)))
                 elif hover_text_candidates:
-                    pool = sorted(hover_text_candidates, key=target_sort_score, reverse=True)[: min(8, len(hover_text_candidates))]
+                    pool = shortlist_progress_targets(hover_text_candidates, band_px=170.0, limit=min(6, len(hover_text_candidates)))
                 elif any_hover_candidates:
-                    pool = sorted(any_hover_candidates, key=target_sort_score, reverse=True)[: min(8, len(any_hover_candidates))]
+                    pool = shortlist_progress_targets(any_hover_candidates, band_px=180.0, limit=min(6, len(any_hover_candidates)))
                 else:
-                    pool = sorted(candidates, key=target_sort_score, reverse=True)[: min(8, len(candidates))]
-                target = random.choice(pool[:2] if len(pool) >= 2 else pool)
+                    pool = shortlist_progress_targets(candidates, band_px=180.0, limit=min(6, len(candidates)))
+                target = pool[0]
 
                 tx = clamp(float(target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
                 ty = clamp(float(target.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
@@ -2261,6 +2289,15 @@ async def run_strict_top_to_bottom_pass(
                 else:
                     sweep_points = [(tx, ty)]
 
+                hover_changed = False
+                try:
+                    before_hover_snapshot = await get_page_activity_snapshot(page)
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                        continue
+                    before_hover_snapshot = {"url": str(page.url or ""), "scrollY": scroll_y, "height": 0, "title": "", "text": "", "media": "", "active": ""}
+
                 try:
                     for i, point in enumerate(sweep_points):
                         cursor_pos = await move_mouse_human_like(
@@ -2293,9 +2330,21 @@ async def run_strict_top_to_bottom_pass(
                         logger.info(f"🧭 Hover interaction skipped due to error: {exc}")
                     continue
 
+                try:
+                    after_hover_snapshot = await get_page_activity_snapshot(page)
+                    hover_changed = page_state_changed(before_hover_snapshot, after_hover_snapshot)
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                        continue
+                    hover_changed = False
+
                 if is_surface_hover or is_hover_text:
-                    # Обязательная пауза показа результата hover перед продолжением спуска.
-                    await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+                    if hover_changed:
+                        # Даем время показать заметно изменившийся hover-результат.
+                        await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+                    else:
+                        await page.wait_for_timeout(random.randint(max(60, micro_hover_min), max(110, micro_hover_max)))
 
                 hover_followup_count = 0
                 if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
@@ -2333,8 +2382,10 @@ async def run_strict_top_to_bottom_pass(
                             f"(дополнительных шагов={hover_followup_count})"
                         )
 
-                visited_keys.add(target_key)
-                visited_families.add(target_family)
+                hover_result_consumed = hover_changed or hover_followup_count > 0 or not (is_surface_hover or is_hover_text)
+                if hover_result_consumed:
+                    visited_keys.add(target_key)
+                    visited_families.add(target_family)
                 hovered_count += 1
                 interacted_this_round = True
                 no_progress_rounds = 0
@@ -2344,15 +2395,29 @@ async def run_strict_top_to_bottom_pass(
                     recent_interactions.pop(0)
 
                 target_text = str(target.get("text", ""))
+                target_text_low = target_text.strip().lower()
                 target_href = str(target.get("href", "")).strip().lower()
                 target_tag = str(target.get("tag", "")).strip().lower()
-                action_hint = has_keyword(target_text, hover_click_words)
+                action_hint = has_keyword(target_text_low, hover_click_words)
+                repeatable_control = is_probable_repeatable_control(target)
                 is_local_trigger = (
                     target_tag in {"button", "summary"}
                     or (
                         not target_href
                         and (action_hint or (target_width * target_height <= 26000 and not is_surface_hover))
                     )
+                )
+                force_click_after_stale_hover = (
+                    (is_surface_hover or is_hover_text)
+                    and not hover_changed
+                    and hover_followup_count == 0
+                    and is_safe_inpage_click_target(
+                        target,
+                        str(page.url or ""),
+                        allow_internal_nav_click=allow_internal_nav_click,
+                        allowed_url=site_url,
+                    )
+                    and (strict_allow_clicks or is_local_trigger or repeatable_control or target_tag in {"button", "summary", "a"})
                 )
 
                 should_click = (
@@ -2374,7 +2439,7 @@ async def run_strict_top_to_bottom_pass(
                         min_visibility_clarity=min_visibility_clarity,
                         resolved_y=ty,
                     )
-                    and (strict_allow_clicks or action_hint or is_local_trigger)
+                    and (strict_allow_clicks or action_hint or is_local_trigger or repeatable_control or force_click_after_stale_hover)
                 )
 
                 click_probability = clamp(inpage_click_probability, 0.0, 1.0)
@@ -2394,10 +2459,14 @@ async def run_strict_top_to_bottom_pass(
                     click_probability = max(click_probability, 0.94)
                 if target_tag in {"button", "summary"} and not target_href:
                     click_probability = max(click_probability, 0.92)
+                if force_click_after_stale_hover:
+                    click_probability = 1.0
+                    logger.info("🖱️ Smart cursor: hover не дал реакции, пробуем прямой клик по локальному control")
 
                 if should_click and random.random() < click_probability:
                     before_url = str(page.url or "")
                     before_scroll = scroll_y
+                    before_click_snapshot = before_hover_snapshot if force_click_after_stale_hover else await get_page_activity_snapshot(page)
                     try:
                         await page.mouse.click(tx, ty, delay=random.randint(35, 105))
                         await page.wait_for_timeout(random.randint(130, 300))
@@ -2405,10 +2474,24 @@ async def run_strict_top_to_bottom_pass(
                         if _is_nav_error(exc):
                             await _recover_after_nav(page)
                             continue
-                    clicked_keys.add(target_key)
-                    clicked_families.add(target_family)
 
                     after_url = str(page.url or "")
+                    try:
+                        after_click_snapshot = await get_page_activity_snapshot(page)
+                        click_changed = page_state_changed(before_click_snapshot, after_click_snapshot)
+                    except Exception as exc:
+                        if _is_nav_error(exc):
+                            await _recover_after_nav(page)
+                            continue
+                        click_changed = False
+
+                    effective_click_change = click_changed or (after_url != before_url)
+                    if effective_click_change:
+                        clicked_keys.add(target_key)
+                        clicked_families.add(target_family)
+                        visited_keys.add(target_key)
+                        visited_families.add(target_family)
+
                     navigated_offsite = after_url and not is_same_site_url(after_url, site_url)
                     navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
                     if navigated_offsite:
@@ -2428,9 +2511,11 @@ async def run_strict_top_to_bottom_pass(
                             restore_scroll_y=before_scroll,
                             timeout=15000,
                         )
+                    elif not effective_click_change:
+                        logger.info("🧭 Smart cursor: локальный клик не изменил состояние, идем дальше без фиксации цели")
 
                     followup_steps = max(1, min(click_sequence_max_steps + 1, 5))
-                    if followup_steps > 0 and (action_hint or is_local_trigger):
+                    if followup_steps > 0 and effective_click_change and (action_hint or is_local_trigger or repeatable_control):
                         cursor_pos, followup_count = await perform_followup_click_sequence(
                             page=page,
                             cursor_pos=cursor_pos,
