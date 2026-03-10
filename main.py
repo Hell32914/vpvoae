@@ -298,7 +298,8 @@ async def collect_interactive_targets(
 
                 const text = (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 40);
                 const key = elementKey(el, cx, cy, text);
-                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                let href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                if (!href) { let p = el.parentElement; for (let d = 0; p && d < 4; d++, p = p.parentElement) { if (p instanceof HTMLAnchorElement) { href = p.getAttribute('href') || ''; break; } } }
                 const dynamicBoost = /menu|nav|tab|card|tile|cta|action|play|pause|open|calc|form|wizard|step|option|choice|result/i.test((el.className || '').toString()) ? 30 : 0;
                 const surfaceHover = isSurfaceHoverCandidate(el, rect, style);
                 const surfaceBoost = surfaceHover ? 96 : 0;
@@ -461,7 +462,8 @@ async def collect_activation_targets(
                 if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
 
                 const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0, 80);
-                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                let href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                if (!href) { let p = el.parentElement; for (let d = 0; p && d < 4; d++, p = p.parentElement) { if (p instanceof HTMLAnchorElement) { href = p.getAttribute('href') || ''; break; } } }
                 const z = toNumber(style.zIndex, 0);
                 const area = rect.width * rect.height;
                 const centerDist = Math.hypot(cx - viewportWidth / 2, cy - viewportHeight / 2);
@@ -840,7 +842,19 @@ def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
 
 def has_keyword(value: str, keywords: Tuple[str, ...]) -> bool:
     low = value.lower()
-    return any(word in low for word in keywords)
+    if any(word in low for word in keywords):
+        return True
+    # Дополнительно проверяем по отдельным токенам (login vs log in, signup vs sign up)
+    tokens = set(low.split())
+    collapsed = low.replace(" ", "")
+    for word in keywords:
+        if " " in word:
+            # Для многословных ключей проверяем склеенный вариант: "sign up" -> "signup"
+            if word.replace(" ", "") in collapsed:
+                return True
+        elif word in tokens:
+            return True
+    return False
 
 
 def _to_float(value: Any, default: float) -> float:
@@ -1064,9 +1078,10 @@ def is_safe_inpage_click_target(
     blocked_action_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
-        "download", "install", "get started", "sign up", "sign in", "log in", "register",
-        "free trial", "get app", "app store", "google play", "try free", "start free",
-        "get it", "launch", "deploy",
+        "download", "install", "get started", "sign up", "signup", "sign in", "signin",
+        "log in", "login", "register", "free trial", "try for free", "try free",
+        "get app", "app store", "google play", "start free", "start trial",
+        "get it", "launch", "deploy", "free", "trial", "demo",
     )
     if has_keyword(text, blocked_action_words) or has_keyword(href, blocked_action_words):
         return False
@@ -1099,9 +1114,10 @@ def is_safe_nav_tab_target(target: Dict[str, Any], current_url: str, allowed_url
     blocked_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store", "order",
-        "login", "sign in", "log in", "account", "privacy", "terms", "cookie",
-        "download", "install", "sign up", "register", "free trial", "get app",
-        "app store", "google play", "try free", "start free", "get it", "launch", "deploy",
+        "login", "signin", "sign in", "log in", "account", "privacy", "terms", "cookie",
+        "download", "install", "sign up", "signup", "register", "free trial", "try for free",
+        "try free", "get app", "app store", "google play", "start free", "start trial",
+        "get it", "launch", "deploy", "free", "trial", "demo",
     )
     if has_keyword(text, blocked_words) or has_keyword(href, blocked_words):
         return False
@@ -1991,7 +2007,8 @@ async def collect_document_interaction_targets(
 
                 const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 84);
                 const textNoWs = text.replace(/\\s+/g, '');
-                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                let href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                if (!href) { let p = el.parentElement; for (let d = 0; p && d < 4; d++, p = p.parentElement) { if (p instanceof HTMLAnchorElement) { href = p.getAttribute('href') || ''; break; } } }
                 const tag = el.tagName.toLowerCase();
 
                 const interactive = isInteractiveNode(el, tag);
@@ -2191,6 +2208,24 @@ async def run_strict_top_to_bottom_pass(
                 if not (viewport_top <= int(item_abs_y) <= viewport_bottom):
                     continue
                 if is_probable_top_nav_target(item, viewport_height):
+                    continue
+
+                # ── Пропускаем элементы с внешними/навигационными ссылками ──
+                item_href = str(item.get("href", "")).strip()
+                if item_href and is_external_href(item_href, current_url, allowed_url=site_url):
+                    continue
+                if item_href and is_navigation_like_href(item_href, current_url) and not allow_internal_nav_click:
+                    continue
+                item_text_low = str(item.get("text", "")).strip().lower()
+                _blocked_commercial = (
+                    "buy", "shop", "cart", "checkout", "pricing", "price",
+                    "purchase", "subscribe", "plan", "membership", "donate", "store", "order",
+                    "download", "install", "sign up", "signup", "sign in", "signin",
+                    "log in", "login", "register", "free trial", "try for free", "try free",
+                    "get app", "app store", "google play", "start free", "start trial",
+                    "free", "trial", "demo",
+                )
+                if has_keyword(item_text_low, _blocked_commercial):
                     continue
 
                 item_family = strict_target_family_key(item)
@@ -2985,7 +3020,8 @@ async def collect_header_nav_targets(
                 if (visibilityClarity < 0.45) continue;
 
                 const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 64);
-                const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                let href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+                if (!href) { let p = el.parentElement; for (let d = 0; p && d < 4; d++, p = p.parentElement) { if (p instanceof HTMLAnchorElement) { href = p.getAttribute('href') || ''; break; } } }
                 const tag = el.tagName.toLowerCase();
                 const cls = (el.className || '').toString().toLowerCase();
 
