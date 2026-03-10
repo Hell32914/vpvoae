@@ -2096,6 +2096,8 @@ async def run_strict_top_to_bottom_pass(
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
+    # Минимальная гарантия: не завершаем раньше 30% от бюджета, даже если достигли дна.
+    min_duration_ms = max(8000, int(soft_budget_ms * 0.30))
 
     last_scroll_y = -1
     stagnant_rounds = 0
@@ -2121,6 +2123,9 @@ async def run_strict_top_to_bottom_pass(
             break
         if elapsed_ms >= hard_budget_ms:
             break
+        # Не выходим раньше минимальной гарантии, даже если внизу.
+        if reached_bottom and elapsed_ms < min_duration_ms:
+            reached_bottom = False
 
         round_index += 1
         interacted_this_round = False
@@ -3603,6 +3608,20 @@ async def run_smart_cursor(
         if always_descend and not strict_top_to_bottom_mode:
             logger.info("🧭 Smart cursor: включен ALWAYS_DESCEND, принудительно используем STRICT проход")
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
+
+        # ── Ожидание готовности контента: убеждаемся, что страница загрузила достаточно элементов ──
+        content_wait_start = time.monotonic()
+        content_wait_max_ms = 20000
+        content_min_targets = 3
+        while (time.monotonic() - content_wait_start) * 1000 < content_wait_max_ms:
+            try:
+                _probe_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 50)
+            except Exception:
+                _probe_targets = []
+            if len(_probe_targets) >= content_min_targets:
+                break
+            logger.info(f"🧭 Smart cursor: ожидание загрузки контента ({len(_probe_targets)} элементов)...")
+            await page.wait_for_timeout(1500)
 
         strict_total_budget_ms = max(8000, int(total_time_ms))
         strict_main_budget_ms = strict_total_budget_ms
