@@ -1210,12 +1210,15 @@ async def perform_followup_click_sequence(
         return cursor_pos, 0
 
     performed = 0
+    started_at = time.monotonic()
     current_x = float(anchor_x)
     current_y = float(anchor_y)
     current_key = str(anchor_key)
     current_family = str(anchor_family)
 
     for step_index in range(max_followup_steps):
+        if (time.monotonic() - started_at) * 1000 >= 2600:
+            break
         wait_min = max(90, int(hover_min_ms * 0.40))
         wait_max = max(wait_min + 30, int(hover_max_ms * 0.70))
         try:
@@ -1765,6 +1768,7 @@ async def run_strict_top_to_bottom_pass(
     click_sequence_radius_factor: float,
     allow_internal_nav_click: bool,
     strict_interactions_per_scroll: int,
+    stall_timeout_ms: int,
 ) -> Tuple[Tuple[float, float], int, bool]:
     """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
@@ -1808,7 +1812,11 @@ async def run_strict_top_to_bottom_pass(
     hover_showcase_min = max(240, int(hover_min_ms * 0.95))
     hover_showcase_max = max(hover_showcase_min + 90, int(hover_max_ms * 1.20))
     strict_interactions_per_scroll = max(1, min(int(strict_interactions_per_scroll), 4))
+    stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
     rounds_since_scroll = 0
+    no_progress_rounds = 0
+    interaction_pause_rounds = 0
+    last_progress_at = time.monotonic()
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -1819,6 +1827,8 @@ async def run_strict_top_to_bottom_pass(
 
         round_index += 1
         interacted_this_round = False
+        if interaction_pause_rounds > 0:
+            interaction_pause_rounds -= 1
 
         if round_index == 1 or (round_index - last_analysis_round) >= 8:
             try:
@@ -1856,7 +1866,7 @@ async def run_strict_top_to_bottom_pass(
             else:
                 raise
 
-        can_interact = (max_targets <= 0) or (hovered_count < max_targets)
+        can_interact = ((max_targets <= 0) or (hovered_count < max_targets)) and interaction_pause_rounds <= 0
         if can_interact and analysis_targets:
             viewport_top = scroll_y + int(viewport_height * 0.10)
             viewport_bottom = scroll_y + int(viewport_height * 0.90)
@@ -2036,6 +2046,8 @@ async def run_strict_top_to_bottom_pass(
                 visited_families.add(target_family)
                 hovered_count += 1
                 interacted_this_round = True
+                no_progress_rounds = 0
+                last_progress_at = time.monotonic()
                 recent_interactions.append((tx, ty, target_abs_y, round_index))
                 if len(recent_interactions) > 20:
                     recent_interactions.pop(0)
@@ -2196,6 +2208,24 @@ async def run_strict_top_to_bottom_pass(
                 at_bottom = False
             else:
                 raise
+
+        scroll_advanced = current_scroll_y > (last_scroll_y + 6)
+        if scroll_advanced:
+            no_progress_rounds = 0
+            last_progress_at = time.monotonic()
+        elif not interacted_this_round:
+            no_progress_rounds += 1
+
+        stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
+        if not at_bottom and (no_progress_rounds >= 6 or stall_elapsed_ms >= stall_timeout_ms):
+            logger.info(
+                "🧭 Smart cursor: anti-stall форсирует выход из локального залипания "
+                f"(rounds={no_progress_rounds}, elapsed={int(stall_elapsed_ms)}ms)"
+            )
+            await force_scroll_progress(page, viewport_height)
+            interaction_pause_rounds = max(interaction_pause_rounds, 2)
+            no_progress_rounds = 0
+            last_progress_at = time.monotonic()
 
         if round_index % 12 == 0:
             logger.info(
@@ -3012,9 +3042,10 @@ async def run_smart_cursor(
     hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.60), 0.15, 1.0)
     click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.46), 0.10, 1.0)
     min_visibility_clarity = clamp(env_float("SMART_CURSOR_MIN_VISIBILITY_CLARITY", 0.42), 0.10, 1.0)
-    click_sequence_max_steps = max(1, min(env_int("SMART_CURSOR_CLICK_SEQUENCE_MAX_STEPS", 3), 4))
+    click_sequence_max_steps = max(1, min(env_int("SMART_CURSOR_CLICK_SEQUENCE_MAX_STEPS", 2), 4))
     click_sequence_radius_factor = clamp(env_float("SMART_CURSOR_CLICK_SEQUENCE_RADIUS_FACTOR", 0.30), 0.12, 0.55)
     strict_interactions_per_scroll = max(1, min(env_int("SMART_CURSOR_STRICT_INTERACTIONS_PER_SCROLL", 2), 4))
+    strict_stall_timeout_ms = max(3500, min(env_int("SMART_CURSOR_STRICT_STALL_TIMEOUT_MS", 10000), 90000))
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
@@ -3025,7 +3056,8 @@ async def run_smart_cursor(
         "🧭 Smart cursor visibility config: "
         f"hover_ratio={hover_visible_ratio:.2f}, click_ratio={click_visible_ratio:.2f}, "
         f"clarity={min_visibility_clarity:.2f}, click_chain_steps={click_sequence_max_steps}, "
-        f"strict_interactions_per_scroll={strict_interactions_per_scroll}"
+        f"strict_interactions_per_scroll={strict_interactions_per_scroll}, "
+        f"strict_stall_timeout_ms={strict_stall_timeout_ms}"
     )
 
     # ════════════════════════════════════════════════════════════════
@@ -3057,54 +3089,22 @@ async def run_smart_cursor(
             logger.info("🧭 Smart cursor: включен ALWAYS_DESCEND, принудительно используем STRICT проход")
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
 
-        strict_budget_ms = max(8000, int(total_time_ms))
-        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 and strict_budget_ms > 14000:
-            logger.info("🧭 Smart cursor: STRICT prepass — последовательный обход верхних вкладок")
-            nav_phase_budget_ms = min(
-                max(7000, int(strict_budget_ms * 0.32)),
-                max(7000, nav_tabs_max_visits * max(1800, int(nav_tab_scroll_timeout_ms * 0.55))),
+        strict_total_budget_ms = max(8000, int(total_time_ms))
+        reserve_for_nav_ms = 0
+        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 and strict_total_budget_ms > 14000:
+            reserve_for_nav_ms = min(
+                max(6000, int(strict_total_budget_ms * 0.24)),
+                max(6000, nav_tabs_max_visits * max(1600, int(nav_tab_scroll_timeout_ms * 0.40))),
             )
-            nav_phase_started = time.monotonic()
 
-            try:
-                await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
-                await page.wait_for_timeout(random.randint(220, 440))
-            except Exception:
-                pass
-
-            per_tab_budget_ms = max(
-                2200,
-                min(nav_tab_scroll_timeout_ms, int(nav_phase_budget_ms / max(1, nav_tabs_max_visits))),
-            )
-            try:
-                cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
-                    page=page,
-                    cursor_pos=cursor_pos,
-                    viewport_width=viewport_width,
-                    viewport_height=viewport_height,
-                    allow_internal_nav_click=allow_internal_nav_click,
-                    visited_nav_keys=clicked_nav_keys,
-                    max_nav_tabs_to_visit=nav_tabs_max_visits,
-                    per_tab_scroll_timeout_ms=per_tab_budget_ms,
-                    scroll_speed_factor=scroll_speed_factor,
-                    scroll_pause_min_ms=scroll_pause_min_ms,
-                    scroll_pause_max_ms=scroll_pause_max_ms,
-                )
-                if visited_nav_count > 0:
-                    logger.info(f"🧭 Smart cursor: STRICT prepass — пройдено вкладок {visited_nav_count}")
-            except Exception as nav_err:
-                logger.warning(f"⚠️ Smart cursor: ошибка STRICT prepass вкладок: {nav_err}")
-                await _recover_after_nav(page)
-
-            nav_elapsed_ms = int((time.monotonic() - nav_phase_started) * 1000)
-            strict_budget_ms = max(8000, strict_budget_ms - nav_elapsed_ms)
+        strict_main_budget_ms = max(8000, strict_total_budget_ms - reserve_for_nav_ms)
 
         cursor_pos, strict_hovered, reached_bottom = await run_strict_top_to_bottom_pass(
             page=page,
             cursor_pos=cursor_pos,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
-            total_time_ms=strict_budget_ms,
+            total_time_ms=strict_main_budget_ms,
             max_targets=max_targets,
             hover_min_ms=hover_min_ms,
             hover_max_ms=hover_max_ms,
@@ -3116,7 +3116,7 @@ async def run_smart_cursor(
             inpage_click_probability=inpage_click_probability,
             scroll_finish_timeout_ms=scroll_finish_timeout_ms,
             require_bottom=(smart_cursor_require_bottom or always_descend),
-            require_bottom_max_ms=min(smart_cursor_require_bottom_max_ms, strict_budget_ms),
+            require_bottom_max_ms=min(smart_cursor_require_bottom_max_ms, strict_main_budget_ms),
             strict_allow_clicks=strict_top_to_bottom_allow_clicks,
             bottom_debug=bottom_debug,
             hover_visible_ratio=hover_visible_ratio,
@@ -3126,12 +3126,55 @@ async def run_smart_cursor(
             click_sequence_radius_factor=click_sequence_radius_factor,
             allow_internal_nav_click=allow_internal_nav_click,
             strict_interactions_per_scroll=strict_interactions_per_scroll,
+            stall_timeout_ms=strict_stall_timeout_ms,
         )
         hovered_count += strict_hovered
         if reached_bottom:
             logger.info("🧭 Smart cursor: STRICT проход завершен, страница просмотрена до конца")
         else:
             logger.warning("⚠️ Smart cursor: STRICT проход завершился по hard-timeout до достижения конца страницы")
+
+        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0:
+            if reached_bottom:
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
+                nav_budget_ms = max(0, min(max(reserve_for_nav_ms, 0), remaining_ms))
+                if nav_budget_ms >= 4500:
+                    logger.info("🧭 Smart cursor: STRICT postpass — обход вкладок после полного прохода главной")
+                    try:
+                        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+                        await page.wait_for_timeout(random.randint(200, 420))
+                    except Exception:
+                        pass
+
+                    per_tab_budget_ms = max(
+                        1700,
+                        min(nav_tab_scroll_timeout_ms, int(nav_budget_ms / max(1, nav_tabs_max_visits))),
+                    )
+                    try:
+                        cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
+                            page=page,
+                            cursor_pos=cursor_pos,
+                            viewport_width=viewport_width,
+                            viewport_height=viewport_height,
+                            allow_internal_nav_click=allow_internal_nav_click,
+                            visited_nav_keys=clicked_nav_keys,
+                            max_nav_tabs_to_visit=nav_tabs_max_visits,
+                            per_tab_scroll_timeout_ms=per_tab_budget_ms,
+                            scroll_speed_factor=scroll_speed_factor,
+                            scroll_pause_min_ms=scroll_pause_min_ms,
+                            scroll_pause_max_ms=scroll_pause_max_ms,
+                        )
+                        if visited_nav_count > 0:
+                            logger.info(f"🧭 Smart cursor: STRICT postpass — пройдено вкладок {visited_nav_count}")
+                    except Exception as nav_err:
+                        logger.warning(f"⚠️ Smart cursor: ошибка STRICT postpass вкладок: {nav_err}")
+                        await _recover_after_nav(page)
+                else:
+                    logger.warning("⚠️ Smart cursor: не осталось бюджета для обхода вкладок после главной")
+            else:
+                logger.warning("⚠️ Smart cursor: обход вкладок пропущен, т.к. главная не пройдена до конца")
+
         logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
         return hovered_count
 
