@@ -2762,8 +2762,17 @@ async def run_strict_top_to_bottom_pass(
             bottom_stable_rounds = 0
 
         if bottom_stable_rounds >= bottom_stable_rounds_required:
-            reached_bottom = True
-            break
+            elapsed_at_bottom_ms = (time.monotonic() - started_at) * 1000
+            if elapsed_at_bottom_ms >= min_duration_ms:
+                reached_bottom = True
+                break
+            else:
+                # Ещё рано завершать — сбрасываем счётчик и продолжаем взаимодействие.
+                logger.info(
+                    f"🧭 Smart cursor: дно достигнуто, но прошло только {int(elapsed_at_bottom_ms)}ms"
+                    f" из минимальных {int(min_duration_ms)}ms — продолжаем"
+                )
+                bottom_stable_rounds = 0
 
     if require_bottom and not reached_bottom:
         elapsed_ms = (time.monotonic() - started_at) * 1000
