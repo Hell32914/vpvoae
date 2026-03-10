@@ -26,6 +26,29 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value.strip())
+    except Exception:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value.strip())
+    except Exception:
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
 def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
 
@@ -200,14 +223,46 @@ async def collect_interactive_targets(
                     continue;
                 }
 
+                const visibleLeft = Math.max(0, rect.left);
+                const visibleTop = Math.max(0, rect.top);
+                const visibleRight = Math.min(viewportWidth, rect.right);
+                const visibleBottom = Math.min(viewportHeight, rect.bottom);
+                const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+                const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+                const visibleArea = visibleWidth * visibleHeight;
+                const totalArea = Math.max(1, rect.width * rect.height);
+                const visibleRatio = visibleArea / totalArea;
+                if (visibleRatio < 0.16) continue;
+
                 const cx = rect.left + rect.width / 2;
                 const cy = rect.top + rect.height / 2;
                 if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
 
-                const topNode = document.elementFromPoint(cx, cy);
-                if (topNode && topNode instanceof Element && !el.contains(topNode) && !topNode.contains(el)) {
-                    continue;
+                const samplePoints = [
+                    [cx, cy],
+                    [rect.left + rect.width * 0.28, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.72, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.5, rect.top + rect.height * 0.3],
+                    [rect.left + rect.width * 0.5, rect.top + rect.height * 0.7],
+                ];
+
+                let sampleCount = 0;
+                let clearCount = 0;
+                for (const [px, py] of samplePoints) {
+                    if (px < 0 || py < 0 || px > viewportWidth || py > viewportHeight) continue;
+                    sampleCount += 1;
+                    const topNode = document.elementFromPoint(px, py);
+                    if (
+                        topNode
+                        && topNode instanceof Element
+                        && (el === topNode || el.contains(topNode) || topNode.contains(el))
+                    ) {
+                        clearCount += 1;
+                    }
                 }
+
+                const visibilityClarity = sampleCount > 0 ? (clearCount / sampleCount) : 0;
+                if (visibilityClarity < 0.34) continue;
 
                 const area = Math.min(rect.width * rect.height, 12000);
                 const distFromCenter = Math.hypot(cx - viewportWidth / 2, cy - viewportHeight / 2);
@@ -235,6 +290,8 @@ async def collect_interactive_targets(
                     href,
                     tag: el.tagName.toLowerCase(),
                     isSurfaceHover: surfaceHover,
+                    visibleRatio,
+                    visibilityClarity,
                 });
             }
 
@@ -683,6 +740,67 @@ def has_keyword(value: str, keywords: Tuple[str, ...]) -> bool:
     return any(word in low for word in keywords)
 
 
+def _to_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def target_visible_ratio(target: Dict[str, Any], fallback: float = 1.0) -> float:
+    raw = _to_float(target.get("visibleRatio"), -1.0)
+    if raw < 0.0:
+        return clamp(fallback, 0.0, 1.0)
+    return clamp(raw, 0.0, 1.0)
+
+
+def target_visibility_clarity(target: Dict[str, Any], fallback: float = 1.0) -> float:
+    raw = _to_float(target.get("visibilityClarity"), -1.0)
+    if raw < 0.0:
+        return clamp(fallback, 0.0, 1.0)
+    return clamp(raw, 0.0, 1.0)
+
+
+def is_target_clearly_visible(
+    target: Dict[str, Any],
+    viewport_width: int,
+    viewport_height: int,
+    min_visible_ratio: float,
+    min_visibility_clarity: float,
+    resolved_y: Optional[float] = None,
+    edge_margin_x_factor: float = 0.03,
+    edge_margin_y_factor: float = 0.05,
+) -> bool:
+    x = _to_float(target.get("x"), viewport_width * 0.5)
+    y = resolved_y if resolved_y is not None else _to_float(target.get("y"), viewport_height * 0.5)
+    width = _to_float(target.get("width"), 0.0)
+    height = _to_float(target.get("height"), 0.0)
+
+    if width < 10.0 or height < 10.0:
+        return False
+
+    edge_margin_x = max(6.0, viewport_width * max(0.0, edge_margin_x_factor))
+    edge_margin_y = max(6.0, viewport_height * max(0.0, edge_margin_y_factor))
+    if x < edge_margin_x or x > (viewport_width - edge_margin_x):
+        return False
+    if y < edge_margin_y or y > (viewport_height - edge_margin_y):
+        return False
+
+    fallback_visibility = 1.0 if (0.0 <= x <= viewport_width and 0.0 <= y <= viewport_height) else 0.0
+    visible_ratio = target_visible_ratio(target, fallback=fallback_visibility)
+    visibility_clarity = target_visibility_clarity(target, fallback=fallback_visibility)
+
+    if visible_ratio < clamp(min_visible_ratio, 0.0, 1.0):
+        return False
+    if visibility_clarity < clamp(min_visibility_clarity, 0.0, 1.0):
+        return False
+
+    return True
+
+
 def is_navigation_like_href(href: str, current_url: str) -> bool:
     clean = href.strip().lower()
     if not clean or clean.startswith("#") or clean.startswith("javascript:"):
@@ -804,11 +922,16 @@ def is_probable_top_nav_target(target: Dict[str, Any], viewport_height: int) -> 
     text = str(target.get("text", "")).strip().lower()
     href = str(target.get("href", "")).strip().lower()
     tag = str(target.get("tag", "")).strip().lower()
+    visible_ratio = target_visible_ratio(target, fallback=1.0)
+    visibility_clarity = target_visibility_clarity(target, fallback=1.0)
 
     if y > viewport_height * 0.24:
         return False
 
     if width < 28 or width > 420 or height < 10 or height > 120:
+        return False
+
+    if visible_ratio < 0.42 or visibility_clarity < 0.42:
         return False
 
     if tag not in {"a", "button", "div", "span"}:
@@ -1018,6 +1141,164 @@ async def try_close_overlay(
             raise
 
     return cursor_pos, False
+
+
+async def perform_followup_click_sequence(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    anchor_x: float,
+    anchor_y: float,
+    anchor_key: str,
+    anchor_family: str,
+    viewport_width: int,
+    viewport_height: int,
+    clicked_keys: Set[str],
+    clicked_families: Set[str],
+    hover_min_ms: int,
+    hover_max_ms: int,
+    max_followup_steps: int,
+    radius_factor: float,
+    min_visible_ratio: float,
+    min_visibility_clarity: float,
+    allow_internal_nav_click: bool,
+    hover_click_words: Tuple[str, ...],
+    widget_action_words: Tuple[str, ...],
+    visited_keys: Optional[Set[str]] = None,
+    visited_families: Optional[Set[str]] = None,
+    recent_interactions: Optional[List[Tuple[float, float, float, int]]] = None,
+    round_index: int = 0,
+    scroll_y: float = 0.0,
+) -> Tuple[Tuple[float, float], int]:
+    """Пробует цепочку соседних кликов для локальных step-by-step интерактивов."""
+    if max_followup_steps <= 0:
+        return cursor_pos, 0
+
+    performed = 0
+    current_x = float(anchor_x)
+    current_y = float(anchor_y)
+    current_key = str(anchor_key)
+    current_family = str(anchor_family)
+
+    for step_index in range(max_followup_steps):
+        wait_min = max(90, int(hover_min_ms * 0.40))
+        wait_max = max(wait_min + 30, int(hover_max_ms * 0.70))
+        try:
+            await page.wait_for_timeout(random.randint(wait_min, wait_max))
+            nearby_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 44)
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+            break
+
+        radius_limit = max(
+            120.0,
+            min(viewport_width, viewport_height) * (radius_factor + step_index * 0.05),
+        )
+        radius_limit = min(radius_limit, max(viewport_width, viewport_height) * 0.58)
+
+        ranked: List[Tuple[Tuple[int, int, float, float], Dict[str, Any]]] = []
+        current_url = str(page.url or "")
+
+        for item in nearby_targets:
+            item_key = str(item.get("key", ""))
+            if not item_key or item_key in clicked_keys or item_key == current_key:
+                continue
+
+            item_family = strict_target_family_key(item)
+            if item_family in clicked_families or item_family == current_family:
+                continue
+
+            if not is_safe_inpage_click_target(item, current_url, allow_internal_nav_click):
+                continue
+
+            ix = clamp(_to_float(item.get("x"), current_x), 2, viewport_width - 2)
+            iy = clamp(_to_float(item.get("y"), current_y), 2, viewport_height - 2)
+            if not is_target_clearly_visible(
+                item,
+                viewport_width,
+                viewport_height,
+                min_visible_ratio=min_visible_ratio,
+                min_visibility_clarity=min_visibility_clarity,
+                resolved_y=iy,
+            ):
+                continue
+
+            dist = math.hypot(ix - current_x, iy - current_y)
+            if dist > radius_limit:
+                continue
+
+            text_low = str(item.get("text", "")).strip().lower()
+            hint = has_keyword(text_low, hover_click_words) or has_keyword(text_low, widget_action_words)
+            compact = (_to_float(item.get("width"), 0.0) * _to_float(item.get("height"), 0.0)) <= 32000
+            hover_like = bool(item.get("isHoverText", False)) or bool(item.get("isSurfaceHover", False))
+
+            rank_tuple = (
+                0 if hint else 1,
+                0 if compact else 1,
+                dist,
+                -target_sort_score(item) - (12.0 if hover_like else 0.0),
+            )
+            ranked.append((rank_tuple, item))
+
+        if not ranked:
+            break
+
+        ranked.sort(key=lambda entry: entry[0])
+        follow_target = ranked[0][1]
+        follow_key = str(follow_target.get("key", ""))
+        follow_family = strict_target_family_key(follow_target)
+        follow_x = clamp(_to_float(follow_target.get("x"), current_x), 2, viewport_width - 2)
+        follow_y = clamp(_to_float(follow_target.get("y"), current_y), 2, viewport_height - 2)
+
+        try:
+            cursor_pos = await move_mouse_human_like(
+                page=page,
+                start=cursor_pos,
+                end=(follow_x, follow_y),
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+                duration_ms=random.randint(150, 420),
+            )
+            await page.wait_for_timeout(random.randint(wait_min, wait_max))
+            before_url = str(page.url or "")
+            await page.mouse.click(follow_x, follow_y, delay=random.randint(30, 95))
+            await page.wait_for_timeout(random.randint(130, 320))
+            after_url = str(page.url or "")
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                break
+            continue
+
+        clicked_keys.add(follow_key)
+        clicked_families.add(follow_family)
+        if visited_keys is not None:
+            visited_keys.add(follow_key)
+        if visited_families is not None:
+            visited_families.add(follow_family)
+
+        if recent_interactions is not None:
+            recent_interactions.append((follow_x, follow_y, float(scroll_y + follow_y), round_index))
+            if len(recent_interactions) > 20:
+                recent_interactions.pop(0)
+
+        performed += 1
+
+        if after_url != before_url and not allow_internal_nav_click:
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=5000)
+                await page.wait_for_timeout(random.randint(240, 500))
+            except Exception:
+                pass
+            await _recover_after_nav(page)
+            break
+
+        current_x = follow_x
+        current_y = follow_y
+        current_key = follow_key
+        current_family = follow_family
+
+    return cursor_pos, performed
 
 
 async def perform_smooth_scroll(
@@ -1333,6 +1614,41 @@ async def collect_document_interaction_targets(
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 10 || rect.height < 10) continue;
 
+                const visibleLeft = Math.max(0, rect.left);
+                const visibleTop = Math.max(0, rect.top);
+                const visibleRight = Math.min(viewportWidth, rect.right);
+                const visibleBottom = Math.min(viewportHeight, rect.bottom);
+                const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+                const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+                const visibleArea = visibleWidth * visibleHeight;
+                const totalArea = Math.max(1, rect.width * rect.height);
+                const visibleRatio = visibleArea / totalArea;
+                if (visibleRatio < 0.12) continue;
+
+                const samplePoints = [
+                    [rect.left + rect.width * 0.5, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.25, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.75, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.5, rect.top + rect.height * 0.28],
+                    [rect.left + rect.width * 0.5, rect.top + rect.height * 0.72],
+                ];
+                let sampleCount = 0;
+                let clearCount = 0;
+                for (const [px, py] of samplePoints) {
+                    if (px < 0 || py < 0 || px > viewportWidth || py > viewportHeight) continue;
+                    sampleCount += 1;
+                    const topNode = document.elementFromPoint(px, py);
+                    if (
+                        topNode
+                        && topNode instanceof Element
+                        && (el === topNode || el.contains(topNode) || topNode.contains(el))
+                    ) {
+                        clearCount += 1;
+                    }
+                }
+                const visibilityClarity = sampleCount > 0 ? (clearCount / sampleCount) : 0;
+                if (visibilityClarity < 0.30) continue;
+
                 const absX = rect.left + (window.scrollX || 0) + rect.width / 2;
                 const absY = rect.top + (window.scrollY || 0) + rect.height / 2;
                 if (!Number.isFinite(absX) || !Number.isFinite(absY)) continue;
@@ -1369,6 +1685,8 @@ async def collect_document_interaction_targets(
                     tag,
                     isHoverText: hoverText,
                     isSurfaceHover: surfaceHover,
+                    visibleRatio,
+                    visibilityClarity,
                 });
             }
 
@@ -1404,6 +1722,12 @@ async def run_strict_top_to_bottom_pass(
     require_bottom_max_ms: int,
     strict_allow_clicks: bool,
     bottom_debug: bool,
+    hover_visible_ratio: float,
+    click_visible_ratio: float,
+    min_visibility_clarity: float,
+    click_sequence_max_steps: int,
+    click_sequence_radius_factor: float,
+    allow_internal_nav_click: bool,
 ) -> Tuple[Tuple[float, float], int, bool]:
     """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
@@ -1494,8 +1818,8 @@ async def run_strict_top_to_bottom_pass(
 
         can_interact = (max_targets <= 0) or (hovered_count < max_targets)
         if can_interact and analysis_targets:
-            viewport_top = scroll_y + int(viewport_height * 0.16)
-            viewport_bottom = scroll_y + int(viewport_height * 0.86)
+            viewport_top = scroll_y + int(viewport_height * 0.10)
+            viewport_bottom = scroll_y + int(viewport_height * 0.90)
             current_url = str(page.url or "")
 
             candidates: List[Dict[str, Any]] = []
@@ -1516,6 +1840,15 @@ async def run_strict_top_to_bottom_pass(
 
                 item_x = float(item.get("x", viewport_width * 0.5))
                 item_view_y = clamp(item_abs_y - scroll_y, 2, viewport_height - 2)
+                if not is_target_clearly_visible(
+                    item,
+                    viewport_width,
+                    viewport_height,
+                    min_visible_ratio=hover_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    resolved_y=item_view_y,
+                ):
+                    continue
                 recently_repeated = False
                 for px, py, p_abs_y, p_round in recent_interactions:
                     if round_index - p_round > 7:
@@ -1539,6 +1872,7 @@ async def run_strict_top_to_bottom_pass(
                     width = float(item.get("width", 0.0))
                     height = float(item.get("height", 0.0))
                     area = width * height
+                    item_view_y = clamp(float(item.get("absY", scroll_y + viewport_height * 0.5)) - scroll_y, 2, viewport_height - 2)
 
                     action_hint = has_keyword(txt, hover_click_words) or has_keyword(txt, widget_action_words)
                     button_like = tag in {"button", "summary"}
@@ -1551,7 +1885,18 @@ async def run_strict_top_to_bottom_pass(
                         or (no_nav_href and compact and txt and len(txt) <= 24)
                     )
 
-                    if looks_clickable_trigger and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click=False):
+                    if (
+                        looks_clickable_trigger
+                        and is_safe_inpage_click_target(item, current_url, allow_internal_nav_click=allow_internal_nav_click)
+                        and is_target_clearly_visible(
+                            item,
+                            viewport_width,
+                            viewport_height,
+                            min_visible_ratio=click_visible_ratio,
+                            min_visibility_clarity=min_visibility_clarity,
+                            resolved_y=item_view_y,
+                        )
+                    ):
                         priority_click_candidates.append(item)
 
                 hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
@@ -1670,7 +2015,15 @@ async def run_strict_top_to_bottom_pass(
                     inpage_click_enabled
                     and target_key not in clicked_keys
                     and target_family not in clicked_families
-                    and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=False)
+                    and is_safe_inpage_click_target(target, str(page.url or ""), allow_internal_nav_click=allow_internal_nav_click)
+                    and is_target_clearly_visible(
+                        target,
+                        viewport_width,
+                        viewport_height,
+                        min_visible_ratio=click_visible_ratio,
+                        min_visibility_clarity=min_visibility_clarity,
+                        resolved_y=ty,
+                    )
                     and (strict_allow_clicks or action_hint or is_local_trigger)
                 )
 
@@ -1685,6 +2038,10 @@ async def run_strict_top_to_bottom_pass(
                     click_probability = max(click_probability, 0.88)
                 if is_surface_hover and not action_hint:
                     click_probability = min(click_probability, 0.32)
+                if is_surface_hover and is_local_trigger:
+                    click_probability = max(click_probability, 0.58)
+                if is_hover_text and is_local_trigger:
+                    click_probability = max(click_probability, 0.94)
                 if target_tag in {"button", "summary"} and not target_href:
                     click_probability = max(click_probability, 0.92)
 
@@ -1718,78 +2075,39 @@ async def run_strict_top_to_bottom_pass(
                         except Exception:
                             pass
 
-                    # Универсальный follow-up: если первый клик открыл локальный интерактив рядом,
-                    # пробуем второй клик по ближайшему безопасному элементу.
-                    if action_hint or is_local_trigger:
-                        try:
-                            await page.wait_for_timeout(random.randint(170, 420))
-                            nearby_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 28)
-                        except Exception as exc:
-                            if _is_nav_error(exc):
-                                await _recover_after_nav(page)
-                                nearby_targets = []
-                            else:
-                                nearby_targets = []
-
-                        nearby_candidates: List[Tuple[Dict[str, Any], float]] = []
-                        radius_limit = max(180.0, min(viewport_width, viewport_height) * 0.28)
-                        for item in nearby_targets:
-                            item_key = str(item.get("key", ""))
-                            item_family = strict_target_family_key(item)
-                            if (
-                                not item_key
-                                or item_key in clicked_keys
-                                or item_key == target_key
-                                or item_family in clicked_families
-                                or item_family == target_family
-                            ):
-                                continue
-                            if not is_safe_inpage_click_target(item, str(page.url or ""), allow_internal_nav_click=False):
-                                continue
-
-                            ix = float(item.get("x", tx))
-                            iy = float(item.get("y", ty))
-                            dist = math.hypot(ix - tx, iy - ty)
-                            if dist > radius_limit:
-                                continue
-                            nearby_candidates.append((item, dist))
-
-                        if nearby_candidates:
-                            def _nearby_rank(entry: Tuple[Dict[str, Any], float]) -> Tuple[int, float, float]:
-                                item, dist = entry
-                                txt = str(item.get("text", ""))
-                                hint = has_keyword(txt, hover_click_words) or has_keyword(txt, widget_action_words)
-                                return (0 if hint else 1, dist, -target_sort_score(item))
-
-                            nearby_candidates.sort(key=_nearby_rank)
-                            follow_target = nearby_candidates[0][0]
-                            fk = str(follow_target.get("key", ""))
-                            ftx = clamp(float(follow_target.get("x", tx)), 2, viewport_width - 2)
-                            fty = clamp(float(follow_target.get("y", ty)), 2, viewport_height - 2)
-
-                            try:
-                                cursor_pos = await move_mouse_human_like(
-                                    page=page,
-                                    start=cursor_pos,
-                                    end=(ftx, fty),
-                                    viewport_width=viewport_width,
-                                    viewport_height=viewport_height,
-                                    duration_ms=random.randint(150, 420),
-                                )
-                                await page.wait_for_timeout(random.randint(max(120, micro_hover_min), max(220, micro_hover_max)))
-                                await page.mouse.click(ftx, fty, delay=random.randint(30, 95))
-                                await page.wait_for_timeout(random.randint(140, 320))
-                                clicked_keys.add(fk)
-                                clicked_families.add(strict_target_family_key(follow_target))
-                                visited_keys.add(fk)
-                                visited_families.add(strict_target_family_key(follow_target))
-                                recent_interactions.append((ftx, fty, float(scroll_y + fty), round_index))
-                                if len(recent_interactions) > 20:
-                                    recent_interactions.pop(0)
-                                logger.info("🖱️ Smart cursor: выполнен follow-up клик по соседней hover-цели")
-                            except Exception as exc:
-                                if _is_nav_error(exc):
-                                    await _recover_after_nav(page)
+                    followup_steps = max(0, click_sequence_max_steps - 1)
+                    if followup_steps > 0 and (action_hint or is_local_trigger):
+                        cursor_pos, followup_count = await perform_followup_click_sequence(
+                            page=page,
+                            cursor_pos=cursor_pos,
+                            anchor_x=tx,
+                            anchor_y=ty,
+                            anchor_key=target_key,
+                            anchor_family=target_family,
+                            viewport_width=viewport_width,
+                            viewport_height=viewport_height,
+                            clicked_keys=clicked_keys,
+                            clicked_families=clicked_families,
+                            hover_min_ms=hover_min_ms,
+                            hover_max_ms=hover_max_ms,
+                            max_followup_steps=followup_steps,
+                            radius_factor=click_sequence_radius_factor,
+                            min_visible_ratio=click_visible_ratio,
+                            min_visibility_clarity=min_visibility_clarity,
+                            allow_internal_nav_click=allow_internal_nav_click,
+                            hover_click_words=hover_click_words,
+                            widget_action_words=widget_action_words,
+                            visited_keys=visited_keys,
+                            visited_families=visited_families,
+                            recent_interactions=recent_interactions,
+                            round_index=round_index,
+                            scroll_y=float(scroll_y),
+                        )
+                        if followup_count > 0:
+                            logger.info(
+                                "🖱️ Smart cursor: выполнена цепочка локальных кликов "
+                                f"(дополнительных шагов={followup_count})"
+                            )
 
         if round_index % 4 == 0:
             try:
@@ -2061,10 +2379,44 @@ async def collect_header_nav_targets(
             for (const el of pool) {
                 if (!isVisible(el)) continue;
                 const rect = el.getBoundingClientRect();
+
+                const visibleLeft = Math.max(0, rect.left);
+                const visibleTop = Math.max(0, rect.top);
+                const visibleRight = Math.min(viewportWidth, rect.right);
+                const visibleBottom = Math.min(viewportHeight, rect.bottom);
+                const visibleWidth = Math.max(0, visibleRight - visibleLeft);
+                const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+                const visibleArea = visibleWidth * visibleHeight;
+                const totalArea = Math.max(1, rect.width * rect.height);
+                const visibleRatio = visibleArea / totalArea;
+                if (visibleRatio < 0.30) continue;
+
                 const cx = rect.left + rect.width / 2;
                 const cy = rect.top + rect.height / 2;
                 if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
                 if (cy > viewportHeight * 0.34 || cx < 0 || cx > viewportWidth) continue;
+
+                const samplePoints = [
+                    [cx, cy],
+                    [rect.left + rect.width * 0.24, rect.top + rect.height * 0.5],
+                    [rect.left + rect.width * 0.76, rect.top + rect.height * 0.5],
+                ];
+                let sampleCount = 0;
+                let clearCount = 0;
+                for (const [px, py] of samplePoints) {
+                    if (px < 0 || py < 0 || px > viewportWidth || py > viewportHeight) continue;
+                    sampleCount += 1;
+                    const topNode = document.elementFromPoint(px, py);
+                    if (
+                        topNode
+                        && topNode instanceof Element
+                        && (el === topNode || el.contains(topNode) || topNode.contains(el))
+                    ) {
+                        clearCount += 1;
+                    }
+                }
+                const visibilityClarity = sampleCount > 0 ? (clearCount / sampleCount) : 0;
+                if (visibilityClarity < 0.45) continue;
 
                 const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 64);
                 const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
@@ -2089,6 +2441,8 @@ async def collect_header_nav_targets(
                     href,
                     tag,
                     key: `${tag}|${text.slice(0, 28)}|${href.slice(0, 36)}|${Math.round(cx)}:${Math.round(cy)}`,
+                    visibleRatio,
+                    visibilityClarity,
                 });
             }
 
@@ -2210,7 +2564,7 @@ async def visit_top_navigation_tabs(
 
     original_url = str(page.url or "")
 
-    for tab_iter in range(max_nav_tabs_to_visit):
+    for _ in range(max_nav_tabs_to_visit):
         # ── Вся итерация обёрнута для отказоустойчивости ──
         try:
             nav_targets = await collect_top_nav_targets(
@@ -2582,15 +2936,27 @@ async def run_smart_cursor(
     visited_keys: Set[str] = set()
     clicked_entry_keys: Set[str] = set()
     clicked_inpage_keys: Set[str] = set()
+    clicked_inpage_families: Set[str] = set()
     hovered_count = 0
     recent_points: List[Tuple[float, float]] = []
     clicked_nav_keys: Set[str] = set()
+
+    hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.68), 0.15, 1.0)
+    click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.54), 0.10, 1.0)
+    min_visibility_clarity = clamp(env_float("SMART_CURSOR_MIN_VISIBILITY_CLARITY", 0.50), 0.10, 1.0)
+    click_sequence_max_steps = max(1, min(env_int("SMART_CURSOR_CLICK_SEQUENCE_MAX_STEPS", 2), 4))
+    click_sequence_radius_factor = clamp(env_float("SMART_CURSOR_CLICK_SEQUENCE_RADIUS_FACTOR", 0.30), 0.12, 0.55)
 
     cursor_pos: Tuple[float, float] = (
         viewport_width * random.uniform(0.35, 0.65),
         viewport_height * random.uniform(0.35, 0.65),
     )
     await page.mouse.move(cursor_pos[0], cursor_pos[1])
+    logger.info(
+        "🧭 Smart cursor visibility config: "
+        f"hover_ratio={hover_visible_ratio:.2f}, click_ratio={click_visible_ratio:.2f}, "
+        f"clarity={min_visibility_clarity:.2f}, click_chain_steps={click_sequence_max_steps}"
+    )
 
     # ════════════════════════════════════════════════════════════════
     # ФАЗА 0: Клик по входным элементам (cookie, enter, welcome gate)
@@ -2620,12 +2986,55 @@ async def run_smart_cursor(
         if always_descend and not strict_top_to_bottom_mode:
             logger.info("🧭 Smart cursor: включен ALWAYS_DESCEND, принудительно используем STRICT проход")
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
+
+        strict_budget_ms = max(8000, int(total_time_ms))
+        if nav_tabs_visit_enabled and nav_tabs_max_visits > 0 and strict_budget_ms > 14000:
+            logger.info("🧭 Smart cursor: STRICT prepass — последовательный обход верхних вкладок")
+            nav_phase_budget_ms = min(
+                max(7000, int(strict_budget_ms * 0.32)),
+                max(7000, nav_tabs_max_visits * max(1800, int(nav_tab_scroll_timeout_ms * 0.55))),
+            )
+            nav_phase_started = time.monotonic()
+
+            try:
+                await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+                await page.wait_for_timeout(random.randint(220, 440))
+            except Exception:
+                pass
+
+            per_tab_budget_ms = max(
+                2200,
+                min(nav_tab_scroll_timeout_ms, int(nav_phase_budget_ms / max(1, nav_tabs_max_visits))),
+            )
+            try:
+                cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
+                    page=page,
+                    cursor_pos=cursor_pos,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    allow_internal_nav_click=allow_internal_nav_click,
+                    visited_nav_keys=clicked_nav_keys,
+                    max_nav_tabs_to_visit=nav_tabs_max_visits,
+                    per_tab_scroll_timeout_ms=per_tab_budget_ms,
+                    scroll_speed_factor=scroll_speed_factor,
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                )
+                if visited_nav_count > 0:
+                    logger.info(f"🧭 Smart cursor: STRICT prepass — пройдено вкладок {visited_nav_count}")
+            except Exception as nav_err:
+                logger.warning(f"⚠️ Smart cursor: ошибка STRICT prepass вкладок: {nav_err}")
+                await _recover_after_nav(page)
+
+            nav_elapsed_ms = int((time.monotonic() - nav_phase_started) * 1000)
+            strict_budget_ms = max(8000, strict_budget_ms - nav_elapsed_ms)
+
         cursor_pos, strict_hovered, reached_bottom = await run_strict_top_to_bottom_pass(
             page=page,
             cursor_pos=cursor_pos,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
-            total_time_ms=total_time_ms,
+            total_time_ms=strict_budget_ms,
             max_targets=max_targets,
             hover_min_ms=hover_min_ms,
             hover_max_ms=hover_max_ms,
@@ -2637,9 +3046,15 @@ async def run_smart_cursor(
             inpage_click_probability=inpage_click_probability,
             scroll_finish_timeout_ms=scroll_finish_timeout_ms,
             require_bottom=(smart_cursor_require_bottom or always_descend),
-            require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
+            require_bottom_max_ms=min(smart_cursor_require_bottom_max_ms, strict_budget_ms),
             strict_allow_clicks=strict_top_to_bottom_allow_clicks,
             bottom_debug=bottom_debug,
+            hover_visible_ratio=hover_visible_ratio,
+            click_visible_ratio=click_visible_ratio,
+            min_visibility_clarity=min_visibility_clarity,
+            click_sequence_max_steps=click_sequence_max_steps,
+            click_sequence_radius_factor=click_sequence_radius_factor,
+            allow_internal_nav_click=allow_internal_nav_click,
         )
         hovered_count += strict_hovered
         if reached_bottom:
@@ -2698,6 +3113,14 @@ async def run_smart_cursor(
                 item for item in targets
                 if str(item.get("key", "")) not in visited_keys
                 and not is_probable_top_nav_target(item, viewport_height)
+                and is_target_clearly_visible(
+                    item,
+                    viewport_width,
+                    viewport_height,
+                    min_visible_ratio=hover_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    resolved_y=_to_float(item.get("y"), viewport_height * 0.5),
+                )
             ]
             if hover_candidates and random.random() < 0.55:
                 surface_candidates = [item for item in hover_candidates if bool(item.get("isSurfaceHover", False))]
@@ -2811,7 +3234,7 @@ async def run_smart_cursor(
     # ФАЗА 2: Обход вкладок навигации (только после полного скролла)
     # Для каждой вкладки: открыть → проскроллить до конца → вернуться
     # ════════════════════════════════════════════════════════════════
-    if nav_tabs_visit_enabled and inpage_click_enabled:
+    if nav_tabs_visit_enabled:
         remaining_ms = total_time_ms - (time.monotonic() - start_time) * 1000
         if remaining_ms > 8000:
             logger.info("🧭 Smart cursor: ФАЗА 2 — обход вкладок навигации")
@@ -2845,6 +3268,15 @@ async def run_smart_cursor(
             pass
 
         nav_keywords = ("list", "grid", "stills", "motion", "culture", "information", "journal")
+        hover_click_words = (
+            "click", "tap", "press", "here", "open", "show", "reveal",
+            "start", "play", "go", "next", "more", "toggle", "menu",
+            "try", "view", "explore", "activate", "continue", "enter",
+        )
+        widget_action_words = (
+            "accept", "reset", "submit", "next", "confirm", "apply",
+            "calculate", "done", "save", "select", "choose", "finish",
+        )
         phase3_start = time.monotonic()
         phase3_budget_ms = remaining_ms
         last_scroll_y = -1
@@ -2870,14 +3302,34 @@ async def run_smart_cursor(
             except Exception as exc:
                 if _is_nav_error(exc):
                     await _recover_after_nav(page)
-                targets = [] if not 'targets' in dir() else []
+                targets = []
 
-            candidates = [item for item in targets if str(item.get("key", "")) not in visited_keys]
+            candidates = [
+                item
+                for item in targets
+                if str(item.get("key", "")) not in visited_keys
+                and is_target_clearly_visible(
+                    item,
+                    viewport_width,
+                    viewport_height,
+                    min_visible_ratio=hover_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    resolved_y=_to_float(item.get("y"), viewport_height * 0.5),
+                )
+            ]
             current_url = str(page.url or "")
 
             safe_click_candidates = [
                 item for item in candidates
                 if is_safe_inpage_click_target(item, current_url, allow_internal_nav_click)
+                and is_target_clearly_visible(
+                    item,
+                    viewport_width,
+                    viewport_height,
+                    min_visible_ratio=click_visible_ratio,
+                    min_visibility_clarity=min_visibility_clarity,
+                    resolved_y=_to_float(item.get("y"), viewport_height * 0.5),
+                )
             ]
             media_candidates = [
                 item for item in safe_click_candidates
@@ -2961,10 +3413,35 @@ async def run_smart_cursor(
                     # Non-critical mouse error — continue
 
                 target_key = str(target.get("key", ""))
+                target_family = strict_target_family_key(target)
+                target_text = str(target.get("text", ""))
+                target_text_low = target_text.strip().lower()
+                target_href = str(target.get("href", "")).strip().lower()
+                target_tag = str(target.get("tag", "")).strip().lower()
+                is_hover_text = bool(target.get("isHoverText", False))
+
+                action_hint = has_keyword(target_text_low, hover_click_words) or has_keyword(target_text_low, widget_action_words)
+                is_local_trigger = (
+                    target_tag in {"button", "summary"}
+                    or (
+                        not target_href
+                        and (action_hint or (target_width * target_height <= 28000 and not is_surface_hover))
+                    )
+                )
+
                 should_click = (
                     inpage_click_enabled
                     and target_key not in clicked_inpage_keys
+                    and target_family not in clicked_inpage_families
                     and is_safe_inpage_click_target(target, current_url, allow_internal_nav_click)
+                    and is_target_clearly_visible(
+                        target,
+                        viewport_width,
+                        viewport_height,
+                        min_visible_ratio=click_visible_ratio,
+                        min_visibility_clarity=min_visibility_clarity,
+                        resolved_y=ty,
+                    )
                 )
 
                 click_probability = inpage_click_probability
@@ -2975,12 +3452,18 @@ async def run_smart_cursor(
                 if float(target.get("width", 0.0)) * float(target.get("height", 0.0)) >= 35000:
                     click_probability = min(max(click_probability, 0.22), 0.42)
 
-                widget_action_words = (
-                    "accept", "reset", "submit", "next", "confirm", "apply",
-                    "calculate", "done", "save", "select", "choose", "finish",
-                )
-                if has_keyword(str(target.get("text", "")), widget_action_words):
+                if has_keyword(target_text, widget_action_words):
                     click_probability = max(click_probability, 0.88)
+                if action_hint:
+                    click_probability = 1.0
+                if is_local_trigger:
+                    click_probability = max(click_probability, 0.84)
+                if is_hover_text and is_local_trigger:
+                    click_probability = max(click_probability, 0.94)
+                if is_surface_hover and is_local_trigger:
+                    click_probability = max(click_probability, 0.56)
+                if target_tag in {"button", "summary"} and not target_href:
+                    click_probability = max(click_probability, 0.90)
 
                 if should_click and random.random() < click_probability:
                     before_url = str(page.url or "")
@@ -2992,6 +3475,7 @@ async def run_smart_cursor(
                             await _recover_after_nav(page)
                             continue
                     clicked_inpage_keys.add(target_key)
+                    clicked_inpage_families.add(target_family)
 
                     if is_probable_top_nav_target(target, viewport_height):
                         clicked_nav_keys.add(nav_signature(target))
@@ -3011,6 +3495,36 @@ async def run_smart_cursor(
                             pass
                     elif after_url != before_url and allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: выполнен внутренний переход по интерактиву")
+                    else:
+                        followup_steps = max(0, click_sequence_max_steps - 1)
+                        if followup_steps > 0 and (action_hint or is_local_trigger or is_hover_text):
+                            cursor_pos, followup_count = await perform_followup_click_sequence(
+                                page=page,
+                                cursor_pos=cursor_pos,
+                                anchor_x=tx,
+                                anchor_y=ty,
+                                anchor_key=target_key,
+                                anchor_family=target_family,
+                                viewport_width=viewport_width,
+                                viewport_height=viewport_height,
+                                clicked_keys=clicked_inpage_keys,
+                                clicked_families=clicked_inpage_families,
+                                hover_min_ms=hover_min_ms,
+                                hover_max_ms=hover_max_ms,
+                                max_followup_steps=followup_steps,
+                                radius_factor=click_sequence_radius_factor,
+                                min_visible_ratio=click_visible_ratio,
+                                min_visibility_clarity=min_visibility_clarity,
+                                allow_internal_nav_click=allow_internal_nav_click,
+                                hover_click_words=hover_click_words,
+                                widget_action_words=widget_action_words,
+                                visited_keys=visited_keys,
+                            )
+                            if followup_count > 0:
+                                logger.info(
+                                    "🖱️ Smart cursor: phase-3 цепочка локальных кликов "
+                                    f"(дополнительных шагов={followup_count})"
+                                )
 
                 hovered_count += 1
                 visited_keys.add(target_key)
@@ -3053,7 +3567,7 @@ async def main():
         scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '24'))
         scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
         scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '45000'))
-        nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', False)
+        nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', True)
         nav_tabs_max_visits = int(os.getenv('SMART_CURSOR_NAV_TABS_MAX_VISITS', '10'))
         nav_tab_scroll_timeout_ms = int(os.getenv('SMART_CURSOR_NAV_TAB_SCROLL_TIMEOUT_MS', '17000'))
         inpage_click_enabled = env_bool('SMART_CURSOR_INPAGE_CLICK_ENABLED', True)
