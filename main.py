@@ -467,9 +467,11 @@ async def collect_activation_targets(
                 const centerDist = Math.hypot(cx - viewportWidth / 2, cy - viewportHeight / 2);
                 const centerScore = Math.max(0, 1 - centerDist / Math.hypot(viewportWidth / 2, viewportHeight / 2));
 
-                const idPart = el.id ? `#${el.id}` : '';
-                const classPart = (el.className || '').toString().replace(/\\s+/g, '.').slice(0, 40);
-                const key = `${el.tagName}${idPart}.${classPart}|${Math.round(cx)}:${Math.round(cy)}|${text.slice(0, 30)}`;
+                const textToken = text.toLowerCase().replace(/\\s+/g, ' ').slice(0, 30);
+                const hrefToken = href.toLowerCase().split('?')[0].slice(0, 40);
+                const xBucket = Math.round(cx / 110);
+                const yBucket = Math.round(cy / 110);
+                const key = `${el.tagName.toLowerCase()}|${textToken}|${hrefToken}|${xBucket}:${yBucket}`;
 
                 out.push({
                     key,
@@ -578,7 +580,9 @@ async def try_click_entry_element(
             continue
 
         text = str(candidate.get("text", "")).strip().lower()
+        text_compact = " ".join(text.split())
         href = str(candidate.get("href", "")).strip().lower()
+        has_entry_hint = has_keyword(text, entry_words) or has_keyword(href, entry_words)
 
         if has_keyword(text, purchase_words) or has_keyword(href, purchase_words):
             continue
@@ -587,22 +591,30 @@ async def try_click_entry_element(
             # По требованию: не кликаем элементы, уводящие на другую страницу.
             continue
 
-        # Без явных признаков входа не кликаем "случайные" ссылки.
-        if href and not has_keyword(text, entry_words) and not has_keyword(href, entry_words):
-            candidate_score = float(candidate.get("score", 0.0))
-            width = float(candidate.get("width", 0.0))
-            height = float(candidate.get("height", 0.0))
-            x = float(candidate.get("x", 0.0))
-            y = float(candidate.get("y", 0.0))
-            center_dist = math.hypot(x - viewport_width / 2, y - viewport_height / 2)
+        candidate_score = float(candidate.get("score", 0.0))
+        width = float(candidate.get("width", 0.0))
+        height = float(candidate.get("height", 0.0))
+        area = width * height
+        x = float(candidate.get("x", 0.0))
+        y = float(candidate.get("y", 0.0))
+        z_index = float(candidate.get("zIndex", 0.0))
+        center_dist = math.hypot(x - viewport_width / 2, y - viewport_height / 2)
 
-            # Разрешаем клик по нестандартным контролам без текста,
-            # если они визуально похожи на центральный activation-trigger.
+        # Без явных признаков входа не кликаем контентные карточки/превью.
+        if not has_entry_hint:
+            short_text = len(text_compact) <= 20
+            tiny_copy = len(text_compact.split()) <= 4
+            centered_gate = center_dist <= math.hypot(viewport_width, viewport_height) * 0.24
+            overlay_like = z_index >= 12
+            compact_gate = area <= 18000 and width <= 220 and height <= 140
+            if href:
+                continue
             if not (
-                candidate_score >= 85
-                and width >= 18
-                and height >= 18
-                and center_dist <= math.hypot(viewport_width, viewport_height) * 0.35
+                candidate_score >= 110
+                and short_text
+                and tiny_copy
+                and centered_gate
+                and (overlay_like or compact_gate or not text_compact)
             ):
                 continue
 
@@ -620,6 +632,14 @@ async def try_click_entry_element(
     tx = float(best["x"])
     ty = float(best["y"])
     text_hint = str(best.get("text", "")).strip()
+
+    try:
+        before_state = await get_page_activity_snapshot(page)
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+            return cursor_pos, False, None
+        raise
 
     logger.info(f"🖱️ Smart cursor: клик по входному элементу '{text_hint[:30]}'")
 
@@ -641,23 +661,75 @@ async def try_click_entry_element(
     except Exception:
         pass
 
+    try:
+        after_state = await get_page_activity_snapshot(page)
+        if not page_state_changed(before_state, after_state):
+            logger.info("🧭 Smart cursor: entry-клик не изменил состояние страницы, завершаем фазу входа")
+            return cursor_pos, False, None
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+        else:
+            raise
+
     return cursor_pos, True, str(best.get("key", ""))
 
 
 async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
     """Легкий снимок состояния страницы для оценки, произошли ли изменения после клика."""
-    _default = {"url": str(page.url or ""), "scrollY": 0, "height": 0, "title": "", "text": ""}
+    _default = {
+        "url": str(page.url or ""),
+        "scrollY": 0,
+        "height": 0,
+        "title": "",
+        "text": "",
+        "media": "",
+        "active": "",
+    }
     try:
         result = await page.evaluate(
             """
             () => {
                 const text = (document.body?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 300);
+                const viewportHeight = window.innerHeight || 0;
+                const media = [];
+                for (const node of document.querySelectorAll('img, video, canvas, [style*="background-image"]')) {
+                    if (!(node instanceof Element)) continue;
+                    const rect = node.getBoundingClientRect();
+                    if (rect.width < 24 || rect.height < 24) continue;
+                    if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+
+                    let signature = node.tagName.toLowerCase();
+                    if (node instanceof HTMLImageElement) {
+                        signature += ':' + ((node.currentSrc || node.src || '').split('?')[0].slice(-80));
+                    } else if (node instanceof HTMLVideoElement) {
+                        signature += ':' + ((node.currentSrc || node.getAttribute('src') || '').split('?')[0].slice(-80));
+                    } else if (node instanceof HTMLElement) {
+                        const bg = node.style.backgroundImage || window.getComputedStyle(node).backgroundImage || '';
+                        signature += ':' + bg.slice(0, 80);
+                    }
+                    media.push(signature);
+                    if (media.length >= 8) break;
+                }
+
+                const active = [];
+                for (const node of document.querySelectorAll('[aria-current="page"], [aria-current="true"], [aria-selected="true"], .active, .is-active, .swiper-slide-active, .slick-active, .w--current, .w--open')) {
+                    if (!(node instanceof HTMLElement)) continue;
+                    const rect = node.getBoundingClientRect();
+                    if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+                    const label = (node.innerText || node.getAttribute('aria-label') || node.id || node.className || '').toString().trim().replace(/\\s+/g, ' ').slice(0, 60);
+                    active.push(label);
+                    if (active.length >= 8) break;
+                }
+
                 return {
                     url: location.href,
                     scrollY: window.scrollY,
                     height: document.documentElement?.scrollHeight || 0,
                     title: document.title || '',
-                    text
+                    text,
+                    media: media.join('|'),
+                    active: active.join('|')
                 };
             }
             """
@@ -756,6 +828,8 @@ def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
         or int(after.get("scrollY", 0)) != int(before.get("scrollY", 0))
         or str(before.get("text", "")) != str(after.get("text", ""))
         or str(before.get("title", "")) != str(after.get("title", ""))
+        or str(before.get("media", "")) != str(after.get("media", ""))
+        or str(before.get("active", "")) != str(after.get("active", ""))
     )
 
 
@@ -1136,6 +1210,41 @@ def strict_target_family_key(target: Dict[str, Any]) -> str:
     return f"{tag}|x{x_bucket}|y{y_bucket}|a{area_bucket}|{marker}"
 
 
+def interaction_text(target: Dict[str, Any]) -> str:
+    text_raw = str(target.get("text", "")).strip().lower()
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in text_raw).split())
+
+
+def is_probable_repeatable_control(target: Dict[str, Any]) -> bool:
+    """Определяет локальные контролы, которые разумно нажимать несколько раз подряд."""
+    text = interaction_text(target)
+    href = str(target.get("href", "")).strip().lower()
+    tag = str(target.get("tag", "")).strip().lower()
+    width = _to_float(target.get("width"), 0.0)
+    height = _to_float(target.get("height"), 0.0)
+    area = max(0.0, width * height)
+
+    if href and not href.startswith("#") and not href.startswith("javascript:"):
+        return False
+
+    repeat_words = (
+        "next", "prev", "previous", "back", "more", "slide", "slider", "carousel",
+        "play", "pause", "resume", "forward", "rewind", "fwd", "step", "continue",
+        "again", "retry", "tab", "left", "right", "expand", "collapse", "open", "close",
+    )
+    button_like = tag in {"button", "summary"} or not href
+    compact = area <= 26000 and width <= 260 and height <= 170
+    terse = len(text) <= 18
+
+    if has_keyword(text, repeat_words) and button_like:
+        return True
+
+    if button_like and compact and (not text or terse):
+        return True
+
+    return False
+
+
 async def collect_close_targets(page: Any, viewport_width: int, viewport_height: int) -> List[Dict[str, Any]]:
     """Ищет кнопки закрытия модалок/lightbox (Close/X/Dismiss/Cancel)."""
     return await page.evaluate(
@@ -1307,6 +1416,9 @@ async def perform_followup_click_sequence(
     current_y = float(anchor_y)
     current_key = str(anchor_key)
     current_family = str(anchor_family)
+    family_repeat_counts: Dict[str, int] = {}
+    family_last_changed: Dict[str, bool] = {}
+    max_repeatable_clicks = 4
 
     for step_index in range(max_followup_steps):
         if allowed_url:
@@ -1334,16 +1446,21 @@ async def perform_followup_click_sequence(
         )
         radius_limit = min(radius_limit, max(viewport_width, viewport_height) * 0.58)
 
-        ranked: List[Tuple[Tuple[int, int, int, int, float, float], Dict[str, Any]]] = []
+        ranked: List[Tuple[Tuple[int, int, int, int, int, float, float], Dict[str, Any]]] = []
         current_url = str(page.url or "")
 
         for item in nearby_targets:
             item_key = str(item.get("key", ""))
-            if not item_key or item_key in clicked_keys or item_key == current_key:
-                continue
-
             item_family = strict_target_family_key(item)
-            if item_family in clicked_families or item_family == current_family:
+            item_repeatable = is_probable_repeatable_control(item)
+            item_repeat_count = family_repeat_counts.get(item_family, 0)
+            same_family_allowed = item_repeatable and family_last_changed.get(item_family, False) and item_repeat_count < max_repeatable_clicks
+
+            if not item_key:
+                continue
+            if (item_key in clicked_keys or item_key == current_key) and not same_family_allowed:
+                continue
+            if (item_family in clicked_families or item_family == current_family) and not same_family_allowed:
                 continue
 
             if not is_safe_inpage_click_target(item, current_url, allow_internal_nav_click, allowed_url=allowed_url):
@@ -1372,11 +1489,13 @@ async def perform_followup_click_sequence(
             hover_like = bool(item.get("isHoverText", False)) or bool(item.get("isSurfaceHover", False))
             button_like = item_tag in {"button", "summary"}
             passive_hover = hover_like and not hint and not button_like
+            continue_same_control = item_repeatable and item_family == current_family and family_last_changed.get(item_family, False)
 
             rank_tuple = (
                 0 if hint else 1,
                 0 if button_like else 1,
                 0 if compact else 1,
+                0 if continue_same_control else 1,
                 1 if passive_hover else 0,
                 dist,
                 -target_sort_score(item),
@@ -1394,6 +1513,7 @@ async def perform_followup_click_sequence(
         follow_y = clamp(_to_float(follow_target.get("y"), current_y), 2, viewport_height - 2)
 
         try:
+            before_snapshot = await get_page_activity_snapshot(page)
             cursor_pos = await move_mouse_human_like(
                 page=page,
                 start=cursor_pos,
@@ -1407,11 +1527,16 @@ async def perform_followup_click_sequence(
             await page.mouse.click(follow_x, follow_y, delay=random.randint(30, 95))
             await page.wait_for_timeout(random.randint(130, 320))
             after_url = str(page.url or "")
+            after_snapshot = await get_page_activity_snapshot(page)
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
                 break
             continue
+
+        local_changed = page_state_changed(before_snapshot, after_snapshot)
+        family_repeat_counts[follow_family] = family_repeat_counts.get(follow_family, 0) + 1
+        family_last_changed[follow_family] = local_changed
 
         clicked_keys.add(follow_key)
         clicked_families.add(follow_family)
@@ -2174,7 +2299,7 @@ async def run_strict_top_to_bottom_pass(
 
                 hover_followup_count = 0
                 if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
-                    hover_followup_steps = max(1, min(click_sequence_max_steps, 2))
+                    hover_followup_steps = max(2, min(click_sequence_max_steps + 2, 5))
                     cursor_pos, hover_followup_count = await perform_followup_click_sequence(
                         page=page,
                         cursor_pos=cursor_pos,
@@ -2304,7 +2429,7 @@ async def run_strict_top_to_bottom_pass(
                             timeout=15000,
                         )
 
-                    followup_steps = max(0, click_sequence_max_steps - 1)
+                    followup_steps = max(1, min(click_sequence_max_steps + 1, 5))
                     if followup_steps > 0 and (action_hint or is_local_trigger):
                         cursor_pos, followup_count = await perform_followup_click_sequence(
                             page=page,
@@ -3781,7 +3906,7 @@ async def run_smart_cursor(
 
                 hover_followup_count = 0
                 if inpage_click_enabled and (is_surface_hover or is_hover_text) and click_sequence_max_steps > 0:
-                    hover_followup_steps = max(1, min(click_sequence_max_steps, 2))
+                    hover_followup_steps = max(2, min(click_sequence_max_steps + 2, 5))
                     cursor_pos, hover_followup_count = await perform_followup_click_sequence(
                         page=page,
                         cursor_pos=cursor_pos,
@@ -3852,7 +3977,7 @@ async def run_smart_cursor(
                     elif after_url != before_url and allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: выполнен внутренний переход по интерактиву")
                     else:
-                        followup_steps = max(0, click_sequence_max_steps - 1)
+                        followup_steps = max(1, min(click_sequence_max_steps + 1, 5))
                         if followup_steps > 0 and (action_hint or is_local_trigger or is_hover_text):
                             cursor_pos, followup_count = await perform_followup_click_sequence(
                                 page=page,
