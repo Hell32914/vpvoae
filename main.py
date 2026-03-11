@@ -1435,6 +1435,99 @@ async def try_close_overlay(
     return cursor_pos, False
 
 
+async def try_close_chat_widgets(page: Any) -> bool:
+    """
+    Скрывает всплывающие чат-виджеты (Intercom, Drift, Crisp, Tawk, Freshchat, Potion и т.д.).
+    Возвращает True, если что-то было скрыто.
+    """
+    try:
+        hidden = await page.evaluate(
+            """
+            () => {
+                const chatSelectors = [
+                    '#intercom-container',
+                    '#intercom-frame',
+                    'iframe[name*="intercom"]',
+                    '[class*="intercom-"]',
+                    '#drift-widget',
+                    '#drift-frame',
+                    'iframe[id*="drift"]',
+                    '#crisp-chatbox',
+                    '[class*="crisp-client"]',
+                    '#tawk-widget-container',
+                    'iframe[title*="tawk"]',
+                    '[class*="tawk-"]',
+                    '#fc_frame',
+                    '#freshchat-container',
+                    '[id*="freshchat"]',
+                    '[class*="freshchat"]',
+                    '[class*="chat-widget"]',
+                    '[class*="chat-bubble"]',
+                    '[class*="support-chat"]',
+                    '[class*="livechat-widget"]',
+                    '[class*="helpcrunch"]',
+                    '[class*="tidio-"]',
+                    '#tidio-chat',
+                    '[class*="zsiq"]',
+                    '#hubspot-messages-iframe-container',
+                    '[class*="fb-customerchat"]',
+                    '[class*="potion-"]',
+                    '[id*="potion"]',
+                    '[class*="chatbot"]',
+                    '[class*="chat-popup"]',
+                    '[class*="chat-container"]',
+                ];
+
+                let count = 0;
+                for (const sel of chatSelectors) {
+                    try {
+                        const nodes = document.querySelectorAll(sel);
+                        for (const el of nodes) {
+                            if (!(el instanceof HTMLElement)) continue;
+                            const st = window.getComputedStyle(el);
+                            if (st.display === 'none') continue;
+                            el.style.setProperty('display', 'none', 'important');
+                            count++;
+                        }
+                    } catch(_) {}
+                }
+
+                // Also hide iframes that look like chat widgets (small, bottom-right)
+                const iframes = document.querySelectorAll('iframe');
+                for (const iframe of iframes) {
+                    if (!(iframe instanceof HTMLElement)) continue;
+                    const rect = iframe.getBoundingClientRect();
+                    const st = window.getComputedStyle(iframe);
+                    if (st.display === 'none') continue;
+                    const vw = window.innerWidth;
+                    const vh = window.innerHeight;
+                    // Chat widgets are typically <500px wide, <700px tall, anchored bottom-right
+                    if (
+                        rect.width > 0 && rect.width <= 500 &&
+                        rect.height > 0 && rect.height <= 700 &&
+                        rect.right >= vw * 0.55 &&
+                        rect.bottom >= vh * 0.40 &&
+                        (iframe.src || '').match(/intercom|drift|crisp|tawk|freshchat|hubspot|tidio|helpcrunch|livechat|potion|chatbot|chat/i)
+                    ) {
+                        iframe.style.setProperty('display', 'none', 'important');
+                        count++;
+                    }
+                }
+
+                return count;
+            }
+            """
+        )
+        if hidden and hidden > 0:
+            logger.info(f"🗑️ Скрыто чат-виджетов: {hidden}")
+            return True
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+        return False
+    return False
+
+
 async def perform_followup_click_sequence(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -2127,14 +2220,18 @@ async def run_strict_top_to_bottom_pass(
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
-    # Минимальная гарантия: не завершаем раньше 65% от бюджета, даже если достигли дна.
-    # Это гарантирует, что основная страница получает большую часть времени.
-    min_duration_ms = max(8000, int(soft_budget_ms * 0.65))
+    # Когда достигнуто дно — ждём 5 секунд, пробуем скролл, и если нельзя — завершаем.
+    bottom_confirm_wait_ms = 5000
 
     last_scroll_y = -1
     stagnant_rounds = 0
     bottom_stable_rounds = 0
     round_index = 0
+    # Скрываем чат-виджеты, которые могли открыться при загрузке страницы
+    try:
+        await try_close_chat_widgets(page)
+    except Exception:
+        pass
     last_analysis_round = -1000
     # ── Быстрые тайминги для «поисковой» фазы (курсор летит к цели) ──
     search_move_min = 60
@@ -2170,9 +2267,6 @@ async def run_strict_top_to_bottom_pass(
             break
         if elapsed_ms >= hard_budget_ms:
             break
-        # Не выходим раньше минимальной гарантии, даже если внизу.
-        if reached_bottom and elapsed_ms < min_duration_ms:
-            reached_bottom = False
 
         round_index += 1
         interacted_this_round = False
@@ -2347,7 +2441,15 @@ async def run_strict_top_to_bottom_pass(
                 elif any_hover_candidates:
                     pool = shortlist_progress_targets(any_hover_candidates, band_px=180.0, limit=min(6, len(any_hover_candidates)))
                 else:
-                    pool = shortlist_progress_targets(candidates, band_px=180.0, limit=min(6, len(candidates)))
+                    # Нет ни hover-кандидатов, ни click-кандидатов — простой текст,
+                    # пропускаем и скроллим дальше.
+                    pool = None
+
+                if pool is None:
+                    # Нет hover/click-кандидатов — только простой текст, не взаимодействуем
+                    candidates = []
+
+            if candidates and pool:
                 target = pool[0]
 
                 # ── Подкрутка скролла, чтобы цель была видна в центральной зоне экрана ──
@@ -2706,6 +2808,10 @@ async def run_strict_top_to_bottom_pass(
                 cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
             except Exception:
                 pass
+            try:
+                await try_close_chat_widgets(page)
+            except Exception:
+                pass
 
         # ── Проверка лимита секции (10 с на один экран) ──
         section_elapsed_ms = (time.monotonic() - section_entered_at) * 1000
@@ -2857,17 +2963,40 @@ async def run_strict_top_to_bottom_pass(
             bottom_stable_rounds = 0
 
         if bottom_stable_rounds >= bottom_stable_rounds_required:
-            elapsed_at_bottom_ms = (time.monotonic() - started_at) * 1000
-            if elapsed_at_bottom_ms >= min_duration_ms:
+            # Дно достигнуто — ждём 5 секунд, пробуем скроллить ещё раз.
+            # Если не получается — завершаем запись.
+            logger.info("🧭 Smart cursor: дно достигнуто, ждём 5с и проверяем...")
+            await page.wait_for_timeout(bottom_confirm_wait_ms)
+            # Пробуем scroll + force_scroll
+            _pre_check_scroll = current_scroll_y
+            try:
+                await perform_smooth_scroll(
+                    page=page,
+                    viewport_height=viewport_height,
+                    scroll_speed_factor=max(scroll_speed_factor, 1.5),
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                )
+                await force_scroll_progress(page, viewport_height)
+                await page.wait_for_timeout(500)
+                _recheck_metrics = await get_scroll_metrics(page)
+                _recheck_scroll = int(_recheck_metrics.get("scrollY", _pre_check_scroll))
+                _recheck_at_bottom = bool(_recheck_metrics.get("atBottom", True))
+            except Exception:
+                _recheck_scroll = _pre_check_scroll
+                _recheck_at_bottom = True
+            if _recheck_scroll <= _pre_check_scroll + 10 or _recheck_at_bottom:
+                # Не можем двигаться дальше — завершаем
+                logger.info("🧭 Smart cursor: после 5с ожидания скролл невозможен — завершаем запись")
                 reached_bottom = True
                 break
             else:
-                # Ещё рано завершать — сбрасываем счётчик и продолжаем взаимодействие.
-                logger.info(
-                    f"🧭 Smart cursor: дно достигнуто, но прошло только {int(elapsed_at_bottom_ms)}ms"
-                    f" из минимальных {int(min_duration_ms)}ms — продолжаем"
-                )
+                # Контент подгрузился (lazy load) — продолжаем
+                logger.info(f"🧭 Smart cursor: контент подгрузился (scroll {_pre_check_scroll} → {_recheck_scroll}), продолжаем")
                 bottom_stable_rounds = 0
+                last_scroll_y = _recheck_scroll
+                scroll_y = _recheck_scroll
+                last_progress_at = time.monotonic()
 
     if require_bottom and not reached_bottom:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -3398,6 +3527,10 @@ async def visit_top_navigation_tabs(
             cursor_pos, _ = await try_close_overlay(page, cursor_pos, viewport_width, viewport_height)
         except Exception:
             await _recover_after_nav(page)
+        try:
+            await try_close_chat_widgets(page)
+        except Exception:
+            pass
 
         if changed:
             # Ограничиваем per-tab бюджет остатком nav_budget_ms
