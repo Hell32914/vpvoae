@@ -757,7 +757,14 @@ async def get_page_activity_snapshot(page: Any) -> Dict[str, Any]:
 
 
 async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
-    _default = {"scrollY": 0, "maxScroll": 0, "atBottom": False}
+    _default = {
+        "scrollY": 0,
+        "maxScroll": 0,
+        "atBottom": False,
+        "documentHeight": 0,
+        "viewportHeight": 0,
+        "bottomGap": 0,
+    }
     try:
         result = await page.evaluate(
             """
@@ -769,10 +776,23 @@ async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
 
                 const viewportHeight = toInt(window.innerHeight || 0, 0);
                 const scrollingEl = document.scrollingElement || document.documentElement || document.body;
+                const rootHeights = [
+                    document.documentElement?.scrollHeight || 0,
+                    document.documentElement?.offsetHeight || 0,
+                    document.documentElement?.clientHeight || 0,
+                    document.body?.scrollHeight || 0,
+                    document.body?.offsetHeight || 0,
+                    document.body?.clientHeight || 0,
+                    scrollingEl?.scrollHeight || 0,
+                ];
 
                 let scrollY = Math.max(
                     toInt(window.scrollY || window.pageYOffset || 0, 0),
                     toInt(scrollingEl?.scrollTop || 0, 0),
+                );
+                let documentHeight = Math.max(
+                    viewportHeight,
+                    ...rootHeights.map((value) => toInt(value, 0)),
                 );
 
                 let maxScroll = Math.max(
@@ -806,6 +826,12 @@ async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
                         maxScroll = Math.max(maxScroll, nativeMax);
                     }
 
+                    documentHeight = Math.max(
+                        documentHeight,
+                        toInt(rect.bottom + scrollY, 0),
+                        toInt((el.offsetTop || 0) + elementHeight, 0),
+                    );
+
                     const transformedTop = Math.max(0, toInt(-(rect.top || 0), 0));
                     const transformedMax = Math.max(0, elementHeight - viewportHeight);
                     const hasTransform = (
@@ -819,11 +845,20 @@ async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
                     }
                 }
 
-                const atBottom = maxScroll <= 4 ? true : scrollY >= (maxScroll - 6);
+                maxScroll = Math.max(maxScroll, Math.max(0, documentHeight - viewportHeight));
+                const bottomGap = Math.max(0, documentHeight - (scrollY + viewportHeight));
+                const atBottom = (
+                    documentHeight <= viewportHeight + 4
+                    || bottomGap <= 8
+                    || (maxScroll > 4 && scrollY >= (maxScroll - 6))
+                );
                 return {
                     scrollY,
                     maxScroll,
                     atBottom,
+                    documentHeight,
+                    viewportHeight,
+                    bottomGap,
                 };
             }
             """
@@ -834,6 +869,82 @@ async def get_scroll_metrics(page: Any) -> Dict[str, Any]:
             await _recover_after_nav(page)
             return _default
         raise
+
+
+def metrics_viewport_height(metrics: Dict[str, Any], fallback_viewport_height: int) -> int:
+    metric_viewport_height = _to_float(metrics.get("viewportHeight"), fallback_viewport_height)
+    if metric_viewport_height <= 0:
+        metric_viewport_height = max(1.0, float(fallback_viewport_height or 1))
+    return max(1, int(metric_viewport_height))
+
+
+def metrics_document_height(metrics: Dict[str, Any], fallback_viewport_height: int) -> int:
+    metric_viewport_height = metrics_viewport_height(metrics, fallback_viewport_height)
+    document_height = max(
+        metric_viewport_height,
+        int(_to_float(metrics.get("documentHeight"), 0.0)),
+        int(_to_float(metrics.get("maxScroll"), 0.0)) + metric_viewport_height,
+    )
+    return max(metric_viewport_height, document_height)
+
+
+def confirm_bottom_state_from_metrics(
+    metrics: Dict[str, Any],
+    viewport_height: int,
+    analysis_max_abs_y: int = 0,
+    round_index: int = 0,
+    bottom_stable_rounds_required: int = 4,
+    stagnant_rounds: int = 0,
+) -> Tuple[bool, str]:
+    current_scroll_y = max(0, int(_to_float(metrics.get("scrollY"), 0.0)))
+    max_scroll_y = max(0, int(_to_float(metrics.get("maxScroll"), 0.0)))
+    metric_viewport_height = metrics_viewport_height(metrics, viewport_height)
+    document_height = metrics_document_height(metrics, metric_viewport_height)
+    bottom_gap = max(
+        0,
+        int(_to_float(metrics.get("bottomGap"), document_height - (current_scroll_y + metric_viewport_height))),
+    )
+    at_bottom = bool(metrics.get("atBottom", False))
+
+    analysis_gap: Optional[int] = None
+    if analysis_max_abs_y > 0:
+        analysis_gap = int(analysis_max_abs_y - (current_scroll_y + metric_viewport_height * 0.94))
+
+    doc_gap_threshold = max(20, int(metric_viewport_height * 0.12))
+    analysis_gap_threshold = max(24, int(metric_viewport_height * 0.10))
+
+    if not at_bottom:
+        if max_scroll_y > 12:
+            return False, f"window distance={max_scroll_y - current_scroll_y}"
+        if document_height > metric_viewport_height + 40:
+            return False, f"document gap={bottom_gap}"
+        if analysis_gap is not None:
+            return False, f"analysis tail={analysis_gap}"
+        return False, "atBottom=false"
+
+    if max_scroll_y > 12 and current_scroll_y < (max_scroll_y - 8):
+        return False, f"window distance={max_scroll_y - current_scroll_y}"
+
+    if document_height > metric_viewport_height + 40 and bottom_gap > doc_gap_threshold:
+        return False, f"document gap={bottom_gap}"
+
+    if analysis_gap is not None and analysis_gap > analysis_gap_threshold:
+        return False, f"analysis tail={analysis_gap}"
+
+    if max_scroll_y > 12:
+        return True, f"window distance={max_scroll_y - current_scroll_y}"
+    if document_height > metric_viewport_height + 40:
+        return True, f"document gap={bottom_gap}"
+    if analysis_gap is not None:
+        return True, f"analysis tail={analysis_gap}"
+
+    fallback_confirmed = round_index >= max(8, bottom_stable_rounds_required * 2) and stagnant_rounds >= 1
+    return (
+        fallback_confirmed,
+        "fallback "
+        f"guard_round={round_index >= max(8, bottom_stable_rounds_required * 2)} "
+        f"guard_stagnant={stagnant_rounds >= 1}",
+    )
 
 
 def page_state_changed(before: Dict[str, Any], after: Dict[str, Any]) -> bool:
@@ -2050,6 +2161,33 @@ async def collect_document_interaction_targets(
                 return false;
             }
 
+            function isContentAnchorCandidate(el, tag, textNoWs, rect) {
+                const cls = (el.className || '').toString().toLowerCase();
+                const idPart = (el.id || '').toString().toLowerCase();
+                const hint = `${cls} ${idPart}`;
+
+                const semanticBlock = ['main', 'section', 'article', 'footer'].includes(tag);
+                if (semanticBlock && rect.height >= Math.max(40, viewportHeight * 0.08)) {
+                    return true;
+                }
+
+                if (['h1', 'h2', 'h3', 'h4'].includes(tag)) {
+                    return textNoWs.length >= 10 && rect.width >= viewportWidth * 0.22;
+                }
+
+                const explicitSectionHint = /hero|feature|pricing|faq|footer|testimonial|review|integrat|cta|benefit|advantage|section/.test(hint);
+                if (explicitSectionHint && rect.width >= viewportWidth * 0.28 && rect.height >= Math.max(24, viewportHeight * 0.05)) {
+                    return true;
+                }
+
+                const textBlock = ['p', 'blockquote', 'li'].includes(tag);
+                if (textBlock && textNoWs.length >= 20 && rect.width >= viewportWidth * 0.22 && rect.height >= 18) {
+                    return true;
+                }
+
+                return false;
+            }
+
             // Дополнительный grid-scan для сайтов без семантических DOM-меток.
             const scanCols = 11;
             const scanRows = 7;
@@ -2143,7 +2281,10 @@ async def collect_document_interaction_targets(
                 const interactive = isInteractiveNode(el, tag);
                 const hoverText = isHoverEffectTextCandidate(el, tag, textNoWs, rect, style);
                 const surfaceHover = isSurfaceHoverCandidate(el, tag, rect, style);
-                if (!interactive && !hoverText && !surfaceHover) continue;
+                const contentAnchor = (!interactive && !hoverText && !surfaceHover)
+                    ? isContentAnchorCandidate(el, tag, textNoWs, rect)
+                    : false;
+                if (!interactive && !hoverText && !surfaceHover && !contentAnchor) continue;
 
                 const key = elementKey(el, absX, absY, text);
 
@@ -2153,6 +2294,7 @@ async def collect_document_interaction_targets(
                 const areaBoost = Math.min(rect.width * rect.height, 12000) * 0.01;
                 const hoverBoost = hoverText ? 82 : 0;
                 const surfaceBoost = surfaceHover ? 106 : 0;
+                const anchorBoost = contentAnchor ? 8 : 0;
 
                 out.push({
                     key,
@@ -2160,19 +2302,62 @@ async def collect_document_interaction_targets(
                     absY: Math.max(1, absY),
                     width: rect.width,
                     height: rect.height,
-                    score: pointerBoost + tagBoost + textBoost + areaBoost + hoverBoost + surfaceBoost,
+                    score: pointerBoost + tagBoost + textBoost + areaBoost + hoverBoost + surfaceBoost + anchorBoost,
                     text,
                     href,
                     tag,
                     isHoverText: hoverText,
                     isSurfaceHover: surfaceHover,
+                    isContentAnchor: contentAnchor,
                     visibleRatio,
                     visibilityClarity,
                 });
             }
 
             out.sort((a, b) => (a.absY - b.absY) || (b.score - a.score));
-            return out.slice(0, Math.max(limit, 1));
+            const maxItems = Math.max(limit, 1);
+            if (out.length <= maxItems) return out;
+
+            const bandHeight = Math.max(220, Math.floor(viewportHeight * 0.85));
+            const bandCount = Math.max(1, Math.ceil(docHeight / bandHeight));
+            const perBand = Math.max(4, Math.ceil(maxItems / bandCount));
+            const bands = Array.from({ length: bandCount }, () => []);
+
+            for (const item of out) {
+                const bandIndex = Math.max(0, Math.min(bandCount - 1, Math.floor(item.absY / bandHeight)));
+                bands[bandIndex].push(item);
+            }
+
+            const sampled = [];
+            const seenKeys = new Set();
+            for (const bandItems of bands) {
+                if (!bandItems.length) continue;
+                bandItems.sort((a, b) => {
+                    const anchorOrder = (a.isContentAnchor ? 1 : 0) - (b.isContentAnchor ? 1 : 0);
+                    return anchorOrder || (b.score - a.score) || (a.absY - b.absY);
+                });
+                for (const item of bandItems.slice(0, perBand)) {
+                    if (seenKeys.has(item.key)) continue;
+                    seenKeys.add(item.key);
+                    sampled.push(item);
+                }
+            }
+
+            if (sampled.length < maxItems) {
+                const remainder = [...out].sort((a, b) => {
+                    const anchorOrder = (a.isContentAnchor ? 1 : 0) - (b.isContentAnchor ? 1 : 0);
+                    return anchorOrder || (b.score - a.score) || (a.absY - b.absY);
+                });
+                for (const item of remainder) {
+                    if (sampled.length >= maxItems) break;
+                    if (seenKeys.has(item.key)) continue;
+                    seenKeys.add(item.key);
+                    sampled.push(item);
+                }
+            }
+
+            sampled.sort((a, b) => (a.absY - b.absY) || (b.score - a.score));
+            return sampled.slice(0, maxItems);
         }
         """,
         {
@@ -2347,6 +2532,7 @@ async def run_strict_top_to_bottom_pass(
             viewport_top = scroll_y + int(viewport_height * 0.18)
             viewport_bottom = scroll_y + int(viewport_height * 0.82)
             current_url = str(page.url or "")
+            pool: Optional[List[Dict[str, Any]]] = None
 
             candidates: List[Dict[str, Any]] = []
             for item in analysis_targets:
@@ -2356,6 +2542,8 @@ async def run_strict_top_to_bottom_pass(
 
                 item_abs_y = float(item.get("absY", 0.0))
                 if not (viewport_top <= int(item_abs_y) <= viewport_bottom):
+                    continue
+                if bool(item.get("isContentAnchor", False)):
                     continue
                 if is_probable_top_nav_target(item, viewport_height):
                     continue
@@ -2905,6 +3093,14 @@ async def run_strict_top_to_bottom_pass(
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
+                after_metrics = {
+                    "scrollY": max(last_scroll_y, scroll_y),
+                    "maxScroll": 0,
+                    "atBottom": False,
+                    "documentHeight": 0,
+                    "viewportHeight": viewport_height,
+                    "bottomGap": 0,
+                }
                 current_scroll_y = max(last_scroll_y, scroll_y)
                 max_scroll_y = 0
                 at_bottom = False
@@ -2951,30 +3147,20 @@ async def run_strict_top_to_bottom_pass(
                 int(float(item.get("absY", 0.0)))
                 for item in analysis_targets
                 if float(item.get("absY", 0.0)) > 1.0
+                and not is_probable_top_nav_target(item, viewport_height)
             ),
             default=0,
         )
 
-        bottom_confirmed = False
-        bottom_reason = "atBottom=false"
-        if at_bottom:
-            if max_scroll_y > 12:
-                bottom_confirmed = current_scroll_y >= (max_scroll_y - 8)
-                bottom_reason = f"window distance={max_scroll_y - current_scroll_y}"
-            elif analysis_max_abs_y > 0:
-                bottom_confirmed = analysis_max_abs_y <= (current_scroll_y + int(viewport_height * 0.94))
-                bottom_reason = f"analysis tail={analysis_max_abs_y - (current_scroll_y + int(viewport_height * 0.94))}"
-            else:
-                bottom_confirmed = round_index >= max(6, bottom_stable_rounds_required * 2) and stagnant_rounds >= 1
-                bottom_reason = (
-                    "fallback "
-                    f"guard_round={round_index >= max(6, bottom_stable_rounds_required * 2)} "
-                    f"guard_stagnant={stagnant_rounds >= 1}"
-                )
-        elif max_scroll_y > 12:
-            bottom_reason = f"window distance={max_scroll_y - current_scroll_y}"
-        elif analysis_max_abs_y > 0:
-            bottom_reason = f"analysis tail={analysis_max_abs_y - (current_scroll_y + int(viewport_height * 0.94))}"
+        bottom_confirmed, bottom_reason = confirm_bottom_state_from_metrics(
+            metrics=after_metrics,
+            viewport_height=viewport_height,
+            analysis_max_abs_y=analysis_max_abs_y,
+            round_index=round_index,
+            bottom_stable_rounds_required=bottom_stable_rounds_required,
+            stagnant_rounds=stagnant_rounds,
+        )
+        metric_document_height = metrics_document_height(after_metrics, viewport_height)
 
         if bottom_debug and (
             round_index % 8 == 0
@@ -2984,7 +3170,7 @@ async def run_strict_top_to_bottom_pass(
             logger.info(
                 "🧭 Bottom check: "
                 f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
-                f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, stable={bottom_stable_rounds}"
+                f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, docHeight={metric_document_height}, stable={bottom_stable_rounds}"
             )
 
         if bottom_confirmed:
@@ -3006,26 +3192,18 @@ async def run_strict_top_to_bottom_pass(
 
             # Дополнительная проверка: сравниваем scrollY + viewportHeight с реальной
             # высотой документа. Если мы НЕ достигли конца документа — отменяем.
-            try:
-                _doc_height = await page.evaluate(
-                    "Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0)"
+            metric_viewport_height = metrics_viewport_height(after_metrics, viewport_height)
+            visible_end = current_scroll_y + metric_viewport_height
+            remaining_gap = metric_document_height - visible_end
+            if remaining_gap > metric_viewport_height * 0.12:
+                logger.info(
+                    f"🧭 Smart cursor: atBottom=true, но до конца контента ещё "
+                    f"{remaining_gap}px (docH={metric_document_height}, visEnd={visible_end}) — продолжаем"
                 )
-                _visible_end = current_scroll_y + viewport_height
-                _gap = int(_doc_height) - _visible_end
-                if _gap > viewport_height * 0.15:
-                    logger.info(
-                        f"🧭 Smart cursor: atBottom=true, но до конца документа ещё "
-                        f"{_gap}px (docH={int(_doc_height)}, visEnd={_visible_end}) — продолжаем"
-                    )
-                    bottom_stable_rounds = 0
-                    stagnant_rounds = 0
-                    # Принудительно скроллим вниз
-                    await force_scroll_progress(page, viewport_height)
-                    continue
-            except Exception as _dh_exc:
-                if _is_nav_error(_dh_exc):
-                    await _recover_after_nav(page)
-                    continue
+                bottom_stable_rounds = 0
+                stagnant_rounds = 0
+                await force_scroll_progress(page, viewport_height)
+                continue
 
             # Пробуем скроллить ещё раз (без 5с ожидания).
             _pre_check_scroll = current_scroll_y
@@ -3110,6 +3288,14 @@ async def force_scroll_to_page_end(
             max_scroll = int(metrics.get("maxScroll", 0))
             at_bottom = bool(metrics.get("atBottom", False))
         except Exception:
+            metrics = {
+                "scrollY": last_scroll,
+                "maxScroll": 0,
+                "atBottom": False,
+                "documentHeight": 0,
+                "viewportHeight": viewport_height,
+                "bottomGap": 0,
+            }
             current_scroll = last_scroll
             max_scroll = 0
             at_bottom = False
@@ -3122,17 +3308,15 @@ async def force_scroll_to_page_end(
             except Exception:
                 pass
 
-        bottom_confirmed = False
-        bottom_reason = "atBottom=false"
-        if at_bottom:
-            if max_scroll > 12:
-                bottom_confirmed = current_scroll >= (max_scroll - 8)
-                bottom_reason = f"window distance={max_scroll - current_scroll}"
-            else:
-                bottom_confirmed = round_index >= 8
-                bottom_reason = f"fallback rounds={round_index}"
-        elif max_scroll > 12:
-            bottom_reason = f"window distance={max_scroll - current_scroll}"
+        stagnant_rounds = 1 if current_scroll <= last_scroll + 2 else 0
+        bottom_confirmed, bottom_reason = confirm_bottom_state_from_metrics(
+            metrics=metrics,
+            viewport_height=viewport_height,
+            round_index=round_index,
+            bottom_stable_rounds_required=3,
+            stagnant_rounds=stagnant_rounds,
+        )
+        metric_document_height = metrics_document_height(metrics, viewport_height)
 
         if bottom_debug and (
             round_index % 6 == 0
@@ -3142,7 +3326,7 @@ async def force_scroll_to_page_end(
             logger.info(
                 "🧭 Force-bottom check: "
                 f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
-                f"scrollY={current_scroll}, maxScroll={max_scroll}, stable={stable_rounds}"
+                f"scrollY={current_scroll}, maxScroll={max_scroll}, docHeight={metric_document_height}, stable={stable_rounds}"
             )
 
         if bottom_confirmed:
@@ -3966,59 +4150,62 @@ async def run_smart_cursor(
             logger.warning("⚠️ Smart cursor: STRICT проход завершился по hard-timeout до достижения конца страницы")
 
         if nav_tabs_visit_enabled and nav_tabs_max_visits > 0:
-            elapsed_ms = int((time.monotonic() - start_time) * 1000)
-            remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
-            # Жёсткий лимит: навигация максимум 25% от общего бюджета.
-            nav_budget_cap_ms = int(strict_total_budget_ms * 0.25)
-            nav_budget_ms = min(remaining_ms, nav_budget_cap_ms)
-            if nav_budget_ms >= 4500:
-                logger.info("🧭 Smart cursor: обход вкладок навигации с hover-эффектами")
-                try:
-                    await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
-                    await page.wait_for_timeout(random.randint(200, 420))
-                except Exception:
-                    pass
-
-                per_tab_budget_ms = max(
-                    1700,
-                    min(nav_tab_scroll_timeout_ms, int(nav_budget_ms / max(1, nav_tabs_max_visits))),
-                )
-                try:
-                    cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
-                        page=page,
-                        cursor_pos=cursor_pos,
-                        viewport_width=viewport_width,
-                        viewport_height=viewport_height,
-                        allow_internal_nav_click=allow_internal_nav_click,
-                        allowed_url=site_url,
-                        visited_nav_keys=clicked_nav_keys,
-                        max_nav_tabs_to_visit=nav_tabs_max_visits,
-                        per_tab_scroll_timeout_ms=per_tab_budget_ms,
-                        scroll_speed_factor=scroll_speed_factor,
-                        scroll_pause_min_ms=scroll_pause_min_ms,
-                        scroll_pause_max_ms=scroll_pause_max_ms,
-                        hover_min_ms=hover_min_ms,
-                        hover_max_ms=hover_max_ms,
-                        inpage_click_enabled=inpage_click_enabled,
-                        inpage_click_probability=inpage_click_probability,
-                        bottom_stable_rounds_required=bottom_stable_rounds_required,
-                        scroll_finish_timeout_ms=scroll_finish_timeout_ms,
-                        hover_visible_ratio=hover_visible_ratio,
-                        click_visible_ratio=click_visible_ratio,
-                        min_visibility_clarity=min_visibility_clarity,
-                        click_sequence_max_steps=click_sequence_max_steps,
-                        click_sequence_radius_factor=click_sequence_radius_factor,
-                        strict_interactions_per_scroll=strict_interactions_per_scroll,
-                        stall_timeout_ms=strict_stall_timeout_ms,
-                        nav_budget_ms=nav_budget_ms,
-                    )
-                    if visited_nav_count > 0:
-                        logger.info(f"🧭 Smart cursor: пройдено вкладок с hover-эффектами: {visited_nav_count}")
-                except Exception as nav_err:
-                    logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок: {nav_err}")
-                    await _recover_after_nav(page)
+            if not reached_bottom:
+                logger.warning("⚠️ Smart cursor: пропускаем вкладки навигации, пока главная страница не подтверждена до конца")
             else:
-                logger.warning("⚠️ Smart cursor: не осталось бюджета для обхода вкладок")
+                elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                remaining_ms = max(0, strict_total_budget_ms - elapsed_ms)
+                # Жёсткий лимит: навигация максимум 25% от общего бюджета.
+                nav_budget_cap_ms = int(strict_total_budget_ms * 0.25)
+                nav_budget_ms = min(remaining_ms, nav_budget_cap_ms)
+                if nav_budget_ms >= 4500:
+                    logger.info("🧭 Smart cursor: обход вкладок навигации с hover-эффектами")
+                    try:
+                        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+                        await page.wait_for_timeout(random.randint(200, 420))
+                    except Exception:
+                        pass
+
+                    per_tab_budget_ms = max(
+                        1700,
+                        min(nav_tab_scroll_timeout_ms, int(nav_budget_ms / max(1, nav_tabs_max_visits))),
+                    )
+                    try:
+                        cursor_pos, visited_nav_count = await visit_top_navigation_tabs(
+                            page=page,
+                            cursor_pos=cursor_pos,
+                            viewport_width=viewport_width,
+                            viewport_height=viewport_height,
+                            allow_internal_nav_click=allow_internal_nav_click,
+                            allowed_url=site_url,
+                            visited_nav_keys=clicked_nav_keys,
+                            max_nav_tabs_to_visit=nav_tabs_max_visits,
+                            per_tab_scroll_timeout_ms=per_tab_budget_ms,
+                            scroll_speed_factor=scroll_speed_factor,
+                            scroll_pause_min_ms=scroll_pause_min_ms,
+                            scroll_pause_max_ms=scroll_pause_max_ms,
+                            hover_min_ms=hover_min_ms,
+                            hover_max_ms=hover_max_ms,
+                            inpage_click_enabled=inpage_click_enabled,
+                            inpage_click_probability=inpage_click_probability,
+                            bottom_stable_rounds_required=bottom_stable_rounds_required,
+                            scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                            hover_visible_ratio=hover_visible_ratio,
+                            click_visible_ratio=click_visible_ratio,
+                            min_visibility_clarity=min_visibility_clarity,
+                            click_sequence_max_steps=click_sequence_max_steps,
+                            click_sequence_radius_factor=click_sequence_radius_factor,
+                            strict_interactions_per_scroll=strict_interactions_per_scroll,
+                            stall_timeout_ms=strict_stall_timeout_ms,
+                            nav_budget_ms=nav_budget_ms,
+                        )
+                        if visited_nav_count > 0:
+                            logger.info(f"🧭 Smart cursor: пройдено вкладок с hover-эффектами: {visited_nav_count}")
+                    except Exception as nav_err:
+                        logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок: {nav_err}")
+                        await _recover_after_nav(page)
+                else:
+                    logger.warning("⚠️ Smart cursor: не осталось бюджета для обхода вкладок")
 
         logger.info(f"🧭 Smart cursor: обработано интерактивных целей {hovered_count}")
         return hovered_count
@@ -4131,6 +4318,14 @@ async def run_smart_cursor(
                 current_scroll_y = int(metrics.get("scrollY", last_scroll_y))
                 at_bottom = bool(metrics.get("atBottom", False))
             except Exception:
+                metrics = {
+                    "scrollY": last_scroll_y,
+                    "maxScroll": 0,
+                    "atBottom": False,
+                    "documentHeight": 0,
+                    "viewportHeight": viewport_height,
+                    "bottomGap": 0,
+                }
                 current_scroll_y = last_scroll_y
                 at_bottom = False
 
@@ -4152,10 +4347,29 @@ async def run_smart_cursor(
                     pass
 
             last_scroll_y = max(last_scroll_y, current_scroll_y)
-            if at_bottom:
+            bottom_confirmed, bottom_reason = confirm_bottom_state_from_metrics(
+                metrics=metrics,
+                viewport_height=viewport_height,
+                round_index=phase1_round,
+                bottom_stable_rounds_required=bottom_stable_rounds_required,
+                stagnant_rounds=stagnant_scroll_rounds,
+            )
+            if bottom_confirmed:
                 bottom_stable_rounds += 1
             else:
                 bottom_stable_rounds = 0
+
+            if bottom_debug and (
+                phase1_round % 8 == 0
+                or (at_bottom and not bottom_confirmed)
+                or bottom_confirmed
+            ):
+                logger.info(
+                    "🧭 Phase-1 bottom check: "
+                    f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
+                    f"scrollY={current_scroll_y}, maxScroll={int(metrics.get('maxScroll', 0))}, "
+                    f"docHeight={metrics_document_height(metrics, viewport_height)}, stable={bottom_stable_rounds}"
+                )
 
             if bottom_stable_rounds >= bottom_stable_rounds_required:
                 main_page_scrolled = True
@@ -4193,7 +4407,7 @@ async def run_smart_cursor(
     # ФАЗА 2: Обход вкладок навигации (только после полного скролла)
     # Для каждой вкладки: открыть → проскроллить до конца → вернуться
     # ════════════════════════════════════════════════════════════════
-    if nav_tabs_visit_enabled:
+    if nav_tabs_visit_enabled and (main_page_scrolled or not scroll_to_end):
         remaining_ms = total_time_ms - (time.monotonic() - start_time) * 1000
         if remaining_ms > 8000:
             logger.info("🧭 Smart cursor: ФАЗА 2 — обход вкладок навигации")
@@ -4223,6 +4437,8 @@ async def run_smart_cursor(
             except Exception as nav_err:
                 logger.warning(f"⚠️ Smart cursor: ошибка при обходе вкладок: {nav_err}")
                 await _recover_after_nav(page)
+    elif nav_tabs_visit_enabled and scroll_to_end and not main_page_scrolled:
+        logger.warning("⚠️ Smart cursor: пропускаем ФАЗУ 2, потому что главная страница не подтверждена до конца")
 
     # ════════════════════════════════════════════════════════════════
     # ФАЗА 3: Интерактивный обход — hover + клики по оставшимся элементам
