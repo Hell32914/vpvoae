@@ -2220,6 +2220,9 @@ async def run_strict_top_to_bottom_pass(
     visited_families: Set[str] = set()
     clicked_keys: Set[str] = set()
     clicked_families: Set[str] = set()
+    # Трекер уже показанных hover-зон (absY, absY_end) чтобы не ходить курсором
+    # по дочерним элементам той же карточки/блока.
+    hovered_zones: List[Tuple[float, float, float, float]] = []  # (x, absY, x+w, absY+h)
     recent_interactions: List[Tuple[float, float, float, int]] = []
     analysis_targets: List[Dict[str, Any]] = []
 
@@ -2447,29 +2450,40 @@ async def run_strict_top_to_bottom_pass(
                     ):
                         priority_click_candidates.append(item)
 
-                hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False))]
-                surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False))]
+                # Фильтруем кандидатов, которые попадают в уже показанную hover-зону
+                def _in_hovered_zone(it: Dict[str, Any]) -> bool:
+                    ix = float(it.get("x", 0.0))
+                    iy = float(it.get("absY", 0.0))
+                    iw = float(it.get("width", 0.0))
+                    ih = float(it.get("height", 0.0))
+                    for zx1, zy1, zx2, zy2 in hovered_zones:
+                        # Элемент полностью внутри зоны (дочерний элемент карточки)
+                        if ix >= zx1 - 10 and iy >= zy1 - 10 and (ix + iw) <= zx2 + 10 and (iy + ih) <= zy2 + 10:
+                            return True
+                    return False
+
+                hover_text_candidates = [item for item in candidates if bool(item.get("isHoverText", False)) and not _in_hovered_zone(item)]
+                surface_hover_candidates = [item for item in candidates if bool(item.get("isSurfaceHover", False)) and not _in_hovered_zone(item)]
                 any_hover_candidates = [
                     item for item in candidates
-                    if bool(item.get("isSurfaceHover", False)) or bool(item.get("isHoverText", False))
+                    if (bool(item.get("isSurfaceHover", False)) or bool(item.get("isHoverText", False)))
+                    and not _in_hovered_zone(item)
                 ]
 
-                # В hover-only проходе не прыгаем в click-first ветку до завершения главной страницы.
-                if inpage_click_enabled and priority_click_candidates:
-                    pool = shortlist_progress_targets(priority_click_candidates, band_px=150.0, limit=min(6, len(priority_click_candidates)))
-                elif surface_hover_candidates:
+                # Приоритет: hover-элементы выше click-элементов.
+                # Click-кандидаты только когда нет hover-целей.
+                if surface_hover_candidates:
                     pool = shortlist_progress_targets(surface_hover_candidates, band_px=170.0, limit=min(6, len(surface_hover_candidates)))
                 elif hover_text_candidates:
                     pool = shortlist_progress_targets(hover_text_candidates, band_px=170.0, limit=min(6, len(hover_text_candidates)))
                 elif any_hover_candidates:
                     pool = shortlist_progress_targets(any_hover_candidates, band_px=180.0, limit=min(6, len(any_hover_candidates)))
+                elif inpage_click_enabled and priority_click_candidates:
+                    pool = shortlist_progress_targets(priority_click_candidates, band_px=150.0, limit=min(6, len(priority_click_candidates)))
                 else:
-                    # Нет ни hover-кандидатов, ни click-кандидатов — простой текст,
-                    # пропускаем и скроллим дальше.
                     pool = None
 
                 if pool is None:
-                    # Нет hover/click-кандидатов — только простой текст, не взаимодействуем
                     candidates = []
 
             if candidates and pool:
@@ -2534,6 +2548,14 @@ async def run_strict_top_to_bottom_pass(
                         resolved_y=ty,
                     )
                 )
+
+                # Если элемент не hover и не click-safe — пропускаем,
+                # нет смысла двигать курсор к простому тексту.
+                _is_any_hover = is_hover_text or is_surface_hover
+                if not _is_any_hover and not target_click_safe:
+                    visited_keys.add(target_key)
+                    visited_families.add(target_family)
+                    continue
 
                 # ── Шаг 0: перемещаем курсор к цели (быстрая «поисковая» скорость) ──
                 try:
@@ -2801,6 +2823,15 @@ async def run_strict_top_to_bottom_pass(
                 recent_interactions.append((tx, ty, target_abs_y, round_index))
                 if len(recent_interactions) > 20:
                     recent_interactions.pop(0)
+                # Запоминаем hover-зону чтобы не ходить по дочерним элементам
+                # того же визуального блока.
+                if (is_surface_hover or is_hover_text) and target_width > 20 and target_height > 10:
+                    hovered_zones.append((
+                        float(target.get("x", tx)) - target_width * 0.5,
+                        target_abs_y - target_height * 0.5,
+                        float(target.get("x", tx)) + target_width * 0.5,
+                        target_abs_y + target_height * 0.5,
+                    ))
 
         if round_index % 4 == 0:
             try:
