@@ -114,7 +114,14 @@ async def collect_interactive_targets(
                 '[aria-haspopup="true"]',
                 'video',
                 'canvas',
-                'summary'
+                'summary',
+                '[class*="review"]',
+                '[class*="testimonial"]',
+                '[class*="feedback"]',
+                '[class*="rating"]',
+                '[class*="comment"]',
+                '[class*="quote"]',
+                '[class*="opinion"]'
             ];
 
             const pool = new Set();
@@ -1766,7 +1773,14 @@ async def collect_document_interaction_targets(
                 'span',
                 'video',
                 'canvas',
-                'summary'
+                'summary',
+                '[class*="review"]',
+                '[class*="testimonial"]',
+                '[class*="feedback"]',
+                '[class*="rating"]',
+                '[class*="comment"]',
+                '[class*="quote"]',
+                '[class*="opinion"]',
             ];
 
             const pool = new Set();
@@ -1857,7 +1871,7 @@ async def collect_document_interaction_targets(
                     || tag === 'video'
                     || tag === 'model-viewer'
                     || tag === 'img'
-                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase|gallery|carousel|slider|swiper|tab|phone|device|mockup|preview|screen|app|demo|lightbox/.test(hint)
+                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase|gallery|carousel|slider|swiper|tab|phone|device|mockup|preview|screen|app|demo|lightbox|review|testimonial|feedback|rating|quote|comment|opinion/.test(hint)
                 );
 
                 const largeEnough = (
@@ -2121,18 +2135,35 @@ async def run_strict_top_to_bottom_pass(
     bottom_stable_rounds = 0
     round_index = 0
     last_analysis_round = -1000
+    # ── Быстрые тайминги для «поисковой» фазы (курсор летит к цели) ──
+    search_move_min = 60
+    search_move_max = 150
+    search_dwell_min = 18
+    search_dwell_max = 45
+    # ── Probe: быстрая проба, обнаружен ли hover-эффект ──
+    probe_dwell_ms = 100
+    # ── Тайминги для «витрины»: когда эффект обнаружен — показываем по-человечески ──
     micro_hover_min = max(40, int(hover_min_ms * 0.35))
     micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
     surface_hover_min = max(micro_hover_min + 30, int(hover_min_ms * 0.42))
     surface_hover_max = max(surface_hover_min + 35, int(hover_max_ms * 0.75))
     hover_showcase_min = max(240, int(hover_min_ms * 0.95))
     hover_showcase_max = max(hover_showcase_min + 90, int(hover_max_ms * 1.20))
+    # ── Витринные (замедленные) move durations при показе найденного эффекта ──
+    showcase_move_surface_min = 140
+    showcase_move_surface_max = 340
+    showcase_move_text_min = 180
+    showcase_move_text_max = 480
     strict_interactions_per_scroll = max(1, min(int(strict_interactions_per_scroll), 4))
     stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
     rounds_since_scroll = 0
     no_progress_rounds = 0
     interaction_pause_rounds = 0
     last_progress_at = time.monotonic()
+    # ── Трекер секции: не более 10 секунд на один экран ──
+    section_max_ms = 10000
+    section_scroll_y_start = 0
+    section_entered_at = time.monotonic()
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -2337,7 +2368,7 @@ async def run_strict_top_to_bottom_pass(
                                 _d = _step_size + random.randint(-8, 8)
                                 await page.mouse.wheel(0, _d)
                                 await page.wait_for_timeout(random.randint(18, 45))
-                            await page.wait_for_timeout(random.randint(80, 180))
+                            await page.wait_for_timeout(random.randint(40, 100))
                             _new_metrics = await get_scroll_metrics(page)
                             scroll_y = max(scroll_y, int(_new_metrics.get("scrollY", scroll_y)))
                         except Exception as _exc:
@@ -2380,7 +2411,7 @@ async def run_strict_top_to_bottom_pass(
                     )
                 )
 
-                # ── Шаг 0: перемещаем курсор к цели ──
+                # ── Шаг 0: перемещаем курсор к цели (быстрая «поисковая» скорость) ──
                 try:
                     before_snapshot = await get_page_activity_snapshot(page)
                 except Exception as exc:
@@ -2396,9 +2427,9 @@ async def run_strict_top_to_bottom_pass(
                         end=(tx, ty),
                         viewport_width=viewport_width,
                         viewport_height=viewport_height,
-                        duration_ms=random.randint(200, 540),
+                        duration_ms=random.randint(search_move_min, search_move_max),
                     )
-                    await page.wait_for_timeout(random.randint(60, 160))
+                    await page.wait_for_timeout(random.randint(search_dwell_min, search_dwell_max))
                 except Exception as exc:
                     if _is_nav_error(exc):
                         await _recover_after_nav(page)
@@ -2416,8 +2447,8 @@ async def run_strict_top_to_bottom_pass(
                     before_url = str(page.url or "")
                     before_scroll = scroll_y
                     try:
-                        await page.mouse.click(tx, ty, delay=random.randint(35, 105))
-                        await page.wait_for_timeout(random.randint(250, 500))
+                        await page.mouse.click(tx, ty, delay=random.randint(25, 70))
+                        await page.wait_for_timeout(random.randint(150, 320))
                     except Exception as exc:
                         if _is_nav_error(exc):
                             await _recover_after_nav(page)
@@ -2529,11 +2560,11 @@ async def run_strict_top_to_bottom_pass(
                                 cursor_pos = await move_mouse_human_like(
                                     page, cursor_pos, (ni_x, ni_y),
                                     viewport_width, viewport_height,
-                                    random.randint(160, 380),
+                                    random.randint(80, 200),
                                 )
-                                await page.wait_for_timeout(random.randint(60, 150))
-                                await page.mouse.click(ni_x, ni_y, delay=random.randint(30, 90))
-                                await page.wait_for_timeout(random.randint(250, 500))
+                                await page.wait_for_timeout(random.randint(30, 80))
+                                await page.mouse.click(ni_x, ni_y, delay=random.randint(20, 65))
+                                await page.wait_for_timeout(random.randint(150, 320))
                                 ni_after = await get_page_activity_snapshot(page)
                                 ni_changed = page_state_changed(ni_before, ni_after)
                             except Exception as exc:
@@ -2591,54 +2622,17 @@ async def run_strict_top_to_bottom_pass(
                             followup_total += seq_count
 
                 # ════════════════════════════════════════════════════════
-                # HOVER FALLBACK: если клик не дал изменений или не был выполнен
+                # HOVER FALLBACK: быстрая проба → если эффект есть, показываем медленно
                 # ════════════════════════════════════════════════════════
                 if not click_changed and (is_surface_hover or is_hover_text):
-                    sweep_points: List[Tuple[float, float]] = []
-                    if is_surface_hover and (target_width >= 120 or target_height >= 90):
-                        span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
-                        span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
-                        sweep_points = [
-                            (clamp(tx - span_x, 2, viewport_width - 2), ty),
-                            (tx, clamp(ty - span_y, 2, viewport_height - 2)),
-                            (clamp(tx + span_x, 2, viewport_width - 2), ty),
-                            (tx, clamp(ty + span_y, 2, viewport_height - 2)),
-                            (tx, ty),
-                        ]
-                        if target_width >= 220 and target_height >= 120:
-                            sweep_points.extend([
-                                (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
-                                (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
-                            ])
-                    elif is_hover_text and target_width >= 110:
-                        half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
-                        sweep_points = [
-                            (clamp(tx - half_span, 2, viewport_width - 2), ty),
-                            (tx, ty),
-                            (clamp(tx + half_span, 2, viewport_width - 2), ty),
-                        ]
-                    else:
-                        sweep_points = [(tx, ty)]
-
+                    # ── Quick-probe: ждём probe_dwell_ms и проверяем, изменилось ли состояние ──
+                    await page.wait_for_timeout(probe_dwell_ms)
+                    probe_changed = False
                     try:
-                        for i, point in enumerate(sweep_points):
-                            cursor_pos = await move_mouse_human_like(
-                                page=page, start=cursor_pos, end=point,
-                                viewport_width=viewport_width, viewport_height=viewport_height,
-                                duration_ms=(
-                                    random.randint(90, 260) if is_surface_hover
-                                    else random.randint(130, 420) if is_hover_text
-                                    else random.randint(220, 640)
-                                ),
-                            )
-                            if is_surface_hover:
-                                await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
-                            elif is_hover_text:
-                                await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
-                            elif i == len(sweep_points) - 1:
-                                await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
-                    except Exception as exc:
-                        if _is_nav_error(exc):
+                        probe_snapshot = await get_page_activity_snapshot(page)
+                        probe_changed = page_state_changed(before_snapshot, probe_snapshot)
+                    except Exception as _pe:
+                        if _is_nav_error(_pe):
                             await _recover_after_nav(page)
                             visited_keys.add(target_key)
                             visited_families.add(target_family)
@@ -2646,16 +2640,66 @@ async def run_strict_top_to_bottom_pass(
                             interacted_this_round = True
                             continue
 
-                    try:
-                        after_hover_snapshot = await get_page_activity_snapshot(page)
-                        hover_changed = page_state_changed(before_snapshot, after_hover_snapshot)
-                    except Exception as exc:
-                        if _is_nav_error(exc):
-                            await _recover_after_nav(page)
-                        hover_changed = False
+                    if probe_changed:
+                        # ── Эффект обнаружен — показываем sweep медленно (витрина) ──
+                        logger.info(f"✨ Hover эффект найден на '{target_text[:30]}', показываем")
+                        sweep_points: List[Tuple[float, float]] = []
+                        if is_surface_hover and (target_width >= 120 or target_height >= 90):
+                            span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
+                            span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
+                            sweep_points = [
+                                (clamp(tx - span_x, 2, viewport_width - 2), ty),
+                                (tx, clamp(ty - span_y, 2, viewport_height - 2)),
+                                (clamp(tx + span_x, 2, viewport_width - 2), ty),
+                                (tx, clamp(ty + span_y, 2, viewport_height - 2)),
+                                (tx, ty),
+                            ]
+                            if target_width >= 220 and target_height >= 120:
+                                sweep_points.extend([
+                                    (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
+                                    (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
+                                ])
+                        elif is_hover_text and target_width >= 110:
+                            half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
+                            sweep_points = [
+                                (clamp(tx - half_span, 2, viewport_width - 2), ty),
+                                (tx, ty),
+                                (clamp(tx + half_span, 2, viewport_width - 2), ty),
+                            ]
+                        else:
+                            sweep_points = [(tx, ty)]
 
-                    if hover_changed:
+                        try:
+                            for i, point in enumerate(sweep_points):
+                                cursor_pos = await move_mouse_human_like(
+                                    page=page, start=cursor_pos, end=point,
+                                    viewport_width=viewport_width, viewport_height=viewport_height,
+                                    duration_ms=(
+                                        random.randint(showcase_move_surface_min, showcase_move_surface_max) if is_surface_hover
+                                        else random.randint(showcase_move_text_min, showcase_move_text_max) if is_hover_text
+                                        else random.randint(220, 640)
+                                    ),
+                                )
+                                if is_surface_hover:
+                                    await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
+                                elif is_hover_text:
+                                    await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
+                                elif i == len(sweep_points) - 1:
+                                    await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                        except Exception as exc:
+                            if _is_nav_error(exc):
+                                await _recover_after_nav(page)
+                                visited_keys.add(target_key)
+                                visited_families.add(target_family)
+                                hovered_count += 1
+                                interacted_this_round = True
+                                continue
+
+                        hover_changed = True
                         await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+                    else:
+                        # ── Эффекта нет — не тратим время на sweep, идём дальше ──
+                        hover_changed = False
 
                 # ── Финализация: регистрируем цель как обработанную ──
                 visited_keys.add(target_key)
@@ -2674,8 +2718,21 @@ async def run_strict_top_to_bottom_pass(
             except Exception:
                 pass
 
+        # ── Проверка лимита секции (10 с на один экран) ──
+        section_elapsed_ms = (time.monotonic() - section_entered_at) * 1000
+        section_scrolled_far = (scroll_y - section_scroll_y_start) >= viewport_height * 0.7
+        if section_scrolled_far:
+            section_scroll_y_start = scroll_y
+            section_entered_at = time.monotonic()
+            section_elapsed_ms = 0
+        force_scroll_section_timeout = section_elapsed_ms >= section_max_ms
+
         should_scroll_now = True
-        if strict_interactions_per_scroll > 1 and interacted_this_round:
+        if force_scroll_section_timeout:
+            # Секция просрочена — принудительно скроллим дальше
+            should_scroll_now = True
+            rounds_since_scroll = 0
+        elif strict_interactions_per_scroll > 1 and interacted_this_round:
             rounds_since_scroll += 1
             if rounds_since_scroll < strict_interactions_per_scroll:
                 should_scroll_now = False
@@ -2683,6 +2740,20 @@ async def run_strict_top_to_bottom_pass(
                 rounds_since_scroll = 0
         else:
             rounds_since_scroll = 0
+
+        # ── Не скроллим, если в текущем viewport остались непосещённые hover-цели ──
+        if should_scroll_now and not force_scroll_section_timeout and analysis_targets:
+            viewport_top_check = scroll_y + int(viewport_height * 0.18)
+            viewport_bottom_check = scroll_y + int(viewport_height * 0.82)
+            remaining_hovers = [
+                item for item in analysis_targets
+                if (bool(item.get("isSurfaceHover", False)) or bool(item.get("isHoverText", False)))
+                and str(item.get("key", "")) not in visited_keys
+                and strict_target_family_key(item) not in visited_families
+                and viewport_top_check <= int(float(item.get("absY", 0))) <= viewport_bottom_check
+            ]
+            if remaining_hovers:
+                should_scroll_now = False
 
         if should_scroll_now:
             await perform_smooth_scroll(
@@ -2693,7 +2764,7 @@ async def run_strict_top_to_bottom_pass(
                 scroll_pause_max_ms=scroll_pause_max_ms,
             )
         else:
-            await page.wait_for_timeout(random.randint(max(40, scroll_pause_min_ms), max(80, scroll_pause_max_ms + 30)))
+            await page.wait_for_timeout(random.randint(max(20, int(scroll_pause_min_ms * 0.5)), max(50, int(scroll_pause_max_ms * 0.6))))
 
         try:
             after_metrics = await get_scroll_metrics(page)
@@ -3845,15 +3916,15 @@ async def run_smart_cursor(
                         for point in path_points:
                             cursor_pos = await move_mouse_human_like(
                                 page, cursor_pos, point,
-                                viewport_width, viewport_height, random.randint(90, 260),
+                                viewport_width, viewport_height, random.randint(60, 160),
                             )
-                            await page.wait_for_timeout(random.randint(max(60, int(hover_min_ms * 0.35)), max(100, int(hover_max_ms * 0.58))))
+                            await page.wait_for_timeout(random.randint(max(35, int(hover_min_ms * 0.25)), max(70, int(hover_max_ms * 0.40))))
                     else:
                         cursor_pos = await move_mouse_human_like(
                             page, cursor_pos, (tx, ty),
-                            viewport_width, viewport_height, random.randint(200, 600),
+                            viewport_width, viewport_height, random.randint(80, 250),
                         )
-                        await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                        await page.wait_for_timeout(random.randint(int(hover_min_ms * 0.6), int(hover_max_ms * 0.7)))
                     visited_keys.add(str(pick.get("key", "")))
                     hovered_count += 1
                 except Exception:
