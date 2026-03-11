@@ -2222,6 +2222,9 @@ async def run_strict_top_to_bottom_pass(
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
     # Когда достигнуто дно — ждём 5 секунд, пробуем скролл, и если нельзя — завершаем.
     bottom_confirm_wait_ms = 5000
+    # Минимальная гарантированная длительность записи (30% бюджета).
+    # Пока не прошло min_duration_ms — «дно» не завершает запись.
+    min_duration_ms = max(8000, int(soft_budget_ms * 0.30))
 
     last_scroll_y = -1
     stagnant_rounds = 0
@@ -2963,6 +2966,16 @@ async def run_strict_top_to_bottom_pass(
             bottom_stable_rounds = 0
 
         if bottom_stable_rounds >= bottom_stable_rounds_required:
+            elapsed_since_start_ms = (time.monotonic() - started_at) * 1000
+            if elapsed_since_start_ms < min_duration_ms:
+                # Слишком рано — страница ложно сообщает «дно». Продолжаем.
+                logger.info(
+                    f"🧭 Smart cursor: дно обнаружено, но прошло только "
+                    f"{int(elapsed_since_start_ms)}мс из минимума {int(min_duration_ms)}мс — игнорируем"
+                )
+                bottom_stable_rounds = 0
+                stagnant_rounds = 0
+                continue
             # Дно достигнуто — ждём 5 секунд, пробуем скроллить ещё раз.
             # Если не получается — завершаем запись.
             logger.info("🧭 Smart cursor: дно достигнуто, ждём 5с и проверяем...")
