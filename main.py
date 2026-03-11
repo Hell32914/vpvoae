@@ -1959,12 +1959,19 @@ async def collect_document_interaction_targets(
                 ].join(' ').toLowerCase();
                 const hint = `${cls} ${idPart} ${attrHint}`;
 
+                // Отсекаем чисто текстовые контейнеры (p, div, section без явных hover-подсказок)
+                const textOnlyTags = ['p', 'span', 'article', 'blockquote', 'li', 'ul', 'ol', 'figcaption', 'label'];
+                if (textOnlyTags.includes(tag)
+                    && !hint.match(/hover|cursor|interactive|parallax|card|slide|flip|tilt|zoom|magnif/)
+                    && (style.cursor || 'auto') === 'auto') {
+                    return false;
+                }
+
                 const looksLikeScene = (
                     tag === 'canvas'
                     || tag === 'video'
                     || tag === 'model-viewer'
-                    || tag === 'img'
-                    || /webgl|three|scene|hero|parallax|interactive|stage|viewer|model|experience|showcase|gallery|carousel|slider|swiper|tab|phone|device|mockup|preview|screen|app|demo|lightbox|review|testimonial|feedback|rating|quote|comment|opinion/.test(hint)
+                    || /webgl|three|scene|parallax|interactive|stage|viewer|model|experience|showcase|gallery|carousel|slider|swiper|phone|device|mockup|preview|lightbox/.test(hint)
                 );
 
                 const largeEnough = (
@@ -1980,8 +1987,10 @@ async def collect_document_interaction_targets(
                     || cursorKind === 'move'
                 );
 
+                // Требуем ЯВНЫЕ признаки интерактивности: transition/animation + cursor ИЛИ scene-маркер
+                const hasStrong = hasMotionSignals(style) && cursorInteractive;
                 return (looksLikeScene && rect.width >= 80 && rect.height >= 50)
-                    || (largeEnough && (hasMotionSignals(style) || cursorInteractive));
+                    || (largeEnough && hasStrong);
             }
 
             function isHoverEffectTextCandidate(el, tag, textNoWs, rect, style) {
@@ -1999,20 +2008,21 @@ async def collect_document_interaction_targets(
 
                 const hasMotionStyle = hasMotionSignals(style);
 
+                // Явные маркеры hover-текста (split-text анимации, per-char эффекты)
+                const hasExplicitHoverHint = (
+                    hint.includes('hover')
+                    || hint.includes('char')
+                    || hint.includes('letter')
+                    || hint.includes('glyph')
+                    || hint.includes('split')
+                    || hint.includes('scramble')
+                    || hint.includes('magnetic')
+                );
+
                 const looksMicroText = (
                     ['span', 'em', 'strong', 'i', 'b', 'a'].includes(tag)
                     && textNoWs.length <= 10
                     && rect.width <= 320
-                );
-
-                const looksHeadingText = (
-                    /^h[1-6]$/.test(tag)
-                    || hint.includes('title')
-                    || hint.includes('headline')
-                    || hint.includes('hero')
-                    || hint.includes('char')
-                    || hint.includes('letter')
-                    || hint.includes('glyph')
                 );
 
                 const likelyHoverZone = (
@@ -2022,10 +2032,22 @@ async def collect_document_interaction_targets(
                     && rect.height <= viewportHeight * 0.5
                 );
 
-                if (!looksMicroText && !looksHeadingText) return false;
                 if (!likelyHoverZone) return false;
 
-                return hasMotionStyle || style.cursor === 'pointer' || looksHeadingText;
+                // Headings: только если есть motion-style ИЛИ явный hover-хинт
+                if (/^h[1-6]$/.test(tag)) {
+                    return hasMotionStyle || hasExplicitHoverHint;
+                }
+
+                // Микро-текст (ссылки, span): требуем и motion, и cursor=pointer
+                if (looksMicroText) {
+                    return hasMotionStyle && style.cursor === 'pointer';
+                }
+
+                // Явный hover-хинт в атрибутах → доверяем
+                if (hasExplicitHoverHint && hasMotionStyle) return true;
+
+                return false;
             }
 
             // Дополнительный grid-scan для сайтов без семантических DOM-меток.
@@ -2220,8 +2242,6 @@ async def run_strict_top_to_bottom_pass(
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
-    # Когда достигнуто дно — ждём 5 секунд, пробуем скролл, и если нельзя — завершаем.
-    bottom_confirm_wait_ms = 5000
     # Минимальная гарантированная длительность записи (30% бюджета).
     # Пока не прошло min_duration_ms — «дно» не завершает запись.
     min_duration_ms = max(8000, int(soft_budget_ms * 0.30))
@@ -2731,49 +2751,25 @@ async def run_strict_top_to_bottom_pass(
                 # page_state_changed() не ловит чисто CSS :hover эффекты.
                 # ════════════════════════════════════════════════════════
                 if not click_changed and (is_surface_hover or is_hover_text):
-                    sweep_points: List[Tuple[float, float]] = []
-                    if is_surface_hover and (target_width >= 120 or target_height >= 90):
-                        span_x = min(max(target_width * 0.26, 28.0), viewport_width * 0.24)
-                        span_y = min(max(target_height * 0.20, 22.0), viewport_height * 0.20)
-                        sweep_points = [
-                            (clamp(tx - span_x, 2, viewport_width - 2), ty),
-                            (tx, clamp(ty - span_y, 2, viewport_height - 2)),
-                            (clamp(tx + span_x, 2, viewport_width - 2), ty),
-                            (tx, clamp(ty + span_y, 2, viewport_height - 2)),
-                            (tx, ty),
-                        ]
-                        if target_width >= 220 and target_height >= 120:
-                            sweep_points.extend([
-                                (clamp(tx - span_x * 0.66, 2, viewport_width - 2), clamp(ty - span_y * 0.66, 2, viewport_height - 2)),
-                                (clamp(tx + span_x * 0.66, 2, viewport_width - 2), clamp(ty + span_y * 0.66, 2, viewport_height - 2)),
-                            ])
-                    elif is_hover_text and target_width >= 110:
-                        half_span = min(max(target_width * 0.24, 20.0), viewport_width * 0.20)
-                        sweep_points = [
-                            (clamp(tx - half_span, 2, viewport_width - 2), ty),
-                            (tx, ty),
-                            (clamp(tx + half_span, 2, viewport_width - 2), ty),
-                        ]
-                    else:
-                        sweep_points = [(tx, ty)]
+                    # Лёгкий свайп: курсор плавно проходит через элемент
+                    # (1 движение — из точки входа через центр к краю), без крестов.
+                    swipe_offset_x = min(max(target_width * 0.22, 18.0), viewport_width * 0.15)
+                    swipe_start = (clamp(tx - swipe_offset_x, 2, viewport_width - 2), ty)
+                    swipe_end = (clamp(tx + swipe_offset_x, 2, viewport_width - 2), ty)
 
                     try:
-                        for i, point in enumerate(sweep_points):
-                            cursor_pos = await move_mouse_human_like(
-                                page=page, start=cursor_pos, end=point,
-                                viewport_width=viewport_width, viewport_height=viewport_height,
-                                duration_ms=(
-                                    random.randint(showcase_move_surface_min, showcase_move_surface_max) if is_surface_hover
-                                    else random.randint(showcase_move_text_min, showcase_move_text_max) if is_hover_text
-                                    else random.randint(220, 640)
-                                ),
-                            )
-                            if is_surface_hover:
-                                await page.wait_for_timeout(random.randint(surface_hover_min, surface_hover_max))
-                            elif is_hover_text:
-                                await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
-                            elif i == len(sweep_points) - 1:
-                                await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+                        cursor_pos = await move_mouse_human_like(
+                            page=page, start=cursor_pos, end=swipe_start,
+                            viewport_width=viewport_width, viewport_height=viewport_height,
+                            duration_ms=random.randint(search_move_min, search_move_max),
+                        )
+                        await page.wait_for_timeout(random.randint(30, 80))
+                        cursor_pos = await move_mouse_human_like(
+                            page=page, start=cursor_pos, end=swipe_end,
+                            viewport_width=viewport_width, viewport_height=viewport_height,
+                            duration_ms=random.randint(180, 360),
+                        )
+                        await page.wait_for_timeout(random.randint(micro_hover_min, micro_hover_max))
                     except Exception as exc:
                         if _is_nav_error(exc):
                             await _recover_after_nav(page)
@@ -2793,7 +2789,7 @@ async def run_strict_top_to_bottom_pass(
                         hover_changed = False
 
                     if hover_changed:
-                        await page.wait_for_timeout(random.randint(hover_showcase_min, hover_showcase_max))
+                        await page.wait_for_timeout(random.randint(200, 450))
 
                 # ── Финализация: регистрируем цель как обработанную ──
                 visited_keys.add(target_key)
@@ -2976,40 +2972,51 @@ async def run_strict_top_to_bottom_pass(
                 bottom_stable_rounds = 0
                 stagnant_rounds = 0
                 continue
-            # Дно достигнуто — ждём 5 секунд, пробуем скроллить ещё раз.
-            # Если не получается — завершаем запись.
-            logger.info("🧭 Smart cursor: дно достигнуто, ждём 5с и проверяем...")
-            await page.wait_for_timeout(bottom_confirm_wait_ms)
-            # Пробуем scroll + force_scroll
+
+            # Дополнительная проверка: сравниваем scrollY + viewportHeight с реальной
+            # высотой документа. Если мы НЕ достигли конца документа — отменяем.
+            try:
+                _doc_height = await page.evaluate(
+                    "Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0)"
+                )
+                _visible_end = current_scroll_y + viewport_height
+                _gap = int(_doc_height) - _visible_end
+                if _gap > viewport_height * 0.15:
+                    logger.info(
+                        f"🧭 Smart cursor: atBottom=true, но до конца документа ещё "
+                        f"{_gap}px (docH={int(_doc_height)}, visEnd={_visible_end}) — продолжаем"
+                    )
+                    bottom_stable_rounds = 0
+                    stagnant_rounds = 0
+                    # Принудительно скроллим вниз
+                    await force_scroll_progress(page, viewport_height)
+                    continue
+            except Exception as _dh_exc:
+                if _is_nav_error(_dh_exc):
+                    await _recover_after_nav(page)
+                    continue
+
+            # Пробуем скроллить ещё раз (без 5с ожидания).
             _pre_check_scroll = current_scroll_y
             try:
-                await perform_smooth_scroll(
-                    page=page,
-                    viewport_height=viewport_height,
-                    scroll_speed_factor=max(scroll_speed_factor, 1.5),
-                    scroll_pause_min_ms=scroll_pause_min_ms,
-                    scroll_pause_max_ms=scroll_pause_max_ms,
-                )
                 await force_scroll_progress(page, viewport_height)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(random.randint(400, 800))
                 _recheck_metrics = await get_scroll_metrics(page)
                 _recheck_scroll = int(_recheck_metrics.get("scrollY", _pre_check_scroll))
-                _recheck_at_bottom = bool(_recheck_metrics.get("atBottom", True))
             except Exception:
                 _recheck_scroll = _pre_check_scroll
-                _recheck_at_bottom = True
-            if _recheck_scroll <= _pre_check_scroll + 10 or _recheck_at_bottom:
-                # Не можем двигаться дальше — завершаем
-                logger.info("🧭 Smart cursor: после 5с ожидания скролл невозможен — завершаем запись")
-                reached_bottom = True
-                break
-            else:
+            if _recheck_scroll > _pre_check_scroll + 10:
                 # Контент подгрузился (lazy load) — продолжаем
                 logger.info(f"🧭 Smart cursor: контент подгрузился (scroll {_pre_check_scroll} → {_recheck_scroll}), продолжаем")
                 bottom_stable_rounds = 0
                 last_scroll_y = _recheck_scroll
                 scroll_y = _recheck_scroll
                 last_progress_at = time.monotonic()
+            else:
+                # Реально дно — завершаем
+                logger.info("🧭 Smart cursor: дно подтверждено (docHeight совпадает, скролл невозможен) — завершаем")
+                reached_bottom = True
+                break
 
     if require_bottom and not reached_bottom:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -4318,21 +4325,20 @@ async def run_smart_cursor(
                 is_surface_hover = bool(target.get("isSurfaceHover", False))
                 try:
                     if is_surface_hover and (target_width >= 120 or target_height >= 90):
-                        span_x = min(max(target_width * 0.23, 24.0), viewport_width * 0.24)
-                        span_y = min(max(target_height * 0.19, 20.0), viewport_height * 0.20)
-                        sweep = [
-                            (clamp(tx - span_x, 1, viewport_width - 1), ty),
-                            (tx, clamp(ty - span_y, 1, viewport_height - 1)),
-                            (clamp(tx + span_x, 1, viewport_width - 1), ty),
-                            (tx, clamp(ty + span_y, 1, viewport_height - 1)),
-                            (tx, ty),
-                        ]
-                        for point in sweep:
-                            cursor_pos = await move_mouse_human_like(
-                                page, cursor_pos, point,
-                                viewport_width, viewport_height, random.randint(90, 280),
-                            )
-                            await page.wait_for_timeout(random.randint(max(65, int(hover_min_ms * 0.34)), max(110, int(hover_max_ms * 0.62))))
+                        # Лёгкий свайп вместо крестообразного прохода
+                        swipe_ox = min(max(target_width * 0.22, 18.0), viewport_width * 0.15)
+                        sp_start = (clamp(tx - swipe_ox, 1, viewport_width - 1), ty)
+                        sp_end = (clamp(tx + swipe_ox, 1, viewport_width - 1), ty)
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos, sp_start,
+                            viewport_width, viewport_height, random.randint(60, 150),
+                        )
+                        await page.wait_for_timeout(random.randint(30, 70))
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos, sp_end,
+                            viewport_width, viewport_height, random.randint(150, 320),
+                        )
+                        await page.wait_for_timeout(random.randint(max(40, int(hover_min_ms * 0.30)), max(90, int(hover_max_ms * 0.50))))
                     else:
                         cursor_pos = await move_mouse_human_like(
                             page, cursor_pos, (tx, ty),
