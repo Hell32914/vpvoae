@@ -1410,6 +1410,25 @@ def interaction_text(target: Dict[str, Any]) -> str:
     return " ".join("".join(ch if ch.isalnum() else " " for ch in text_raw).split())
 
 
+def nav_blacklist_key(target: Dict[str, Any]) -> str:
+    """Ключ для чёрного списка навигации — объединяет похожие элементы независимо от позиции.
+
+    Если кнопка с текстом 'Read More' вызвала навигацию, ВСЕ кнопки 'Read More'
+    на странице будут пропущены. Работает по tag+text+href паттерну.
+    """
+    tag = str(target.get("tag", "")).strip().lower()
+    text = interaction_text(target)[:24]
+    href = str(target.get("href", "")).strip().lower().split("?")[0][:36]
+    return f"NAV|{tag}|{text}|{href}"
+
+
+def is_nav_blacklisted(target: Dict[str, Any], blacklist: Optional[Set[str]]) -> bool:
+    """Проверяет, находится ли элемент в чёрном списке навигации."""
+    if not blacklist:
+        return False
+    return nav_blacklist_key(target) in blacklist
+
+
 def is_probable_repeatable_control(target: Dict[str, Any]) -> bool:
     """Определяет локальные контролы, которые разумно нажимать несколько раз подряд."""
     text = interaction_text(target)
@@ -1716,6 +1735,7 @@ async def perform_followup_click_sequence(
     round_index: int = 0,
     scroll_y: float = 0.0,
     allowed_url: Optional[str] = None,
+    nav_blacklist: Optional[Set[str]] = None,
 ) -> Tuple[Tuple[float, float], int]:
     """Пробует цепочку соседних кликов для локальных step-by-step интерактивов."""
     if max_followup_steps <= 0:
@@ -1775,6 +1795,8 @@ async def perform_followup_click_sequence(
                 continue
 
             if not is_safe_inpage_click_target(item, current_url, allow_internal_nav_click, allowed_url=allowed_url):
+                continue
+            if is_nav_blacklisted(item, nav_blacklist):
                 continue
 
             ix = clamp(_to_float(item.get("x"), current_x), 2, viewport_width - 2)
@@ -1870,6 +1892,11 @@ async def perform_followup_click_sequence(
         navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
 
         if navigated_offsite and allowed_url:
+            # Добавляем в чёрный список навигации
+            if nav_blacklist is not None:
+                _bl_key = nav_blacklist_key(follow_target)
+                nav_blacklist.add(_bl_key)
+                logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (внешний переход из followup)")
             await ensure_page_within_allowed_site(
                 page,
                 allowed_url,
@@ -1880,6 +1907,10 @@ async def perform_followup_click_sequence(
             break
 
         if navigated_internally and not allow_internal_nav_click:
+            if nav_blacklist is not None:
+                _bl_key = nav_blacklist_key(follow_target)
+                nav_blacklist.add(_bl_key)
+                logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (внутренний переход из followup)")
             await restore_page_location(
                 page,
                 before_url,
@@ -2657,16 +2688,16 @@ async def run_header_hover_pass(
     if not header_targets:
         return cursor_pos, 0
 
-    # Ограничиваем: максимум 3 элемента, быстрый свип чтобы не занимать начало записи
-    header_targets = header_targets[:3]
-    logger.info(f"🧭 Header hover pass: {len(header_targets)} элементов в зоне хедера (быстрый свип)")
+    # Показываем до 8 элементов хедера: ховеры навигации важны для записи
+    header_targets = header_targets[:8]
+    logger.info(f"🧭 Header hover pass: {len(header_targets)} элементов в зоне хедера")
 
     for item in header_targets:
         tx = clamp(float(item.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
         ty = clamp(float(item.get("y", viewport_height * 0.06)), 2, viewport_height - 2)
-        # Очень быстрое движение + микро-дwell: достаточно чтобы CSS :hover триггернулся на видео
-        transit_ms = random.randint(25, 55)
-        dwell_ms = random.randint(40, 90)
+        # Быстрое движение + достаточный dwell чтобы CSS :hover триггернулся на видео
+        transit_ms = random.randint(18, 40)
+        dwell_ms = random.randint(80, 180)
         try:
             cursor_pos = await move_mouse_human_like(
                 page, cursor_pos, (tx, ty),
@@ -2761,6 +2792,7 @@ async def run_strict_top_to_bottom_pass(
     site_url: str,
     strict_interactions_per_scroll: int,
     stall_timeout_ms: int,
+    nav_blacklist: Optional[Set[str]] = None,
 ) -> Tuple[Tuple[float, float], int, bool]:
     """Однонаправленный проход сверху вниз: приоритет hover-эффектам, без переходов на другие страницы."""
     hovered_count = 0
@@ -2815,6 +2847,32 @@ async def run_strict_top_to_bottom_pass(
     except Exception:
         pass
 
+    # ── Pre-scroll для прогрева lazy-load контента ──
+    # Быстро прокручиваем страницу вниз/вверх программно (без курсора),
+    # чтобы все ленивые изображения, видео и анимации загрузились до начала записи.
+    logger.info("🔄 Pre-scroll: прогреваем lazy-load контент...")
+    try:
+        _prescroll_steps = 8
+        for _ps_i in range(_prescroll_steps):
+            await page.evaluate(
+                """(step) => {
+                    const vh = window.innerHeight || 800;
+                    window.scrollBy({ top: vh * 0.85, left: 0, behavior: 'auto' });
+                }""",
+                _ps_i,
+            )
+            await page.wait_for_timeout(random.randint(150, 300))
+        # Возвращаемся наверх
+        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+        await page.wait_for_timeout(random.randint(200, 400))
+        logger.info("✅ Pre-scroll завершён")
+    except Exception as _prescroll_exc:
+        logger.warning(f"⚠️ Pre-scroll ошибка: {_prescroll_exc}")
+        try:
+            await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+        except Exception:
+            pass
+
     # ── CSS pre-scan: строим полную карту hover/pointer элементов до начала движения ──
     # Это позволяет курсору знать заранее куда двигаться, не теряя время на «разведку».
     logger.info("🔍 CSS pre-scan: анализируем hover/transition/pointer элементы страницы...")
@@ -2841,32 +2899,33 @@ async def run_strict_top_to_bottom_pass(
 
     last_analysis_round = -1000
     # ── Быстрые тайминги для «поисковой» фазы (курсор летит к цели) ──
-    # Транзитная скорость в 3-4x быстрее человеческой: курсор "прилетает" к цели,
+    # Транзитная скорость в 4-6x быстрее человеческой: курсор "прилетает" к цели,
     # а не медленно плывёт, чтобы не терять время на переходы между элементами.
-    search_move_min = 18
-    search_move_max = 55
-    search_dwell_min = 10
-    search_dwell_max = 30
+    search_move_min = 8
+    search_move_max = 22
+    search_dwell_min = 5
+    search_dwell_max = 15
     # ── Тайминги для «витрины»: когда эффект обнаружен — показываем по-человечески ──
-    micro_hover_min = max(40, int(hover_min_ms * 0.35))
-    micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
-    surface_hover_min = max(micro_hover_min + 30, int(hover_min_ms * 0.42))
-    surface_hover_max = max(surface_hover_min + 35, int(hover_max_ms * 0.75))
-    hover_showcase_min = max(240, int(hover_min_ms * 0.95))
-    hover_showcase_max = max(hover_showcase_min + 90, int(hover_max_ms * 1.20))
+    micro_hover_min = max(35, int(hover_min_ms * 0.30))
+    micro_hover_max = max(micro_hover_min + 15, int(hover_max_ms * 0.45))
+    surface_hover_min = max(micro_hover_min + 20, int(hover_min_ms * 0.35))
+    surface_hover_max = max(surface_hover_min + 25, int(hover_max_ms * 0.60))
+    hover_showcase_min = max(180, int(hover_min_ms * 0.75))
+    hover_showcase_max = max(hover_showcase_min + 60, int(hover_max_ms * 0.95))
     # ── Витринные (замедленные) move durations при показе найденного эффекта ──
-    showcase_move_surface_min = 140
-    showcase_move_surface_max = 340
-    showcase_move_text_min = 180
-    showcase_move_text_max = 480
+    showcase_move_surface_min = 100
+    showcase_move_surface_max = 260
+    showcase_move_text_min = 130
+    showcase_move_text_max = 360
     strict_interactions_per_scroll = max(1, min(int(strict_interactions_per_scroll), 4))
     stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
     rounds_since_scroll = 0
     no_progress_rounds = 0
     interaction_pause_rounds = 0
     last_progress_at = time.monotonic()
-    # ── Трекер секции: не более 10 секунд на один экран ──
-    section_max_ms = 10000
+    # ── Трекер секции: не более 5 секунд на один экран ──
+    # При типичном лендинге (10-15 экранов) это даёт ~50-75с — укладываемся в ~1 минуту.
+    section_max_ms = 5000
     section_scroll_y_start = 0
     section_entered_at = time.monotonic()
 
@@ -3015,6 +3074,9 @@ async def run_strict_top_to_bottom_pass(
                 item_family = strict_target_family_key(item)
                 if item_family in visited_families:
                     continue
+                # ── Проверка чёрного списка навигации: элементы, которые раньше вызвали переход ──
+                if is_nav_blacklisted(item, nav_blacklist):
+                    continue
 
                 item_x = float(item.get("x", viewport_width * 0.5))
                 item_view_y = clamp(item_abs_y - scroll_y, 2, viewport_height - 2)
@@ -3106,15 +3168,16 @@ async def run_strict_top_to_bottom_pass(
 
                 # Приоритет: hover-элементы выше click-элементов.
                 # Click-кандидаты только когда нет hover-целей.
-                # band_px=90 обеспечивает строгий порядок слева→направо в пределах одной строки экрана.
+                # band_px=70 обеспечивает строгий порядок слева→направо в пределах одной строки экрана.
+                # Меньший band = более предсказуемое чтение L→R перед переходом на следующую «строку».
                 if surface_hover_candidates:
-                    pool = shortlist_progress_targets(surface_hover_candidates, band_px=90.0, limit=min(6, len(surface_hover_candidates)))
+                    pool = shortlist_progress_targets(surface_hover_candidates, band_px=70.0, limit=min(6, len(surface_hover_candidates)))
                 elif hover_text_candidates:
-                    pool = shortlist_progress_targets(hover_text_candidates, band_px=90.0, limit=min(6, len(hover_text_candidates)))
+                    pool = shortlist_progress_targets(hover_text_candidates, band_px=70.0, limit=min(6, len(hover_text_candidates)))
                 elif any_hover_candidates:
-                    pool = shortlist_progress_targets(any_hover_candidates, band_px=100.0, limit=min(6, len(any_hover_candidates)))
+                    pool = shortlist_progress_targets(any_hover_candidates, band_px=80.0, limit=min(6, len(any_hover_candidates)))
                 elif inpage_click_enabled and priority_click_candidates:
-                    pool = shortlist_progress_targets(priority_click_candidates, band_px=90.0, limit=min(6, len(priority_click_candidates)))
+                    pool = shortlist_progress_targets(priority_click_candidates, band_px=70.0, limit=min(6, len(priority_click_candidates)))
                 else:
                     pool = None
 
@@ -3264,6 +3327,11 @@ async def run_strict_top_to_bottom_pass(
                         logger.warning(
                             f"⛔ Smart cursor: уход с исходной страницы ({after_path} ≠ {pass_origin_path}), возвращаемся"
                         )
+                        # Добавляем в чёрный список навигации
+                        if nav_blacklist is not None:
+                            _bl_key = nav_blacklist_key(target)
+                            nav_blacklist.add(_bl_key)
+                            logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (уход с исходной страницы)")
                         await restore_page_location(page, pass_origin_url, restore_scroll_y=before_scroll, timeout=15000)
                         visited_keys.add(target_key)
                         visited_families.add(target_family)
@@ -3279,6 +3347,10 @@ async def run_strict_top_to_bottom_pass(
                         continue
                     elif navigated_internally and not allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: пойман внутренний переход, откатываемся")
+                        if nav_blacklist is not None:
+                            _bl_key = nav_blacklist_key(target)
+                            nav_blacklist.add(_bl_key)
+                            logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (внутренний переход)")
                         await restore_page_location(page, pass_origin_url, restore_scroll_y=before_scroll, timeout=15000)
                         visited_keys.add(target_key)
                         visited_families.add(target_family)
@@ -3319,6 +3391,8 @@ async def run_strict_top_to_bottom_pass(
                                 continue
                             if ni_family in clicked_families or ni_family in visited_families:
                                 continue
+                            if is_nav_blacklisted(new_item, nav_blacklist):
+                                continue
                             ni_x = clamp(_to_float(new_item.get("x"), tx), 2, viewport_width - 2)
                             ni_y = clamp(_to_float(new_item.get("y"), ty), 2, viewport_height - 2)
                             dist = math.hypot(ni_x - tx, ni_y - ty)
@@ -3358,12 +3432,20 @@ async def run_strict_top_to_bottom_pass(
                             # Проверяем, не ушли ли мы на внешний/внутренний URL.
                             ni_after_url = str(page.url or "")
                             if ni_after_url and not is_same_site_url(ni_after_url, site_url):
+                                if nav_blacklist is not None:
+                                    _bl_key = nav_blacklist_key(new_item)
+                                    nav_blacklist.add(_bl_key)
+                                    logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (внешний deep-click)")
                                 await ensure_page_within_allowed_site(
                                     page, site_url, fallback_url=before_url,
                                     fallback_scroll_y=before_scroll, timeout=12000,
                                 )
                                 break
                             if ni_after_url != before_url and is_navigation_like_href(ni_after_url, before_url) and not allow_internal_nav_click:
+                                if nav_blacklist is not None:
+                                    _bl_key = nav_blacklist_key(new_item)
+                                    nav_blacklist.add(_bl_key)
+                                    logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (внутренний deep-click)")
                                 await restore_page_location(page, before_url, restore_scroll_y=before_scroll, timeout=12000)
                                 break
 
@@ -3400,6 +3482,7 @@ async def run_strict_top_to_bottom_pass(
                                 recent_interactions=recent_interactions,
                                 round_index=round_index, scroll_y=float(scroll_y),
                                 allowed_url=site_url,
+                                nav_blacklist=nav_blacklist,
                             )
                             followup_total += seq_count
 
@@ -4045,6 +4128,7 @@ async def visit_top_navigation_tabs(
     strict_interactions_per_scroll: int = 2,
     stall_timeout_ms: int = 10000,
     nav_budget_ms: int = 90000,
+    nav_blacklist: Optional[Set[str]] = None,
 ) -> Tuple[Tuple[float, float], int]:
     """Проходит по вкладкам верхней навигации последовательно с hover-эффектами на каждой странице."""
     visited_count = 0
@@ -4252,6 +4336,7 @@ async def visit_top_navigation_tabs(
                     site_url=allowed_url,
                     strict_interactions_per_scroll=strict_interactions_per_scroll,
                     stall_timeout_ms=stall_timeout_ms,
+                    nav_blacklist=nav_blacklist,
                 )
             except Exception as exc:
                 if _is_nav_error(exc):
@@ -4491,6 +4576,7 @@ async def run_smart_cursor(
     hovered_count = 0
     recent_points: List[Tuple[float, float]] = []
     clicked_nav_keys: Set[str] = set()
+    nav_blacklist: Set[str] = set()
 
     hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.60), 0.15, 1.0)
     click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.46), 0.10, 1.0)
@@ -4546,12 +4632,16 @@ async def run_smart_cursor(
 
         # ── Ожидание готовности контента: убеждаемся, что страница загрузила достаточно элементов ──
         # Также ждём исчезновения прелоадера/сплэш-экрана (если есть).
+        # Агрессивная стратегия: быстрый опрос (500мс) + попытки dismiss прелоадера.
         content_wait_start = time.monotonic()
-        content_wait_max_ms = int(os.getenv("PRELOAD_WAIT_MS", "20000"))
-        content_wait_max_ms = max(8000, min(content_wait_max_ms, 120000))
+        content_wait_max_ms = int(os.getenv("PRELOAD_WAIT_MS", "10000"))
+        content_wait_max_ms = max(4000, min(content_wait_max_ms, 60000))
         content_min_targets = 3
         _preloader_seen = False
+        _dismiss_attempted = False
+        _preloader_poll_count = 0
         while (time.monotonic() - content_wait_start) * 1000 < content_wait_max_ms:
+            _preloader_poll_count += 1
             try:
                 _probe_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 50)
             except Exception:
@@ -4572,9 +4662,41 @@ async def run_smart_cursor(
                 if _preloader_seen:
                     logger.info("✅ Smart cursor: прелоадер исчез, контент загружен")
                 break
+
+            # После 2с ожидания — пытаемся dismiss прелоадер кликом/клавишами
             elapsed_wait = int((time.monotonic() - content_wait_start) * 1000)
-            logger.info(f"🧭 Smart cursor: ожидание загрузки контента ({len(_probe_targets)} элементов, {elapsed_wait}ms)...")
-            await page.wait_for_timeout(1500)
+            if elapsed_wait >= 2000 and not _dismiss_attempted:
+                _dismiss_attempted = True
+                logger.info("🧭 Smart cursor: пытаемся dismiss прелоадер (click + keys)...")
+                try:
+                    # Кликаем по центру экрана
+                    _cx = viewport_width * 0.5
+                    _cy = viewport_height * 0.5
+                    await page.mouse.click(_cx, _cy, delay=random.randint(20, 60))
+                    await page.wait_for_timeout(200)
+                except Exception:
+                    pass
+                # Пробуем клавиши для dismiss splash
+                for _key in ["Escape", "Enter", "Space"]:
+                    try:
+                        await page.keyboard.press(_key)
+                        await page.wait_for_timeout(100)
+                    except Exception:
+                        pass
+                # Пробуем кликнуть entry-элементы
+                try:
+                    cursor_pos, _entry_ok, _entry_key = await try_click_entry_element(
+                        page, cursor_pos, viewport_width, viewport_height, clicked_entry_keys,
+                    )
+                    if _entry_ok and _entry_key:
+                        clicked_entry_keys.add(_entry_key)
+                        logger.info("✅ Smart cursor: dismiss прелоадера через entry-клик")
+                except Exception:
+                    pass
+
+            if elapsed_wait % 2000 < 600:
+                logger.info(f"🧭 Smart cursor: ожидание загрузки контента ({len(_probe_targets)} элементов, {elapsed_wait}ms)...")
+            await page.wait_for_timeout(500)
 
         strict_total_budget_ms = max(8000, int(total_time_ms))
         strict_main_budget_ms = strict_total_budget_ms
@@ -4608,6 +4730,7 @@ async def run_smart_cursor(
             site_url=site_url,
             strict_interactions_per_scroll=strict_interactions_per_scroll,
             stall_timeout_ms=strict_stall_timeout_ms,
+            nav_blacklist=nav_blacklist,
         )
         hovered_count += strict_hovered
         if reached_bottom:
@@ -4664,6 +4787,7 @@ async def run_smart_cursor(
                             strict_interactions_per_scroll=strict_interactions_per_scroll,
                             stall_timeout_ms=strict_stall_timeout_ms,
                             nav_budget_ms=nav_budget_ms,
+                            nav_blacklist=nav_blacklist,
                         )
                         if visited_nav_count > 0:
                             logger.info(f"🧭 Smart cursor: пройдено вкладок с hover-эффектами: {visited_nav_count}")
@@ -5093,6 +5217,7 @@ async def run_smart_cursor(
                     inpage_click_enabled
                     and target_key not in clicked_inpage_keys
                     and target_family not in clicked_inpage_families
+                    and not is_nav_blacklisted(target, nav_blacklist)
                     and is_safe_inpage_click_target(target, current_url, allow_internal_nav_click, allowed_url=site_url)
                     and is_target_clearly_visible(
                         target,
@@ -5150,6 +5275,7 @@ async def run_smart_cursor(
                         widget_action_words=widget_action_words,
                         visited_keys=visited_keys,
                         allowed_url=site_url,
+                        nav_blacklist=nav_blacklist,
                     )
                     if hover_followup_count > 0:
                         logger.info(
@@ -5182,6 +5308,10 @@ async def run_smart_cursor(
                     navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
                     if navigated_offsite:
                         logger.warning("⛔ Smart cursor: phase-3 поймал внешний переход, возвращаемся назад")
+                        if nav_blacklist is not None:
+                            _bl_key = nav_blacklist_key(target)
+                            nav_blacklist.add(_bl_key)
+                            logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (phase-3 внешний)")
                         await ensure_page_within_allowed_site(
                             page,
                             site_url,
@@ -5190,6 +5320,10 @@ async def run_smart_cursor(
                         )
                     elif navigated_internally and not allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: обнаружен внутренний переход, откатываемся назад")
+                        if nav_blacklist is not None:
+                            _bl_key = nav_blacklist_key(target)
+                            nav_blacklist.add(_bl_key)
+                            logger.info(f"🚫 Nav blacklist: добавлен '{_bl_key}' (phase-3 внутренний)")
                         await restore_page_location(
                             page,
                             before_url,
@@ -5222,6 +5356,7 @@ async def run_smart_cursor(
                                 widget_action_words=widget_action_words,
                                 visited_keys=visited_keys,
                                 allowed_url=site_url,
+                                nav_blacklist=nav_blacklist,
                             )
                             if followup_count > 0:
                                 logger.info(
@@ -5327,7 +5462,7 @@ async def main():
         target_url = os.getenv('TARGET_URL', 'https://www.gsproductions.co.za/')
         viewport_width = int(os.getenv('VIEWPORT_WIDTH', '1920'))
         viewport_height = int(os.getenv('VIEWPORT_HEIGHT', '1080'))
-        render_timeout = int(os.getenv('RENDER_TIMEOUT', '5000'))
+        render_timeout = int(os.getenv('RENDER_TIMEOUT', '2000'))
         load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
         smart_cursor_enabled = env_bool('SMART_CURSOR_ENABLED', True)
         smart_cursor_timeout = int(os.getenv('SMART_CURSOR_TIMEOUT', '360000'))
