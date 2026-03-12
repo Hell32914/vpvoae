@@ -53,6 +53,18 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
 
 
+def _url_page_path(url: str) -> str:
+    """Возвращает нормализованный path URL без trailing-slash и фрагментов.
+    Используется для сравнения «мы на той же странице».
+    """
+    try:
+        parts = urlparse(url)
+        path = (parts.path or "/").rstrip("/") or "/"
+        return path
+    except Exception:
+        return "/"
+
+
 def normalized_site_host(url: str) -> str:
     try:
         host = (urlparse(url).hostname or "").strip().lower().strip(".")
@@ -2770,7 +2782,8 @@ async def run_strict_top_to_bottom_pass(
     hover_click_words = (
         "click", "tap", "press", "here", "open", "show", "reveal",
         "start", "play", "go", "next", "more", "toggle", "menu",
-        "try", "view", "explore", "activate", "continue", "enter",
+        # "try" убрано — слишком часто триггерит CTA «TRY FOR FREE»
+        "view", "explore", "activate", "continue", "enter",
     )
 
     try:
@@ -2785,6 +2798,12 @@ async def run_strict_top_to_bottom_pass(
     # Минимальная гарантированная длительность записи (30% бюджета).
     # Пока не прошло min_duration_ms — «дно» не завершает запись.
     min_duration_ms = max(8000, int(soft_budget_ms * 0.30))
+
+    # ── Universal origin guard: запоминаем URL с которого начали pass ──
+    # После ЛЮБОГО клика, если path изменился — немедленно возвращаемся на origin.
+    # Это защищает от случайных переходов по CTA независимо от allow_internal_nav_click.
+    pass_origin_url = str(page.url or site_url)
+    pass_origin_path = _url_page_path(pass_origin_url)
 
     last_scroll_y = -1
     stagnant_rounds = 0
@@ -2863,12 +2882,23 @@ async def run_strict_top_to_bottom_pass(
         if interaction_pause_rounds > 0:
             interaction_pause_rounds -= 1
 
-        await ensure_page_within_allowed_site(
-            page,
-            site_url,
-            fallback_url=site_url,
-            timeout=15000,
-        )
+        # ── Universal origin guard: если при любой причине мы сдвинулись с исходной страницы — возвращаемся ──
+        _current_loop_url = str(page.url or "")
+        _current_loop_path = _url_page_path(_current_loop_url)
+        if _current_loop_url and _current_loop_path != pass_origin_path:
+            if not is_same_site_url(_current_loop_url, pass_origin_url):
+                logger.warning(f"⛔ Origin guard: внешний домен {_current_loop_url}, возвращаемся на {pass_origin_url}")
+                await restore_page_location(page, pass_origin_url, timeout=15000)
+            else:
+                logger.warning(f"⛔ Origin guard: path сдвинулся ({_current_loop_path} ≠ {pass_origin_path}), возвращаемся")
+                await restore_page_location(page, pass_origin_url, timeout=15000)
+        else:
+            await ensure_page_within_allowed_site(
+                page,
+                site_url,
+                fallback_url=pass_origin_url,
+                timeout=15000,
+            )
 
         if round_index == 1 or (round_index - last_analysis_round) >= 8:
             try:
@@ -2878,10 +2908,32 @@ async def run_strict_top_to_bottom_pass(
                     viewport_height=viewport_height,
                     limit=1200,
                 )
-                # Обогащаем список CSS-предсканом: добавляем цели, которые не попали в DOM-скан
+                # Обогащаем список CSS-предсканом: добавляем цели, которые не попали в DOM-скан.
+                # Применяем тот же коммерческий фильтр, что и в основном цикле.
                 if css_hover_targets and round_index == 1:
                     existing_keys = {str(t.get("key", "")) for t in analysis_targets}
-                    css_extra = [t for t in css_hover_targets if str(t.get("key", "")) not in existing_keys]
+                    _css_commercial = (
+                        "buy", "shop", "cart", "checkout", "pricing", "price",
+                        "purchase", "subscribe", "plan", "membership", "donate", "store", "order",
+                        "download", "install", "sign up", "signup", "sign in", "signin",
+                        "log in", "login", "register", "free trial", "try for free", "try free",
+                        "get app", "app store", "google play", "start free", "start trial",
+                        "free", "trial", "demo", "try",
+                    )
+                    def _css_extra_ok(t: Dict[str, Any]) -> bool:
+                        t_text = str(t.get("text", "")).strip().lower()
+                        t_href = str(t.get("href", "")).strip()
+                        # Пропускаем любые элементы с CTA-текстом
+                        if t_text and has_keyword(t_text, _css_commercial):
+                            return False
+                        # Пропускаем элементы без текста, у которых есть навигационная ссылка
+                        if not t_text and t_href and is_navigation_like_href(t_href, pass_origin_url):
+                            return False
+                        return True
+                    css_extra = [
+                        t for t in css_hover_targets
+                        if str(t.get("key", "")) not in existing_keys and _css_extra_ok(t)
+                    ]
                     if css_extra:
                         analysis_targets = analysis_targets + css_extra
                         analysis_targets.sort(key=lambda t: (float(t.get("absY", 0)), float(t.get("x", 0))))
@@ -2948,7 +3000,15 @@ async def run_strict_top_to_bottom_pass(
                     "log in", "login", "register", "free trial", "try for free", "try free",
                     "get app", "app store", "google play", "start free", "start trial",
                     "free", "trial", "demo",
+                    # standalone "try" — почти всегда CTA «TRY FOR FREE» / «TRY IT»
+                    "try",
                 )
+                # Блокируем элементы с пустым текстом у которых href ведёт на другую страницу
+                # (дочерние иконки/стрелки внутри CTA-кнопок)
+                if not item_text_low and str(item.get("href", "")).strip():
+                    _item_href = str(item.get("href", "")).strip()
+                    if is_navigation_like_href(_item_href, current_url):
+                        continue
                 if has_keyword(item_text_low, _blocked_commercial):
                     continue
 
@@ -3197,13 +3257,14 @@ async def run_strict_top_to_bottom_pass(
 
                     # ── Защита от ухода на внешний сайт ──
                     navigated_offsite = after_url and not is_same_site_url(after_url, site_url)
+                    after_path = _url_page_path(after_url) if after_url else pass_origin_path
+                    navigated_away_from_origin = after_path != pass_origin_path
                     navigated_internally = after_url != before_url and is_navigation_like_href(after_url, before_url)
-                    if navigated_offsite:
-                        logger.warning("⛔ Smart cursor: пойман внешний переход, возвращаемся")
-                        await ensure_page_within_allowed_site(
-                            page, site_url, fallback_url=before_url,
-                            fallback_scroll_y=before_scroll, timeout=15000,
+                    if navigated_offsite or navigated_away_from_origin:
+                        logger.warning(
+                            f"⛔ Smart cursor: уход с исходной страницы ({after_path} ≠ {pass_origin_path}), возвращаемся"
                         )
+                        await restore_page_location(page, pass_origin_url, restore_scroll_y=before_scroll, timeout=15000)
                         visited_keys.add(target_key)
                         visited_families.add(target_family)
                         clicked_keys.add(target_key)
@@ -3218,7 +3279,7 @@ async def run_strict_top_to_bottom_pass(
                         continue
                     elif navigated_internally and not allow_internal_nav_click:
                         logger.info("🖱️ Smart cursor: пойман внутренний переход, откатываемся")
-                        await restore_page_location(page, before_url, restore_scroll_y=before_scroll, timeout=15000)
+                        await restore_page_location(page, pass_origin_url, restore_scroll_y=before_scroll, timeout=15000)
                         visited_keys.add(target_key)
                         visited_families.add(target_family)
                         clicked_keys.add(target_key)
