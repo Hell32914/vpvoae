@@ -516,15 +516,22 @@ def activation_target_score(target: Dict[str, Any], viewport_width: int, viewpor
     z_index = float(target.get("zIndex", 0.0))
 
     primary_keywords = (
-        "enter", "start", "continue", "explore", "open", "go", "begin", "launch", "proceed",
+        "enter", "start", "continue", "explore", "open", "begin", "launch", "proceed",
         "visit", "view", "discover", "watch", "play", "skip", "next", "close", "ok", "accept",
         "agree", "allow", "got it", "i understand", "войти", "начать", "продолж", "далее", "принять",
     )
+    # Эти слова блокируют bonus чтобы auth/nav кнопки не получали +430
+    auth_nav_words = (
+        "signup", "sign up", "login", "log in", "register", "create account",
+        "google", "linkedin", "facebook", "github", "apple",
+        "get started", "free trial", "try for free",
+    )
 
     keyword_bonus = 0.0
-    if any(word in text for word in primary_keywords):
+    # Используем has_keyword (word-token matching) а не plain substring для primary_keywords
+    if has_keyword(text, primary_keywords) and not has_keyword(text, auth_nav_words):
         keyword_bonus += 430.0
-    if any(word in href for word in primary_keywords):
+    if has_keyword(href, primary_keywords) and not has_keyword(href, auth_nav_words):
         keyword_bonus += 120.0
 
     if tag in {"button", "a"}:
@@ -563,11 +570,20 @@ async def try_click_entry_element(
         "allow", "войти", "начать", "принять",
     )
     weak_entry_words = (
-        "continue", "open", "go", "skip", "next", "ok", "продолж", "далее",
+        "continue", "open", "skip", "next", "ok", "продолж", "далее",
     )
+    # Эти слова НИКОГДА не должны триггерить Phase-0 click — они навигационные CTA,
+    # а не gate/overlay (cookie-wall, age-gate, welcome screen).
     purchase_words = (
         "buy", "shop", "cart", "checkout", "pricing", "price", "guide", "ebook", "course",
         "purchase", "subscribe", "plan", "membership", "donate", "book", "store",
+        # Auth buttons — никогда не являются входными gate-кнопками
+        "signup", "sign up", "sign-up",
+        "login", "log in", "log-in",
+        "register", "create account",
+        "with google", "with linkedin", "with facebook", "with github", "with apple",
+        "oauth", "sso", "saml",
+        "free trial", "get started", "try for free", "try free", "start free",
     )
 
     try:
@@ -657,6 +673,8 @@ async def try_click_entry_element(
 
     logger.info(f"🖱️ Smart cursor: клик по входному элементу '{text_hint[:30]}'")
 
+    before_url = str(page.url or "")
+
     cursor_pos = await move_mouse_human_like(
         page,
         cursor_pos,
@@ -674,6 +692,27 @@ async def try_click_entry_element(
         await page.wait_for_load_state("networkidle", timeout=3000)
     except Exception:
         pass
+
+    # ── Проверяем, не ушли ли мы на другой сайт или другую страницу ──
+    # Если URL изменился — это был навигационный CTA, а не gate. Откатываемся.
+    after_url = str(page.url or "")
+    if after_url != before_url:
+        navigated_offsite = not is_same_site_url(after_url, before_url)
+        navigated_to_other_page = is_navigation_like_href(after_url, before_url)
+        if navigated_offsite or navigated_to_other_page:
+            logger.warning(
+                f"⛔ Smart cursor: entry-клик вызвал навигацию ({before_url} → {after_url}), откатываемся"
+            )
+            try:
+                await page.go_back(timeout=8000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(600)
+            except Exception:
+                try:
+                    await page.goto(before_url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(600)
+                except Exception:
+                    pass
+            return cursor_pos, False, None
 
     try:
         after_state = await get_page_activity_snapshot(page)
@@ -2606,20 +2645,22 @@ async def run_header_hover_pass(
     if not header_targets:
         return cursor_pos, 0
 
-    logger.info(f"🧭 Header hover pass: найдено {len(header_targets)} элементов в зоне хедера")
+    # Ограничиваем: максимум 3 элемента, быстрый свип чтобы не занимать начало записи
+    header_targets = header_targets[:3]
+    logger.info(f"🧭 Header hover pass: {len(header_targets)} элементов в зоне хедера (быстрый свип)")
 
     for item in header_targets:
         tx = clamp(float(item.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
         ty = clamp(float(item.get("y", viewport_height * 0.06)), 2, viewport_height - 2)
-        # Быстрое движение к цели — показываем что-то интересное
-        transit_ms = random.randint(60, 150)
+        # Очень быстрое движение + микро-дwell: достаточно чтобы CSS :hover триггернулся на видео
+        transit_ms = random.randint(25, 55)
+        dwell_ms = random.randint(40, 90)
         try:
             cursor_pos = await move_mouse_human_like(
                 page, cursor_pos, (tx, ty),
                 viewport_width, viewport_height, transit_ms,
             )
-            # Плавный hover — по-человечески
-            await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+            await page.wait_for_timeout(dwell_ms)
             hovered += 1
         except Exception:
             pass
