@@ -169,6 +169,15 @@ echo "=========================================="
 echo "📱 Starting VPVoAe Application"
 echo "=========================================="
 
+# Фаза предзагрузки: если PRELOAD_TIME_S > 0 — открываем сайт заранее,
+# чтобы все анимации и медиа загрузились ДО начала записи с курсором.
+PRELOAD_TIME_S=${PRELOAD_TIME_S:-0}
+if [ "$PRELOAD_TIME_S" -gt 0 ] 2>/dev/null; then
+    echo "⏳ Preload phase: загружаем сайт ${PRELOAD_TIME_S}s до начала записи..."
+    PRELOAD_MODE=1 timeout "${PRELOAD_TIME_S}" python /app/main.py 2>&1 | tail -30 || true
+    echo "✅ Preload phase завершена, начинаем запись с курсором"
+fi
+
 DISPLAY=:99 python /app/main.py
 APP_EXIT_CODE=$?
 

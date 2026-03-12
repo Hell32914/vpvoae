@@ -2368,6 +2368,317 @@ async def collect_document_interaction_targets(
     )
 
 
+async def collect_css_hover_map(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+) -> List[Dict[str, Any]]:
+    """Сканирует CSS-правила всех таблиц стилей и возвращает элементы с hover/transition/pointer.
+
+    Вызывается один раз после загрузки (до начала основного цикла) чтобы построить
+    полную карту взаимодействий ещё до старта движения курсора.
+    """
+    try:
+        return await page.evaluate(
+            """
+            ({ viewportWidth, viewportHeight }) => {
+                // ── 1. Читаем CSS-правила из всех доступных таблиц стилей ──
+                const hoverSelectors = new Set();
+                const sheets = Array.from(document.styleSheets || []);
+                for (const sheet of sheets) {
+                    let rules;
+                    try { rules = Array.from(sheet.cssRules || []); } catch { continue; }
+                    for (const rule of rules) {
+                        // @media, @supports и т.п. — рекурсивно
+                        const innerRules = rule.cssRules ? Array.from(rule.cssRules) : [rule];
+                        for (const r of innerRules) {
+                            if (!r.selectorText) continue;
+                            const sel = r.selectorText;
+                            const style = r.style || {};
+                            const hasCursorPointer = (style.cursor || '').toLowerCase() === 'pointer';
+                            const hasTransition = (style.transitionDuration || '') !== ''
+                                && (style.transitionDuration || '') !== '0s'
+                                && (style.transitionDuration || '') !== '0ms';
+                            const hasHoverPseudo = /:hover|:focus|:active|:focus-visible/.test(sel);
+                            if (hasCursorPointer || hasTransition || hasHoverPseudo) {
+                                // Убираем псевдоэлементы — нам нужны базовые CSS-селекторы
+                                const baseSelector = sel
+                                    .split(',')
+                                    .map(s => s.replace(/::?[a-z\\-]+(\\([^)]*\\))?/gi, '').trim())
+                                    .filter(s => s.length > 0 && s !== '*')
+                                    .join(',');
+                                if (baseSelector) {
+                                    try {
+                                        // Проверяем, что селектор валиден
+                                        document.querySelector(baseSelector);
+                                        hoverSelectors.add(baseSelector);
+                                    } catch {}
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── 2. Фиксированный набор семантически-интерактивных тегов ──
+                const semanticSelectors = [
+                    'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
+                    'details', 'summary', 'label[for]',
+                    '[onclick]', '[role="button"]', '[role="link"]', '[role="menuitem"]',
+                    '[tabindex]:not([tabindex="-1"])', '[contenteditable="true"]',
+                    '[draggable="true"]', '[data-action]', '[data-hover]',
+                    '[class*="btn"]', '[class*="cta"]',
+                ];
+                for (const s of semanticSelectors) hoverSelectors.add(s);
+
+                // ── 3. Собираем уникальные элементы ──
+                const pool = new Set();
+                for (const sel of hoverSelectors) {
+                    try {
+                        for (const el of document.querySelectorAll(sel)) {
+                            if (el instanceof HTMLElement) pool.add(el);
+                        }
+                    } catch {}
+                }
+
+                function hasTransitionStyle(style) {
+                    const raw = (style.transitionDuration || '').toString();
+                    if (!raw) return false;
+                    for (const part of raw.split(',')) {
+                        const token = part.trim().toLowerCase();
+                        if (!token) continue;
+                        if (token.endsWith('ms') && Number.parseFloat(token) > 0.1) return true;
+                        if (token.endsWith('s') && Number.parseFloat(token) > 0.001) return true;
+                    }
+                    return false;
+                }
+
+                const scrollY = window.scrollY || 0;
+                const doc = document.documentElement;
+                const docHeight = Math.max(doc.scrollHeight || 0, document.body.scrollHeight || 0, viewportHeight);
+                const out = [];
+
+                for (const el of pool) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden'
+                        || Number(style.opacity || '1') < 0.05) continue;
+                    if (style.pointerEvents === 'none') continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 8 || rect.height < 8) continue;
+
+                    const absY = scrollY + rect.top + rect.height * 0.5;
+                    const absX = rect.left + rect.width * 0.5;
+
+                    const hasPointer = (style.cursor || '').toLowerCase() === 'pointer';
+                    const hasTrans = hasTransitionStyle(style);
+                    const tag = el.tagName.toLowerCase();
+                    const isInteractive = ['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)
+                        || el.hasAttribute('onclick') || el.getAttribute('role') === 'button';
+
+                    const score = (hasPointer ? 80 : 0) + (hasTrans ? 60 : 0) + (isInteractive ? 40 : 0)
+                        + Math.min(rect.width * rect.height, 60000) * 0.001;
+
+                    const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0, 60);
+                    const href = el instanceof HTMLAnchorElement ? (el.getAttribute('href') || '') : '';
+
+                    // Собираем ключ элемента
+                    let keyParts = [];
+                    let cur = el;
+                    let depth = 0;
+                    while (cur && cur instanceof HTMLElement && depth < 4) {
+                        const cls = (cur.className || '').toString().trim().split(/\\s+/).slice(0, 2).join('.');
+                        keyParts.push(`${cur.tagName.toLowerCase()}${cur.id ? '#' + cur.id : ''}${cls ? '.' + cls : ''}`);
+                        cur = cur.parentElement;
+                        depth++;
+                    }
+                    const key = `${keyParts.join('>')}|${Math.round(absX)}:${Math.round(absY)}|${text.slice(0, 30)}`;
+
+                    out.push({
+                        key,
+                        tag,
+                        x: absX,
+                        absY,
+                        y: rect.top + rect.height * 0.5,
+                        width: rect.width,
+                        height: rect.height,
+                        text,
+                        href,
+                        score,
+                        isHoverText: hasTrans && !isInteractive && rect.width < viewportWidth * 0.5,
+                        isSurfaceHover: hasTrans && rect.width >= viewportWidth * 0.16,
+                        hasPointerCursor: hasPointer,
+                        hasTransition: hasTrans,
+                        isInteractive,
+                        isContentAnchor: false,
+                        visibleRatio: 1.0,
+                        clarityScore: 1.0,
+                    });
+                }
+
+                // Сортируем: сначала верхние (по absY), потом левые (по x)
+                out.sort((a, b) => (a.absY - b.absY) || (a.x - b.x));
+                return out.slice(0, 1500);
+            }
+            """,
+            {"viewportWidth": viewport_width, "viewportHeight": viewport_height},
+        )
+    except Exception:
+        return []
+
+
+async def run_header_hover_pass(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+    hover_min_ms: int,
+    hover_max_ms: int,
+) -> Tuple[Tuple[float, float], int]:
+    """Быстрый проход по hover-элементам в зоне хедера (верхние 12% экрана).
+
+    Вызывается в самом начале записи чтобы показать эффекты хедера и навигации.
+    Только hover — без кликов.
+    """
+    hovered = 0
+    try:
+        header_targets = await page.evaluate(
+            """
+            ({ viewportWidth, viewportHeight }) => {
+                const headerZoneBottom = viewportHeight * 0.14;
+                const pool = new Set();
+                // Верхушка: header, nav, fixed/sticky элементы
+                for (const sel of [
+                    'header *', 'nav *', '[role="navigation"] *',
+                    '[class*="nav"] *', '[class*="header"] *', '[class*="menu"] *',
+                ]) {
+                    try {
+                        for (const el of document.querySelectorAll(sel)) {
+                            if (el instanceof HTMLElement) pool.add(el);
+                        }
+                    } catch {}
+                }
+                // Любые видимые интерактивные элементы в верхней зоне
+                for (const el of document.querySelectorAll('a[href],button,[role="button"],[onclick]')) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.top >= 0 && rect.bottom <= headerZoneBottom * 1.5) pool.add(el);
+                }
+
+                const out = [];
+                for (const el of pool) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden'
+                        || Number(style.opacity || '1') < 0.05) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 8 || rect.height < 8) continue;
+                    if (rect.bottom > headerZoneBottom * 1.5) continue;
+                    if (rect.top < 0) continue;
+
+                    const hasHover = (style.cursor || '').toLowerCase() === 'pointer'
+                        || (style.transitionDuration || '') !== ''
+                        || el.tagName.toLowerCase() === 'a'
+                        || el.tagName.toLowerCase() === 'button';
+                    if (!hasHover) continue;
+
+                    const cx = rect.left + rect.width * 0.5;
+                    const cy = rect.top + rect.height * 0.5;
+                    out.push({ x: cx, y: cy, width: rect.width, height: rect.height,
+                               text: (el.innerText || '').trim().slice(0, 40) });
+                }
+
+                // Сортируем слева направо
+                out.sort((a, b) => a.x - b.x);
+                // Убираем близкие дубли (< 40px)
+                const deduped = [];
+                for (const item of out) {
+                    if (!deduped.length || Math.abs(item.x - deduped[deduped.length - 1].x) > 40) {
+                        deduped.push(item);
+                    }
+                }
+                return deduped.slice(0, 10);
+            }
+            """,
+            {"viewportWidth": viewport_width, "viewportHeight": viewport_height},
+        )
+    except Exception:
+        return cursor_pos, 0
+
+    if not header_targets:
+        return cursor_pos, 0
+
+    logger.info(f"🧭 Header hover pass: найдено {len(header_targets)} элементов в зоне хедера")
+
+    for item in header_targets:
+        tx = clamp(float(item.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
+        ty = clamp(float(item.get("y", viewport_height * 0.06)), 2, viewport_height - 2)
+        # Быстрое движение к цели — показываем что-то интересное
+        transit_ms = random.randint(60, 150)
+        try:
+            cursor_pos = await move_mouse_human_like(
+                page, cursor_pos, (tx, ty),
+                viewport_width, viewport_height, transit_ms,
+            )
+            # Плавный hover — по-человечески
+            await page.wait_for_timeout(random.randint(hover_min_ms, hover_max_ms))
+            hovered += 1
+        except Exception:
+            pass
+
+    return cursor_pos, hovered
+
+
+async def detect_preloader(page: Any, viewport_width: int, viewport_height: int) -> bool:
+    """Возвращает True если страница сейчас показывает прелоадер или сплэш-экран."""
+    try:
+        result = await page.evaluate(
+            """
+            ({ vw, vh }) => {
+                // Смотрим — есть ли элемент, покрывающий > 70% экрана
+                function covers(el) {
+                    const rect = el.getBoundingClientRect();
+                    const overlapW = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+                    const overlapH = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+                    return (overlapW * overlapH) >= vw * vh * 0.70;
+                }
+
+                // Проверяем children body
+                let hasCovering = false;
+                for (const el of document.body.children) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none') continue;
+                    if (covers(el)) {
+                        const zIndex = Number(style.zIndex) || 0;
+                        const hasAnim = (style.animationName || '') !== 'none' || (style.transitionDuration || '') !== '0s';
+                        // Прелоадер-признаки: перекрывает экран + z-index высокий или позиция fixed
+                        if (style.position === 'fixed' || style.position === 'absolute' || zIndex >= 100 || hasAnim) {
+                            hasCovering = true;
+                        }
+                    }
+                }
+
+                // Кол-во значимых интерактивных элементов
+                const interactiveCount = document.querySelectorAll(
+                    'a[href], button, nav, header, main, [role="navigation"]'
+                ).length;
+
+                // Если страница не скроллируется — тоже плохой знак
+                const scrollable = (document.documentElement.scrollHeight || 0) > vh * 1.4;
+
+                return { hasCovering, interactiveCount, scrollable };
+            }
+            """,
+            {"vw": viewport_width, "vh": viewport_height},
+        )
+        has_covering = bool(result.get("hasCovering", False))
+        interactive = int(result.get("interactiveCount", 99))
+        scrollable = bool(result.get("scrollable", True))
+        # Прелоадер: покрывает экран И мало интерактивных элементов ИЛИ нет прокрутки
+        return has_covering and (interactive < 8 or not scrollable)
+    except Exception:
+        return False
+
+
 async def run_strict_top_to_bottom_pass(
     page: Any,
     cursor_pos: Tuple[float, float],
@@ -2443,12 +2754,39 @@ async def run_strict_top_to_bottom_pass(
         await try_close_chat_widgets(page)
     except Exception:
         pass
+
+    # ── CSS pre-scan: строим полную карту hover/pointer элементов до начала движения ──
+    # Это позволяет курсору знать заранее куда двигаться, не теряя время на «разведку».
+    logger.info("🔍 CSS pre-scan: анализируем hover/transition/pointer элементы страницы...")
+    try:
+        css_hover_targets = await collect_css_hover_map(page, viewport_width, viewport_height)
+        logger.info(f"🔍 CSS pre-scan: найдено {len(css_hover_targets)} потенциальных целей с hover/pointer/transition")
+    except Exception:
+        css_hover_targets = []
+
+    # ── Header hover pass: показываем hover-эффекты хедера в самом начале записи ──
+    try:
+        cursor_pos, _header_hovered = await run_header_hover_pass(
+            page=page,
+            cursor_pos=cursor_pos,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            hover_min_ms=hover_min_ms,
+            hover_max_ms=hover_max_ms,
+        )
+        if _header_hovered > 0:
+            logger.info(f"🧭 Header hover pass: показано {_header_hovered} hover-эффектов хедера")
+    except Exception:
+        pass
+
     last_analysis_round = -1000
     # ── Быстрые тайминги для «поисковой» фазы (курсор летит к цели) ──
-    search_move_min = 60
-    search_move_max = 150
-    search_dwell_min = 18
-    search_dwell_max = 45
+    # Транзитная скорость в 3-4x быстрее человеческой: курсор "прилетает" к цели,
+    # а не медленно плывёт, чтобы не терять время на переходы между элементами.
+    search_move_min = 18
+    search_move_max = 55
+    search_dwell_min = 10
+    search_dwell_max = 30
     # ── Тайминги для «витрины»: когда эффект обнаружен — показываем по-человечески ──
     micro_hover_min = max(40, int(hover_min_ms * 0.35))
     micro_hover_max = max(micro_hover_min + 20, int(hover_max_ms * 0.55))
@@ -2499,6 +2837,13 @@ async def run_strict_top_to_bottom_pass(
                     viewport_height=viewport_height,
                     limit=1200,
                 )
+                # Обогащаем список CSS-предсканом: добавляем цели, которые не попали в DOM-скан
+                if css_hover_targets and round_index == 1:
+                    existing_keys = {str(t.get("key", "")) for t in analysis_targets}
+                    css_extra = [t for t in css_hover_targets if str(t.get("key", "")) not in existing_keys]
+                    if css_extra:
+                        analysis_targets = analysis_targets + css_extra
+                        analysis_targets.sort(key=lambda t: (float(t.get("absY", 0)), float(t.get("x", 0))))
                 last_analysis_round = round_index
                 if round_index == 1:
                     logger.info(f"🧭 Smart cursor: DOM анализ до скролла, найдено целей={len(analysis_targets)}")
@@ -2660,14 +3005,15 @@ async def run_strict_top_to_bottom_pass(
 
                 # Приоритет: hover-элементы выше click-элементов.
                 # Click-кандидаты только когда нет hover-целей.
+                # band_px=90 обеспечивает строгий порядок слева→направо в пределах одной строки экрана.
                 if surface_hover_candidates:
-                    pool = shortlist_progress_targets(surface_hover_candidates, band_px=170.0, limit=min(6, len(surface_hover_candidates)))
+                    pool = shortlist_progress_targets(surface_hover_candidates, band_px=90.0, limit=min(6, len(surface_hover_candidates)))
                 elif hover_text_candidates:
-                    pool = shortlist_progress_targets(hover_text_candidates, band_px=170.0, limit=min(6, len(hover_text_candidates)))
+                    pool = shortlist_progress_targets(hover_text_candidates, band_px=90.0, limit=min(6, len(hover_text_candidates)))
                 elif any_hover_candidates:
-                    pool = shortlist_progress_targets(any_hover_candidates, band_px=180.0, limit=min(6, len(any_hover_candidates)))
+                    pool = shortlist_progress_targets(any_hover_candidates, band_px=100.0, limit=min(6, len(any_hover_candidates)))
                 elif inpage_click_enabled and priority_click_candidates:
-                    pool = shortlist_progress_targets(priority_click_candidates, band_px=150.0, limit=min(6, len(priority_click_candidates)))
+                    pool = shortlist_progress_targets(priority_click_candidates, band_px=90.0, limit=min(6, len(priority_click_candidates)))
                 else:
                     pool = None
 
@@ -4097,17 +4443,35 @@ async def run_smart_cursor(
         logger.info("🧭 Smart cursor: STRICT режим (один проход сверху вниз, без переходов по страницам)")
 
         # ── Ожидание готовности контента: убеждаемся, что страница загрузила достаточно элементов ──
+        # Также ждём исчезновения прелоадера/сплэш-экрана (если есть).
         content_wait_start = time.monotonic()
-        content_wait_max_ms = 20000
+        content_wait_max_ms = int(os.getenv("PRELOAD_WAIT_MS", "20000"))
+        content_wait_max_ms = max(8000, min(content_wait_max_ms, 120000))
         content_min_targets = 3
+        _preloader_seen = False
         while (time.monotonic() - content_wait_start) * 1000 < content_wait_max_ms:
             try:
                 _probe_targets = await collect_interactive_targets(page, viewport_width, viewport_height, 50)
             except Exception:
                 _probe_targets = []
-            if len(_probe_targets) >= content_min_targets:
+
+            # Проверяем прелоадер: если он есть, ждём дольше
+            _has_preloader = False
+            if len(_probe_targets) < content_min_targets:
+                try:
+                    _has_preloader = await detect_preloader(page, viewport_width, viewport_height)
+                except Exception:
+                    pass
+                if _has_preloader and not _preloader_seen:
+                    logger.info("🧭 Smart cursor: обнаружен прелоадер, ждём загрузки контента...")
+                    _preloader_seen = True
+
+            if len(_probe_targets) >= content_min_targets and not _has_preloader:
+                if _preloader_seen:
+                    logger.info("✅ Smart cursor: прелоадер исчез, контент загружен")
                 break
-            logger.info(f"🧭 Smart cursor: ожидание загрузки контента ({len(_probe_targets)} элементов)...")
+            elapsed_wait = int((time.monotonic() - content_wait_start) * 1000)
+            logger.info(f"🧭 Smart cursor: ожидание загрузки контента ({len(_probe_targets)} элементов, {elapsed_wait}ms)...")
             await page.wait_for_timeout(1500)
 
         strict_total_budget_ms = max(8000, int(total_time_ms))
@@ -4780,9 +5144,81 @@ async def run_smart_cursor(
     return hovered_count
 
 
+async def _run_preload_mode() -> None:
+    """Режим предзагрузки: открываем сайт, ждём загрузки всего контента и выходим.
+
+    Используется entrypoint.sh (PRELOAD_MODE=1) перед фактической записью,
+    чтобы CDN/DNS-кэши прогрелись, анимации и медиа подгрузились.
+    """
+    target_url = os.getenv('TARGET_URL', 'https://www.gsproductions.co.za/')
+    viewport_width = int(os.getenv('VIEWPORT_WIDTH', '1920'))
+    viewport_height = int(os.getenv('VIEWPORT_HEIGHT', '1080'))
+    load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
+    preload_wait_ms = max(5000, int(os.getenv('PRELOAD_WAIT_MS', '20000')))
+    browser_performance_mode = env_bool('BROWSER_PERFORMANCE_MODE', True)
+
+    logger.info(f"🔄 PRELOAD_MODE: загружаем {target_url} (warm-up {preload_wait_ms}ms)...")
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser_args = [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage', '--no-sandbox',
+                '--disable-extensions', '--kiosk', '--start-fullscreen',
+                f'--window-size={viewport_width},{viewport_height}',
+                '--hide-crash-restore-bubble', '--disable-infobars',
+            ]
+            if browser_performance_mode:
+                browser_args.extend([
+                    '--ignore-gpu-blocklist', '--enable-webgl',
+                    '--enable-unsafe-swiftshader', '--use-angle=swiftshader',
+                    '--enable-gpu-rasterization', '--enable-zero-copy',
+                ])
+            browser = await p.chromium.launch(headless=False, args=browser_args)
+            context = await browser.new_context(
+                viewport={'width': viewport_width, 'height': viewport_height},
+                device_scale_factor=1,
+            )
+            page = await context.new_page()
+            try:
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=load_timeout)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(15000, load_timeout))
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"⚠️ PRELOAD_MODE goto: {e}")
+            # Прокручиваем страницу вниз/вверх, чтобы триггернуть lazyload медиа
+            try:
+                for _ in range(4):
+                    await page.evaluate("() => window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' })")
+                    await page.wait_for_timeout(600)
+                await page.evaluate("() => window.scrollTo({ top: 0, behavior: 'auto' })")
+            except Exception:
+                pass
+            await page.wait_for_timeout(max(3000, preload_wait_ms - 8000))
+            logger.info("✅ PRELOAD_MODE: прогрев завершён")
+            await context.close()
+    except Exception as e:
+        logger.warning(f"⚠️ PRELOAD_MODE error: {e}")
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
 async def main():
     """Главная функция для рендеринга веб-сайта на сервере с Xvfb и FFmpeg видеозаписью."""
     browser = None
+
+    # ── PRELOAD_MODE: прогрев без FFmpeg-записи (используется entrypoint.sh) ──
+    preload_mode = env_bool('PRELOAD_MODE', False)
+    if preload_mode:
+        await _run_preload_mode()
+        return
+
     try:
         # Получение конфигурации из переменных окружения
         output_path = os.getenv('OUTPUT_PATH', 'output')
@@ -5006,6 +5442,20 @@ async def main():
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️  Таймаут при загрузке ({load_timeout}ms), продолжаем...")
 
+            # ── Курсор появляется сразу после загрузки страницы ──
+            # Позиционируем его заранее, чтобы он был виден с первых секунд записи.
+            _entry_cx = viewport_width * random.uniform(0.36, 0.54)
+            _entry_cy = viewport_height * random.uniform(0.22, 0.38)
+            if visible_cursor_enabled:
+                try:
+                    await page.evaluate(
+                        """([mx, my]) => { if (window.__vpvoaeMoveCursor) window.__vpvoaeMoveCursor(mx, my); }""",
+                        [_entry_cx, _entry_cy],
+                    )
+                    await page.mouse.move(_entry_cx, _entry_cy)
+                except Exception:
+                    pass
+
             if browser_fullscreen:
                 try:
                     await page.bring_to_front()
@@ -5015,9 +5465,28 @@ async def main():
                 except Exception:
                     logger.warning("⚠️ Не удалось переключить браузер в fullscreen")
 
-            logger.info(f"⏳ Ожидание отрисовки WebGL анимаций ({render_timeout}ms)...")
-            # Сайт тяжелый, даем время на полный рендер WebGL
-            await page.wait_for_timeout(render_timeout)
+            # ── Вместо статического сна двигаем курсор во время прогрева ──
+            # Это делает появление курсора заметным сразу, без 17-секундной паузы.
+            logger.info(f"⏳ Прогрев страницы: медленное движение курсора ({render_timeout}ms)...")
+            if visible_cursor_enabled and render_timeout >= 800:
+                _warm_target = (
+                    viewport_width * random.uniform(0.44, 0.62),
+                    viewport_height * random.uniform(0.30, 0.52),
+                )
+                try:
+                    await move_mouse_human_like(
+                        page,
+                        (_entry_cx, _entry_cy),
+                        _warm_target,
+                        viewport_width,
+                        viewport_height,
+                        max(700, render_timeout - 400),
+                    )
+                    await page.wait_for_timeout(min(400, render_timeout))
+                except Exception:
+                    await page.wait_for_timeout(render_timeout)
+            else:
+                await page.wait_for_timeout(render_timeout)
 
             if smart_cursor_enabled and smart_cursor_timeout > 0:
                 logger.info(

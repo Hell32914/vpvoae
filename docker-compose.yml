@@ -52,6 +52,10 @@ services:
       FFMPEG_DRAW_MOUSE: ${FFMPEG_DRAW_MOUSE:-0}
       FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
       FFMPEG_NICE_LEVEL: ${FFMPEG_NICE_LEVEL:-10}
+      # Предзагрузка: PRELOAD_TIME_S > 0 → прогрев сайта ДО начала FFmpeg-записи
+      PRELOAD_TIME_S: ${PRELOAD_TIME_S:-0}
+      # Сколько миллисекунд ждать полной загрузки контента (прелоадер/медиа) перед стартом курсора
+      PRELOAD_WAIT_MS: ${PRELOAD_WAIT_MS:-20000}
       LOG_LEVEL: INFO
     volumes:
       - vpvoae-output:/app/output
