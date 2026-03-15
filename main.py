@@ -1929,6 +1929,27 @@ async def find_viewport_cta_elements(
                     return ratio >= 2.0;
                 }
 
+                function isFixedOrSticky(el) {
+                    let node = el;
+                    let depth = 0;
+                    while (node && depth < 10) {
+                        if (node.nodeType !== 1) break;
+                        const pos = window.getComputedStyle(node).position;
+                        if (pos === 'fixed' || pos === 'sticky') return true;
+                        const tag = node.tagName.toLowerCase();
+                        if (tag === 'header' || tag === 'nav') return true;
+                        if (node.getAttribute('role') === 'banner'
+                            || node.getAttribute('role') === 'navigation') return true;
+                        node = node.parentElement;
+                        depth++;
+                    }
+                    return false;
+                }
+
+                const centerX = viewportWidth / 2;
+                const centerY = viewportHeight / 2;
+                const diag = Math.sqrt(centerX * centerX + centerY * centerY);
+
                 const candidates = [];
                 const elements = document.querySelectorAll(
                     'button, a, [role="button"], [class*="btn"], [class*="cta"], [class*="action"]'
@@ -1936,6 +1957,8 @@ async def find_viewport_cta_elements(
 
                 for (const el of elements) {
                     if (!(el instanceof HTMLElement)) continue;
+                    if (isFixedOrSticky(el)) continue;
+
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden'
                         || Number(style.opacity || '1') < 0.05) continue;
@@ -1955,16 +1978,28 @@ async def find_viewport_cta_elements(
 
                     const cx = rect.left + rect.width / 2;
                     const cy = rect.top + rect.height / 2;
+                    const area = rect.width * rect.height;
+                    const distFromCenter = Math.sqrt(
+                        (cx - centerX) * (cx - centerX) + (cy - centerY) * (cy - centerY)
+                    );
+                    const centerScore = Math.max(0, 1 - distFromCenter / (diag * 0.5)) * 120;
+                    const areaScore = Math.min(area / 500, 60);
+
+                    const href = (el.tagName.toLowerCase() === 'a'
+                        ? (el.getAttribute('href') || '') : '').trim();
 
                     candidates.push({
                         x: Math.max(2, Math.min(viewportWidth - 2, cx)),
                         y: Math.max(2, Math.min(viewportHeight - 2, cy)),
                         text: text.slice(0, 40),
+                        dedupKey: text.slice(0, 40) + '|' + href.slice(0, 80),
                         hasKeyword: hasKeyword,
                         hasContrast: hasContrast,
                         score: (hasKeyword ? 100 : 0)
                             + (hasContrast ? 80 : 0)
                             + (style.cursor === 'pointer' ? 30 : 0)
+                            + centerScore
+                            + areaScore
                     });
                 }
 
@@ -4912,6 +4947,7 @@ async def run_scroll_only_down_pass(
     next_landmark_index = 0
     slowdown_rounds_remaining = 0
     seen_heading_keys: Set[str] = set()
+    hovered_cta_keys: Set[str] = set()
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -5012,13 +5048,19 @@ async def run_scroll_only_down_pass(
             # Наведение курсора на CTA-кнопку для демонстрации
             try:
                 viewport_ctas = await find_viewport_cta_elements(
-                    page, viewport_width, viewport_height, limit=2,
+                    page, viewport_width, viewport_height, limit=4,
                 )
-                if viewport_ctas:
-                    cta = viewport_ctas[0]
-                    cta_x = float(cta.get("x", viewport_width * 0.5))
-                    cta_y = float(cta.get("y", viewport_height * 0.5))
-                    cta_text = str(cta.get("text", "")).strip()
+                picked_cta = None
+                for _c in (viewport_ctas or []):
+                    _key = str(_c.get("dedupKey", _c.get("text", "")))
+                    if _key not in hovered_cta_keys:
+                        picked_cta = _c
+                        hovered_cta_keys.add(_key)
+                        break
+                if picked_cta:
+                    cta_x = float(picked_cta.get("x", viewport_width * 0.5))
+                    cta_y = float(picked_cta.get("y", viewport_height * 0.5))
+                    cta_text = str(picked_cta.get("text", "")).strip()
                     logger.info(f"🎯 Scroll-only: наведение на CTA '{cta_text[:30]}'")
                     cursor_pos = await move_mouse_human_like(
                         page, cursor_pos, (cta_x, cta_y),
@@ -5026,10 +5068,10 @@ async def run_scroll_only_down_pass(
                         random.randint(300, 700),
                     )
                     await page.wait_for_timeout(random.randint(1000, 1500))
-                    # Уводим мышь в сторону, чтобы не перекрывать контент
+                    # Уводим мышь к левому краю на той же высоте — плавный уход
                     cursor_pos = await move_mouse_human_like(
                         page, cursor_pos,
-                        (viewport_width * 0.15, viewport_height * 0.5),
+                        (viewport_width * 0.05, cta_y),
                         viewport_width, viewport_height,
                         random.randint(200, 450),
                     )
@@ -5121,13 +5163,19 @@ async def run_scroll_only_down_pass(
             if live_headings:
                 try:
                     viewport_ctas = await find_viewport_cta_elements(
-                        page, viewport_width, viewport_height, limit=2,
+                        page, viewport_width, viewport_height, limit=4,
                     )
-                    if viewport_ctas:
-                        cta = viewport_ctas[0]
-                        cta_x = float(cta.get("x", viewport_width * 0.5))
-                        cta_y = float(cta.get("y", viewport_height * 0.5))
-                        cta_text = str(cta.get("text", "")).strip()
+                    picked_cta = None
+                    for _c in (viewport_ctas or []):
+                        _key = str(_c.get("dedupKey", _c.get("text", "")))
+                        if _key not in hovered_cta_keys:
+                            picked_cta = _c
+                            hovered_cta_keys.add(_key)
+                            break
+                    if picked_cta:
+                        cta_x = float(picked_cta.get("x", viewport_width * 0.5))
+                        cta_y = float(picked_cta.get("y", viewport_height * 0.5))
+                        cta_text = str(picked_cta.get("text", "")).strip()
                         logger.info(f"🎯 Scroll-only: CTA рядом с заголовком '{cta_text[:30]}'")
                         cursor_pos = await move_mouse_human_like(
                             page, cursor_pos, (cta_x, cta_y),
@@ -5137,7 +5185,7 @@ async def run_scroll_only_down_pass(
                         await page.wait_for_timeout(random.randint(800, 1300))
                         cursor_pos = await move_mouse_human_like(
                             page, cursor_pos,
-                            (viewport_width * 0.15, viewport_height * 0.5),
+                            (viewport_width * 0.05, cta_y),
                             viewport_width, viewport_height,
                             random.randint(180, 400),
                         )
@@ -5157,7 +5205,7 @@ async def run_scroll_only_down_pass(
             stagnant_rounds += 1
 
         stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
-        if not at_bottom and (stagnant_rounds >= 3 or stall_elapsed_ms >= stall_timeout_ms):
+        if not at_bottom and (stagnant_rounds >= 6 or stall_elapsed_ms >= stall_timeout_ms):
             logger.info(
                 "🧭 Scroll-only: anti-stall форсирует продвижение вниз "
                 f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms)"
