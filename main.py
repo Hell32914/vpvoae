@@ -49,6 +49,28 @@ def env_float(name: str, default: float) -> float:
     return parsed
 
 
+def resolve_smart_cursor_mode(raw_value: Optional[str]) -> str:
+    raw_mode = (raw_value or "").strip().lower()
+    aliases = {
+        "": "default",
+        "default": "default",
+        "standard": "default",
+        "legacy": "default",
+        "scroll_only": "scroll_only",
+        "scroll-only": "scroll_only",
+        "scrollonly": "scroll_only",
+        "descend_only": "scroll_only",
+        "descend-only": "scroll_only",
+        "down_only": "scroll_only",
+        "down-only": "scroll_only",
+    }
+    resolved = aliases.get(raw_mode)
+    if resolved:
+        return resolved
+    logger.warning(f"⚠️ Неизвестный SMART_CURSOR_MODE='{raw_value}', используем default")
+    return "default"
+
+
 def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(value, max_value))
 
@@ -4537,6 +4559,244 @@ async def move_mouse_human_like(
     return end_x, end_y
 
 
+async def run_scroll_only_down_pass(
+    page: Any,
+    viewport_height: int,
+    total_time_ms: int,
+    bottom_stable_rounds_required: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+    scroll_finish_timeout_ms: int,
+    require_bottom: bool,
+    require_bottom_max_ms: int,
+    bottom_debug: bool,
+    stall_timeout_ms: int,
+) -> bool:
+    """Чистый режим прокрутки: только движение вниз без hover, кликов и навигации."""
+    reached_bottom = False
+
+    try:
+        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
+        await page.wait_for_timeout(random.randint(120, 260))
+    except Exception:
+        pass
+
+    started_at = time.monotonic()
+    soft_budget_ms = max(8000, int(total_time_ms))
+    hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
+    min_duration_ms = max(4000, int(soft_budget_ms * 0.18))
+    stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
+
+    last_scroll_y = -1
+    stagnant_rounds = 0
+    bottom_stable_rounds = 0
+    round_index = 0
+    last_progress_at = time.monotonic()
+
+    while True:
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        if elapsed_ms >= soft_budget_ms and (reached_bottom or not require_bottom):
+            break
+        if elapsed_ms >= hard_budget_ms:
+            break
+
+        round_index += 1
+
+        try:
+            before_metrics = await get_scroll_metrics(page)
+            before_scroll_raw = int(before_metrics.get("scrollY", max(last_scroll_y, 0)))
+            if bottom_debug and last_scroll_y >= 0 and before_scroll_raw + 8 < last_scroll_y:
+                logger.info(
+                    "🧭 Scroll-only rebound detected: "
+                    f"raw={before_scroll_raw}, last={last_scroll_y}. Держим движение вниз"
+                )
+            before_scroll_y = max(before_scroll_raw, max(last_scroll_y, 0))
+            at_bottom_before = bool(before_metrics.get("atBottom", False))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                before_metrics = {
+                    "scrollY": max(last_scroll_y, 0),
+                    "maxScroll": 0,
+                    "atBottom": False,
+                    "documentHeight": 0,
+                    "viewportHeight": viewport_height,
+                    "bottomGap": 0,
+                }
+                before_scroll_y = max(last_scroll_y, 0)
+                at_bottom_before = False
+            else:
+                raise
+
+        await perform_smooth_scroll(
+            page=page,
+            viewport_height=viewport_height,
+            scroll_speed_factor=scroll_speed_factor,
+            scroll_pause_min_ms=scroll_pause_min_ms,
+            scroll_pause_max_ms=scroll_pause_max_ms,
+        )
+
+        try:
+            after_metrics = await get_scroll_metrics(page)
+            current_scroll_raw = int(after_metrics.get("scrollY", before_scroll_y))
+            if bottom_debug and last_scroll_y >= 0 and current_scroll_raw + 8 < last_scroll_y:
+                logger.info(
+                    "🧭 Scroll-only rebound detected (post-scroll): "
+                    f"raw={current_scroll_raw}, last={last_scroll_y}. Игнорируем откат"
+                )
+            current_scroll_y = max(current_scroll_raw, before_scroll_y, max(last_scroll_y, 0))
+            max_scroll_y = int(after_metrics.get("maxScroll", 0))
+            at_bottom = bool(after_metrics.get("atBottom", at_bottom_before))
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+                after_metrics = {
+                    "scrollY": before_scroll_y,
+                    "maxScroll": 0,
+                    "atBottom": False,
+                    "documentHeight": 0,
+                    "viewportHeight": viewport_height,
+                    "bottomGap": 0,
+                }
+                current_scroll_y = before_scroll_y
+                max_scroll_y = 0
+                at_bottom = False
+            else:
+                raise
+
+        scroll_advanced = current_scroll_y > (last_scroll_y + 6)
+        if scroll_advanced:
+            stagnant_rounds = 0
+            last_progress_at = time.monotonic()
+        else:
+            stagnant_rounds += 1
+
+        stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
+        if not at_bottom and (stagnant_rounds >= 3 or stall_elapsed_ms >= stall_timeout_ms):
+            logger.info(
+                "🧭 Scroll-only: anti-stall форсирует продвижение вниз "
+                f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms)"
+            )
+            await force_scroll_progress(page, viewport_height)
+            stagnant_rounds = 0
+            last_progress_at = time.monotonic()
+            try:
+                after_metrics = await get_scroll_metrics(page)
+                current_scroll_y = max(int(after_metrics.get("scrollY", current_scroll_y)), current_scroll_y)
+                max_scroll_y = int(after_metrics.get("maxScroll", max_scroll_y))
+                at_bottom = bool(after_metrics.get("atBottom", at_bottom))
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    raise
+
+        if round_index % 12 == 0:
+            logger.info(
+                f"🧭 Scroll-only progress: scrollY={current_scroll_y}, maxScroll={max_scroll_y}, "
+                f"stagnant={stagnant_rounds}"
+            )
+
+        last_scroll_y = max(last_scroll_y, current_scroll_y)
+        bottom_confirmed, bottom_reason = confirm_bottom_state_from_metrics(
+            metrics=after_metrics,
+            viewport_height=viewport_height,
+            round_index=round_index,
+            bottom_stable_rounds_required=bottom_stable_rounds_required,
+            stagnant_rounds=stagnant_rounds,
+        )
+        metric_document_height = metrics_document_height(after_metrics, viewport_height)
+
+        if bottom_debug and (
+            round_index % 8 == 0
+            or (at_bottom and not bottom_confirmed)
+            or bottom_confirmed
+        ):
+            logger.info(
+                "🧭 Scroll-only bottom check: "
+                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
+                f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, docHeight={metric_document_height}, "
+                f"stable={bottom_stable_rounds}"
+            )
+
+        if bottom_confirmed:
+            bottom_stable_rounds += 1
+        else:
+            bottom_stable_rounds = 0
+
+        if bottom_stable_rounds >= bottom_stable_rounds_required:
+            elapsed_since_start_ms = (time.monotonic() - started_at) * 1000
+            if elapsed_since_start_ms < min_duration_ms:
+                logger.info(
+                    f"🧭 Scroll-only: дно найдено слишком рано "
+                    f"({int(elapsed_since_start_ms)}мс из минимума {int(min_duration_ms)}мс) — продолжаем"
+                )
+                bottom_stable_rounds = 0
+                stagnant_rounds = 0
+                continue
+
+            metric_viewport_height = metrics_viewport_height(after_metrics, viewport_height)
+            visible_end = current_scroll_y + metric_viewport_height
+            remaining_gap = metric_document_height - visible_end
+            if remaining_gap > metric_viewport_height * 0.12:
+                logger.info(
+                    f"🧭 Scroll-only: atBottom=true, но до конца контента ещё {remaining_gap}px "
+                    f"(docH={metric_document_height}, visEnd={visible_end}) — продолжаем"
+                )
+                bottom_stable_rounds = 0
+                stagnant_rounds = 0
+                await force_scroll_progress(page, viewport_height)
+                continue
+
+            pre_check_scroll = current_scroll_y
+            try:
+                await force_scroll_progress(page, viewport_height)
+                await page.wait_for_timeout(random.randint(250, 500))
+                recheck_metrics = await get_scroll_metrics(page)
+                recheck_scroll = int(recheck_metrics.get("scrollY", pre_check_scroll))
+            except Exception:
+                recheck_scroll = pre_check_scroll
+
+            if recheck_scroll > pre_check_scroll + 10:
+                logger.info(
+                    f"🧭 Scroll-only: контент подгрузился (scroll {pre_check_scroll} → {recheck_scroll}), продолжаем"
+                )
+                bottom_stable_rounds = 0
+                last_scroll_y = recheck_scroll
+                last_progress_at = time.monotonic()
+                continue
+
+            logger.info("🧭 Scroll-only: дно подтверждено, завершаем спуск")
+            reached_bottom = True
+            break
+
+    if require_bottom and not reached_bottom:
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        remaining_ms = max(0, int(hard_budget_ms - elapsed_ms))
+        finish_budget_ms = min(max(4000, int(scroll_finish_timeout_ms)), remaining_ms)
+        if finish_budget_ms <= 0:
+            finish_budget_ms = max(8000, min(30000, int(scroll_finish_timeout_ms)))
+        if finish_budget_ms > 0:
+            try:
+                reached_bottom = await force_scroll_to_page_end(
+                    page=page,
+                    viewport_height=viewport_height,
+                    scroll_speed_factor=scroll_speed_factor,
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                    finish_timeout_ms=finish_budget_ms,
+                    bottom_debug=bottom_debug,
+                )
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    logger.warning(f"⚠️ Scroll-only: ошибка финального доскролла: {exc}")
+
+    return reached_bottom
+
+
 async def run_smart_cursor(
     page: Any,
     site_url: str,
@@ -4546,6 +4806,7 @@ async def run_smart_cursor(
     max_targets: int,
     hover_min_ms: int,
     hover_max_ms: int,
+    smart_cursor_mode: str,
     entry_click_enabled: bool,
     entry_click_attempts: int,
     scroll_to_end: bool,
@@ -4577,6 +4838,7 @@ async def run_smart_cursor(
     recent_points: List[Tuple[float, float]] = []
     clicked_nav_keys: Set[str] = set()
     nav_blacklist: Set[str] = set()
+    scroll_only_mode_active = smart_cursor_mode == "scroll_only"
 
     hover_visible_ratio = clamp(env_float("SMART_CURSOR_HOVER_VISIBLE_RATIO", 0.60), 0.15, 1.0)
     click_visible_ratio = clamp(env_float("SMART_CURSOR_CLICK_VISIBLE_RATIO", 0.46), 0.10, 1.0)
@@ -4602,7 +4864,7 @@ async def run_smart_cursor(
     # ════════════════════════════════════════════════════════════════
     # ФАЗА 0: Клик по входным элементам (cookie, enter, welcome gate)
     # ════════════════════════════════════════════════════════════════
-    if entry_click_enabled:
+    if entry_click_enabled and not scroll_only_mode_active:
         for _ in range(max(entry_click_attempts, 0)):
             try:
                 cursor_pos, clicked, clicked_key = await try_click_entry_element(
@@ -4623,6 +4885,28 @@ async def run_smart_cursor(
                 clicked_entry_keys.add(clicked_key)
 
     await ensure_page_within_allowed_site(page, site_url, fallback_url=site_url, timeout=15000)
+
+    if scroll_only_mode_active:
+        logger.info("🧭 Smart cursor: режим SCROLL_ONLY (только спуск вниз, без hover/click/nav)")
+        reached_bottom = await run_scroll_only_down_pass(
+            page=page,
+            viewport_height=viewport_height,
+            total_time_ms=total_time_ms,
+            bottom_stable_rounds_required=bottom_stable_rounds_required,
+            scroll_speed_factor=scroll_speed_factor,
+            scroll_pause_min_ms=scroll_pause_min_ms,
+            scroll_pause_max_ms=scroll_pause_max_ms,
+            scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+            require_bottom=True,
+            require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
+            bottom_debug=bottom_debug,
+            stall_timeout_ms=strict_stall_timeout_ms,
+        )
+        if reached_bottom:
+            logger.info("🧭 Smart cursor: режим SCROLL_ONLY завершён, страница прокручена до конца")
+        else:
+            logger.warning("⚠️ Smart cursor: режим SCROLL_ONLY завершился по таймауту до достижения конца страницы")
+        return hovered_count
 
     strict_mode_active = strict_top_to_bottom_mode or always_descend
     if strict_mode_active:
@@ -5469,6 +5753,7 @@ async def main():
         smart_cursor_max_targets = int(os.getenv('SMART_CURSOR_MAX_TARGETS', '0'))
         hover_min_ms = int(os.getenv('SMART_CURSOR_HOVER_MIN_MS', '220'))
         hover_max_ms = int(os.getenv('SMART_CURSOR_HOVER_MAX_MS', '760'))
+        smart_cursor_mode = resolve_smart_cursor_mode(os.getenv('SMART_CURSOR_MODE', 'default'))
         entry_click_enabled = env_bool('SMART_CURSOR_ENTRY_CLICK_ENABLED', True)
         entry_click_attempts = int(os.getenv('SMART_CURSOR_ENTRY_CLICK_ATTEMPTS', '3'))
         scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
@@ -5520,6 +5805,7 @@ async def main():
         logger.info(f"Display: {os.getenv('DISPLAY', ':99')}")
         logger.info("📹 Video recording: ENABLED (запись идёт параллельно)")
         logger.info(f"🧭 Smart cursor: {'ENABLED' if smart_cursor_enabled else 'DISABLED'}")
+        logger.info(f"🧭 Smart cursor mode: {smart_cursor_mode}")
         logger.info(f"🧭 Smart cursor strict top-to-bottom: {'ENABLED' if strict_top_to_bottom_mode else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor always descend: {'ENABLED' if smart_cursor_always_descend else 'DISABLED'}")
         logger.info(f"🧭 Smart cursor strict allow clicks: {'ENABLED' if strict_top_to_bottom_allow_clicks else 'DISABLED'}")
@@ -5739,6 +6025,7 @@ async def main():
                     max_targets=smart_cursor_max_targets,
                     hover_min_ms=hover_min_ms,
                     hover_max_ms=hover_max_ms,
+                    smart_cursor_mode=smart_cursor_mode,
                     entry_click_enabled=entry_click_enabled,
                     entry_click_attempts=entry_click_attempts,
                     scroll_to_end=scroll_to_end,
