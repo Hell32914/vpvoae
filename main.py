@@ -4559,8 +4559,100 @@ async def move_mouse_human_like(
     return end_x, end_y
 
 
+def is_scroll_only_heading_landmark(target: Dict[str, Any]) -> bool:
+    tag = str(target.get("tag", "")).strip().lower()
+    text = str(target.get("text", "")).strip()
+    if not text:
+        return False
+    return tag in {"h1", "h2", "h3", "h4"}
+
+
+def is_scroll_only_cta_landmark(target: Dict[str, Any], viewport_height: int) -> bool:
+    if is_probable_top_nav_target(target, viewport_height):
+        return False
+
+    text = str(target.get("text", "")).strip()
+    text_low = text.lower()
+    if len(text_low) < 3:
+        return False
+
+    tag = str(target.get("tag", "")).strip().lower()
+    href = str(target.get("href", "")).strip()
+    width = max(0.0, _to_float(target.get("width"), 0.0))
+    height = max(0.0, _to_float(target.get("height"), 0.0))
+
+    if width < 72 or height < 24:
+        return False
+
+    cta_words = (
+        "get started", "start", "book", "schedule", "contact", "talk", "demo",
+        "pricing", "price", "quote", "request", "learn more", "discover",
+        "explore", "join", "subscribe", "sign up", "apply", "buy", "shop",
+        "download", "free trial", "trial", "let's talk", "lets talk",
+    )
+    button_like = tag in {"button", "a", "summary"} or bool(href)
+    compact_label = len(text_low) <= 44 and len(text_low.split()) <= 6
+
+    return button_like and compact_label and has_keyword(text_low, cta_words)
+
+
+def build_scroll_only_section_landmarks(
+    targets: List[Dict[str, Any]],
+    viewport_height: int,
+) -> List[Dict[str, Any]]:
+    raw_landmarks: List[Dict[str, Any]] = []
+
+    for item in targets:
+        abs_y = max(0.0, _to_float(item.get("absY"), 0.0))
+        if abs_y <= 1.0:
+            continue
+
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+
+        kind: Optional[str] = None
+        if is_scroll_only_heading_landmark(item):
+            kind = "heading"
+        elif is_scroll_only_cta_landmark(item, viewport_height):
+            kind = "cta"
+
+        if not kind:
+            continue
+
+        raw_landmarks.append({
+            "key": str(item.get("key", "")) or f"{kind}|{int(abs_y)}|{text[:24]}",
+            "absY": abs_y,
+            "kind": kind,
+            "label": text[:72],
+        })
+
+    raw_landmarks.sort(key=lambda item: (float(item.get("absY", 0.0)), 0 if item.get("kind") == "heading" else 1))
+
+    deduped: List[Dict[str, Any]] = []
+    min_gap = max(140.0, viewport_height * 0.18)
+    for item in raw_landmarks:
+        if not deduped:
+            deduped.append(item)
+            continue
+
+        prev = deduped[-1]
+        close_enough = (float(item.get("absY", 0.0)) - float(prev.get("absY", 0.0))) < min_gap
+        if not close_enough:
+            deduped.append(item)
+            continue
+
+        prev_priority = 0 if prev.get("kind") == "heading" else 1
+        item_priority = 0 if item.get("kind") == "heading" else 1
+        if item_priority < prev_priority:
+            deduped[-1] = item
+
+    return deduped
+
+
 async def run_scroll_only_down_pass(
     page: Any,
+    viewport_width: int,
     viewport_height: int,
     total_time_ms: int,
     bottom_stable_rounds_required: int,
@@ -4575,12 +4667,38 @@ async def run_scroll_only_down_pass(
 ) -> bool:
     """Чистый режим прокрутки: только движение вниз без hover, кликов и навигации."""
     reached_bottom = False
+    section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 500), 4000))
+    section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.58), 0.20, 1.0)
+    section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 2), 6))
+    section_landmarks: List[Dict[str, Any]] = []
+    next_landmark_index = 0
+    slowdown_rounds_remaining = 0
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
         await page.wait_for_timeout(random.randint(120, 260))
     except Exception:
         pass
+
+    try:
+        section_targets = await collect_document_interaction_targets(
+            page=page,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            limit=1200,
+        )
+        section_landmarks = build_scroll_only_section_landmarks(section_targets, viewport_height)
+        if section_landmarks:
+            logger.info(
+                "🧭 Scroll-only landmarks: "
+                f"found={len(section_landmarks)}, pause={section_pause_ms}ms, "
+                f"slowdown={section_slowdown_factor:.2f}x/{section_slowdown_rounds} rounds"
+            )
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+        else:
+            logger.warning(f"⚠️ Scroll-only: не удалось собрать landmarks секций: {exc}")
 
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
@@ -4629,13 +4747,47 @@ async def run_scroll_only_down_pass(
             else:
                 raise
 
+        visible_landmark: Optional[Dict[str, Any]] = None
+        trigger_top = before_scroll_y + int(viewport_height * 0.06)
+        trigger_bottom = before_scroll_y + int(viewport_height * 0.62)
+        while next_landmark_index < len(section_landmarks):
+            landmark = section_landmarks[next_landmark_index]
+            landmark_abs_y = int(_to_float(landmark.get("absY"), 0.0))
+            if landmark_abs_y < trigger_top:
+                next_landmark_index += 1
+                continue
+            if landmark_abs_y <= trigger_bottom:
+                visible_landmark = landmark
+                next_landmark_index += 1
+            break
+
+        if visible_landmark is not None:
+            landmark_kind = "CTA" if visible_landmark.get("kind") == "cta" else "section"
+            landmark_label = str(visible_landmark.get("label", "")).strip()
+            logger.info(
+                f"🧭 Scroll-only: новая {landmark_kind} зона '{landmark_label[:56]}' — пауза {section_pause_ms}ms"
+            )
+            if section_pause_ms > 0:
+                await page.wait_for_timeout(section_pause_ms)
+            slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
+
+        effective_scroll_speed_factor = scroll_speed_factor
+        effective_scroll_pause_min_ms = scroll_pause_min_ms
+        effective_scroll_pause_max_ms = scroll_pause_max_ms
+        if slowdown_rounds_remaining > 0:
+            effective_scroll_speed_factor = clamp(scroll_speed_factor * section_slowdown_factor, 0.25, scroll_speed_factor)
+            effective_scroll_pause_min_ms = max(scroll_pause_min_ms, int(scroll_pause_min_ms * 1.6))
+            effective_scroll_pause_max_ms = max(effective_scroll_pause_min_ms + 5, int(scroll_pause_max_ms * 1.85))
+
         await perform_smooth_scroll(
             page=page,
             viewport_height=viewport_height,
-            scroll_speed_factor=scroll_speed_factor,
-            scroll_pause_min_ms=scroll_pause_min_ms,
-            scroll_pause_max_ms=scroll_pause_max_ms,
+            scroll_speed_factor=effective_scroll_speed_factor,
+            scroll_pause_min_ms=effective_scroll_pause_min_ms,
+            scroll_pause_max_ms=effective_scroll_pause_max_ms,
         )
+        if slowdown_rounds_remaining > 0:
+            slowdown_rounds_remaining -= 1
 
         try:
             after_metrics = await get_scroll_metrics(page)
@@ -4890,6 +5042,7 @@ async def run_smart_cursor(
         logger.info("🧭 Smart cursor: режим SCROLL_ONLY (только спуск вниз, без hover/click/nav)")
         reached_bottom = await run_scroll_only_down_pass(
             page=page,
+            viewport_width=viewport_width,
             viewport_height=viewport_height,
             total_time_ms=total_time_ms,
             bottom_stable_rounds_required=bottom_stable_rounds_required,
@@ -5675,10 +5828,14 @@ async def _run_preload_mode() -> None:
     viewport_width = int(os.getenv('VIEWPORT_WIDTH', '1920'))
     viewport_height = int(os.getenv('VIEWPORT_HEIGHT', '1080'))
     load_timeout = int(os.getenv('LOAD_TIMEOUT', '60000'))
+    preload_time_s = max(0, env_int('PRELOAD_TIME_S', 0))
     preload_wait_ms = max(5000, int(os.getenv('PRELOAD_WAIT_MS', '20000')))
     browser_performance_mode = env_bool('BROWSER_PERFORMANCE_MODE', True)
 
-    logger.info(f"🔄 PRELOAD_MODE: загружаем {target_url} (warm-up {preload_wait_ms}ms)...")
+    logger.info(
+        f"🔄 PRELOAD_MODE: загружаем {target_url} "
+        f"(warm-up min={preload_wait_ms}ms, target={preload_time_s}s)..."
+    )
     browser = None
     try:
         async with async_playwright() as p:
@@ -5701,14 +5858,17 @@ async def _run_preload_mode() -> None:
                 device_scale_factor=1,
             )
             page = await context.new_page()
+            page_opened_at = time.monotonic()
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=load_timeout)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=min(15000, load_timeout))
                 except Exception:
                     pass
+                page_opened_at = time.monotonic()
             except Exception as e:
                 logger.warning(f"⚠️ PRELOAD_MODE goto: {e}")
+                page_opened_at = time.monotonic()
             # Прокручиваем страницу вниз/вверх, чтобы триггернуть lazyload медиа
             try:
                 for _ in range(4):
@@ -5717,8 +5877,12 @@ async def _run_preload_mode() -> None:
                 await page.evaluate("() => window.scrollTo({ top: 0, behavior: 'auto' })")
             except Exception:
                 pass
-            await page.wait_for_timeout(max(3000, preload_wait_ms - 8000))
-            logger.info("✅ PRELOAD_MODE: прогрев завершён")
+            target_hold_ms = max(preload_wait_ms, preload_time_s * 1000)
+            elapsed_after_open_ms = int((time.monotonic() - page_opened_at) * 1000)
+            remaining_wait_ms = max(0, target_hold_ms - elapsed_after_open_ms)
+            if remaining_wait_ms > 0:
+                await page.wait_for_timeout(remaining_wait_ms)
+            logger.info(f"✅ PRELOAD_MODE: прогрев завершён ({target_hold_ms}ms после открытия сайта)")
             await context.close()
     except Exception as e:
         logger.warning(f"⚠️ PRELOAD_MODE error: {e}")

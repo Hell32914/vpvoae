@@ -50,6 +50,23 @@ fi
 
 echo "✅ Xvfb is running on :99"
 
+# Фаза предзагрузки: открываем сайт заранее БЕЗ записи,
+# чтобы дождаться полной инициализации страницы до старта FFmpeg.
+PRELOAD_TIME_S=${PRELOAD_TIME_S:-30}
+if ! [[ "$PRELOAD_TIME_S" =~ ^[0-9]+$ ]]; then
+  PRELOAD_TIME_S=30
+fi
+
+if [ "$PRELOAD_TIME_S" -gt 0 ]; then
+    echo ""
+    echo "=========================================="
+    echo "⏳ Starting pre-record warm-up"
+    echo "=========================================="
+    echo "⏳ Preload phase: открываем сайт и ждём ${PRELOAD_TIME_S}s до старта записи..."
+    DISPLAY=:99 PRELOAD_MODE=1 python /app/main.py 2>&1 | tail -30 || true
+    echo "✅ Preload phase завершена, запускаем запись"
+fi
+
 # Запускаем FFmpeg для видеозаписи
 echo ""
 echo "=========================================="
@@ -168,15 +185,6 @@ echo ""
 echo "=========================================="
 echo "📱 Starting VPVoAe Application"
 echo "=========================================="
-
-# Фаза предзагрузки: если PRELOAD_TIME_S > 0 — открываем сайт заранее,
-# чтобы все анимации и медиа загрузились ДО начала записи с курсором.
-PRELOAD_TIME_S=${PRELOAD_TIME_S:-0}
-if [ "$PRELOAD_TIME_S" -gt 0 ] 2>/dev/null; then
-    echo "⏳ Preload phase: загружаем сайт ${PRELOAD_TIME_S}s до начала записи..."
-    PRELOAD_MODE=1 timeout "${PRELOAD_TIME_S}" python /app/main.py 2>&1 | tail -30 || true
-    echo "✅ Preload phase завершена, начинаем запись с курсором"
-fi
 
 DISPLAY=:99 python /app/main.py
 APP_EXIT_CODE=$?
