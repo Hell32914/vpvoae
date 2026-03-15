@@ -2261,26 +2261,22 @@ async def perform_gsap_micro_scroll(
     """Микро-скролл для GSAP/ScrollTrigger сайтов: много мелких wheel-событий
     с короткими паузами вместо редких крупных прыжков.  Это заставляет GSAP
     плавно прокручивать анимации в pinned-секциях, как тачпад реального юзера."""
-    # Количество тиков зависит от slowdown (slow = меньше тиков, быстрее сцены)
+    # 10-15 тиков по 150px — достаточно, чтобы пробить длинные GSAP pinned секции
     n_ticks = random.randint(10, 15)
-    tick_size_base = 100  # px за один wheel-event
+    tick_size_base = 150  # px за один wheel-event (+50% vs 100 — пробивает тяжёлые GSAP слайдеры)
 
-    # Если включено замедление (slowdown) — уменьшаем размер тика,
-    # чтобы GSAP успевал отыграть анимацию между событиями
-    tick_size = max(40, int(tick_size_base * clamp(scroll_speed_factor, 0.30, 1.20)))
+    # При замедлении (slowdown на секциях) уменьшаем тик до ~80px, GSAP успевает сыграть сцену
+    tick_size = max(60, int(tick_size_base * clamp(scroll_speed_factor, 0.40, 1.20)))
 
     for i in range(n_ticks):
-        step = max(30, int(tick_size + random.uniform(-15, 20)))
+        step = max(50, int(tick_size + random.uniform(-20, 25)))
         try:
             await page.mouse.wheel(0, step)
         except Exception:
             pass
-        # 20-30 мс — достаточно быстро для плавности, но GSAP успевает реагировать
-        inter_tick_ms = random.randint(
-            max(scroll_pause_min_ms, 20),
-            max(scroll_pause_max_ms, min(scroll_pause_max_ms + 10, 30)),
-        )
-        await page.wait_for_timeout(inter_tick_ms)
+        # Фиксировано ~30мс — ровно столько нужно GSAP для обработки wheel-события
+        # без прыжков, но быстро относительно затяжных анимаций
+        await page.wait_for_timeout(random.randint(26, 34))
 
 
 async def force_scroll_progress(page: Any, viewport_height: int) -> None:
@@ -5012,15 +5008,27 @@ async def run_scroll_only_down_pass(
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
     min_duration_ms = max(4000, int(soft_budget_ms * 0.18))
     stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
+    # Абсолютный предохранитель: не зависаем на бесконечных GSAP-лендингах дольше N секунд.
+    # Когда срабатывает — выходим штатно, entrypoint.sh посылает SIGTERM в FFmpeg → видео сохраняется.
+    gsap_failsafe_ms = max(60000, min(env_int("GSAP_SCROLL_FAILSAFE_MS", 180000), 600000))
 
     last_scroll_y = -1
     stagnant_rounds = 0
     bottom_stable_rounds = 0
     round_index = 0
     last_progress_at = time.monotonic()
+    prev_dom_hash: int = 0  # для DOM-mutation guard (см. ниже)
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
+        # ── Глобальный предохранитель 180 с ─────────────────────────────────────
+        if elapsed_ms >= gsap_failsafe_ms:
+            logger.warning(
+                f"🔴 Scroll-only GSAP failsafe: {int(elapsed_ms / 1000)}s — "
+                "принудительное завершение (entrypoint.sh сохранит видео)"
+            )
+            break
+        # ────────────────────────────────────────────────────────────────────────
         if elapsed_ms >= soft_budget_ms and (reached_bottom or not require_bottom):
             break
         if elapsed_ms >= hard_budget_ms:
@@ -5234,7 +5242,29 @@ async def run_scroll_only_down_pass(
         # ────────────────────────────────────────────────────────────────────────
 
         scroll_advanced = current_scroll_y > (last_scroll_y + 6)
-        if scroll_advanced:
+
+        # ── DOM mutation guard ───────────────────────────────────────────────────
+        # На GSAP-сайтах window.scrollY стоит на месте пока идёт pinned-анимация.
+        # Если DOM меняется (innerHTML.length изменился) — значит анимация активна,
+        # скролл не завис по-настоящему, счётчик стагнации не трогаем.
+        dom_is_mutating = False
+        if not scroll_advanced:
+            try:
+                cur_dom_hash = int(await page.evaluate(
+                    """() => document.body ? document.body.innerHTML.length : 0"""
+                ))
+                if prev_dom_hash != 0 and cur_dom_hash != prev_dom_hash:
+                    dom_is_mutating = True
+                    logger.info(
+                        "🧭 Scroll-only DOM мутирует (GSAP анимация активна, scrollY не двигается) — "
+                        f"hash {prev_dom_hash}→{cur_dom_hash}, stagnant не считаем"
+                    )
+                prev_dom_hash = cur_dom_hash
+            except Exception:
+                pass
+        # ────────────────────────────────────────────────────────────────────────
+
+        if scroll_advanced or dom_is_mutating:
             stagnant_rounds = 0
             last_progress_at = time.monotonic()
         else:
@@ -5286,27 +5316,56 @@ async def run_scroll_only_down_pass(
         except Exception:
             gsap_at_real_bottom = False
 
-        # Принимаем оба сигнала: классические метрики ИЛИ прямая DOM-формула
-        effective_confirmed = bottom_confirmed or gsap_at_real_bottom
+        # ── Визуальный детектор подвала (Footer Detector) ───────────────────────
+        # Ищем <footer> или последний видимый блочный дочерний элемент <body>.
+        # Если его низ (getBoundingClientRect().bottom) ≤ window.innerHeight —
+        # низ сайта физически появился на экране, даже если scrollY стоит на месте.
+        try:
+            footer_in_viewport: bool = bool(await page.evaluate(
+                """() => {
+                    const footer = document.querySelector('footer');
+                    if (footer) {
+                        const r = footer.getBoundingClientRect();
+                        if (r.height > 0) return r.bottom <= window.innerHeight + 4;
+                    }
+                    // Fallback: последний видимый блочный ребёнок body
+                    const children = Array.from(document.body.children).reverse();
+                    for (const el of children) {
+                        const st = getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.height > 0) return r.bottom <= window.innerHeight + 4;
+                    }
+                    return false;
+                }"""
+            ))
+        except Exception:
+            footer_in_viewport = False
+
+        # Принимаем оба сигнала: классические метрики ИЛИ прямая DOM-формула ИЛИ footer виден
+        effective_confirmed = bottom_confirmed or gsap_at_real_bottom or footer_in_viewport
 
         if bottom_debug and (
             round_index % 8 == 0
             or (at_bottom and not bottom_confirmed)
             or bottom_confirmed
             or gsap_at_real_bottom
+            or footer_in_viewport
         ):
             logger.info(
                 "🧭 Scroll-only bottom check: "
-                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, gsapDOM={gsap_at_real_bottom}, "
+                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, "
+                f"gsapDOM={gsap_at_real_bottom}, footerVisible={footer_in_viewport}, "
                 f"reason={bottom_reason}, "
                 f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, docHeight={metric_document_height}, "
                 f"stable={bottom_stable_rounds}"
             )
 
-        if gsap_at_real_bottom and not bottom_confirmed:
+        if (gsap_at_real_bottom or footer_in_viewport) and not bottom_confirmed:
             logger.info(
-                f"🧭 Scroll-only GSAP: DOM-формула сигнализирует конец "
-                f"(scrollY={current_scroll_y}), ждём подтверждения"
+                f"🧭 Scroll-only GSAP/footer: конец страницы обнаружен визуально "
+                f"(gsap={gsap_at_real_bottom}, footer={footer_in_viewport}, scrollY={current_scroll_y}), "
+                "ждём подтверждения"
             )
 
         if effective_confirmed:
