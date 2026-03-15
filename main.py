@@ -2251,6 +2251,38 @@ async def perform_smooth_scroll(
         await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
 
 
+async def perform_gsap_micro_scroll(
+    page: Any,
+    viewport_height: int,
+    scroll_speed_factor: float,
+    scroll_pause_min_ms: int,
+    scroll_pause_max_ms: int,
+) -> None:
+    """Микро-скролл для GSAP/ScrollTrigger сайтов: много мелких wheel-событий
+    с короткими паузами вместо редких крупных прыжков.  Это заставляет GSAP
+    плавно прокручивать анимации в pinned-секциях, как тачпад реального юзера."""
+    # Количество тиков зависит от slowdown (slow = меньше тиков, быстрее сцены)
+    n_ticks = random.randint(10, 15)
+    tick_size_base = 100  # px за один wheel-event
+
+    # Если включено замедление (slowdown) — уменьшаем размер тика,
+    # чтобы GSAP успевал отыграть анимацию между событиями
+    tick_size = max(40, int(tick_size_base * clamp(scroll_speed_factor, 0.30, 1.20)))
+
+    for i in range(n_ticks):
+        step = max(30, int(tick_size + random.uniform(-15, 20)))
+        try:
+            await page.mouse.wheel(0, step)
+        except Exception:
+            pass
+        # 20-30 мс — достаточно быстро для плавности, но GSAP успевает реагировать
+        inter_tick_ms = random.randint(
+            max(scroll_pause_min_ms, 20),
+            max(scroll_pause_max_ms, min(scroll_pause_max_ms + 10, 30)),
+        )
+        await page.wait_for_timeout(inter_tick_ms)
+
+
 async def force_scroll_progress(page: Any, viewport_height: int) -> None:
     """Форсирует продвижение скролла на сайтах с нестандартным smooth-scroll."""
     delta = max(80, int(viewport_height * 0.9))
@@ -5087,7 +5119,7 @@ async def run_scroll_only_down_pass(
             effective_scroll_pause_min_ms = max(scroll_pause_min_ms, int(scroll_pause_min_ms * 1.6))
             effective_scroll_pause_max_ms = max(effective_scroll_pause_min_ms + 5, int(scroll_pause_max_ms * 1.85))
 
-        await perform_smooth_scroll(
+        await perform_gsap_micro_scroll(
             page=page,
             viewport_height=viewport_height,
             scroll_speed_factor=effective_scroll_speed_factor,
@@ -5096,6 +5128,10 @@ async def run_scroll_only_down_pass(
         )
         if slowdown_rounds_remaining > 0:
             slowdown_rounds_remaining -= 1
+
+        # Даём браузеру/GSAP время отрендерить новый контент и пересчитать scrollHeight
+        # (критично для Lazy Load и ScrollTrigger refresh)
+        await page.wait_for_timeout(500)
 
         try:
             after_metrics = await get_scroll_metrics(page)
@@ -5240,19 +5276,40 @@ async def run_scroll_only_down_pass(
         )
         metric_document_height = metrics_document_height(after_metrics, viewport_height)
 
+        # ── GSAP/ScrollTrigger: DOM-height formula ──────────────────────────────
+        # На scroll-jacked сайтах (GSAP pinned, Locomotive) window.scrollY может
+        # замирать пока идёт анимация; проверяем конец напрямую через scrollHeight.
+        try:
+            gsap_at_real_bottom: bool = bool(await page.evaluate(
+                """() => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2"""
+            ))
+        except Exception:
+            gsap_at_real_bottom = False
+
+        # Принимаем оба сигнала: классические метрики ИЛИ прямая DOM-формула
+        effective_confirmed = bottom_confirmed or gsap_at_real_bottom
+
         if bottom_debug and (
             round_index % 8 == 0
             or (at_bottom and not bottom_confirmed)
             or bottom_confirmed
+            or gsap_at_real_bottom
         ):
             logger.info(
                 "🧭 Scroll-only bottom check: "
-                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, reason={bottom_reason}, "
+                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, gsapDOM={gsap_at_real_bottom}, "
+                f"reason={bottom_reason}, "
                 f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, docHeight={metric_document_height}, "
                 f"stable={bottom_stable_rounds}"
             )
 
-        if bottom_confirmed:
+        if gsap_at_real_bottom and not bottom_confirmed:
+            logger.info(
+                f"🧭 Scroll-only GSAP: DOM-формула сигнализирует конец "
+                f"(scrollY={current_scroll_y}), ждём подтверждения"
+            )
+
+        if effective_confirmed:
             bottom_stable_rounds += 1
         else:
             bottom_stable_rounds = 0
@@ -5281,25 +5338,44 @@ async def run_scroll_only_down_pass(
                 await force_scroll_progress(page, viewport_height)
                 continue
 
-            pre_check_scroll = current_scroll_y
+            # ── GSAP lazy-load guard: счётчик попыток ──────────────────────────
+            # Даже если "дно" обнаружено, делаем 4 попытки с 1-секундными паузами:
+            # если scrollHeight вырос — контент ещё подгружается, скроллим дальше.
             try:
-                await force_scroll_progress(page, viewport_height)
-                await page.wait_for_timeout(random.randint(250, 500))
-                recheck_metrics = await get_scroll_metrics(page)
-                recheck_scroll = int(recheck_metrics.get("scrollY", pre_check_scroll))
+                prev_scroll_height = int(await page.evaluate(
+                    """() => document.documentElement.scrollHeight"""
+                ))
             except Exception:
-                recheck_scroll = pre_check_scroll
+                prev_scroll_height = metric_document_height
 
-            if recheck_scroll > pre_check_scroll + 10:
-                logger.info(
-                    f"🧭 Scroll-only: контент подгрузился (scroll {pre_check_scroll} → {recheck_scroll}), продолжаем"
-                )
-                bottom_stable_rounds = 0
-                last_scroll_y = recheck_scroll
-                last_progress_at = time.monotonic()
-                continue
+            gsap_content_grew = False
+            gsap_retry_count = 4
+            for _retry in range(gsap_retry_count):
+                await force_scroll_progress(page, viewport_height)
+                await page.wait_for_timeout(1000)
+                try:
+                    new_scroll_height = int(await page.evaluate(
+                        """() => document.documentElement.scrollHeight"""
+                    ))
+                except Exception:
+                    new_scroll_height = prev_scroll_height
+                if new_scroll_height > prev_scroll_height + 10:
+                    gsap_content_grew = True
+                    logger.info(
+                        f"🧭 Scroll-only GSAP guard: scrollHeight вырос "
+                        f"{prev_scroll_height}→{new_scroll_height} "
+                        f"(попытка {_retry + 1}/{gsap_retry_count}) — продолжаем"
+                    )
+                    prev_scroll_height = new_scroll_height
+                    bottom_stable_rounds = 0
+                    stagnant_rounds = 0
+                    last_progress_at = time.monotonic()
+                    break  # выходим из retry-цикла, возвращаемся к основному while
 
-            logger.info("🧭 Scroll-only: дно подтверждено, завершаем спуск")
+            if gsap_content_grew:
+                continue  # основной while-цикл — скроллим дальше
+
+            logger.info("🧭 Scroll-only: GSAP guard пройден, scrollHeight стабилен — дно подтверждено")
             reached_bottom = True
             break
 
