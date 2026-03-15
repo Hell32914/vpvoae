@@ -19,6 +19,9 @@ services:
       VISIBLE_CURSOR_ENABLED: ${VISIBLE_CURSOR_ENABLED:-true}
       SMART_CURSOR_ENABLED: ${SMART_CURSOR_ENABLED:-true}
       SMART_CURSOR_MODE: ${SMART_CURSOR_MODE:-default}
+      # SMART_CURSOR_MODE options:
+      #   default / explorer / hover  = Mode 1: Explorer with hovers (scroll + hover + nav tabs)
+      #   scroll_only / cta_analyzer / cta = Mode 2: CTA Analyzer (scroll + pause at sections + cursor on CTAs)
       SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS: ${SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS:-500}
       SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR: ${SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR:-0.58}
       SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS: ${SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS:-2}

@@ -56,6 +56,8 @@ def resolve_smart_cursor_mode(raw_value: Optional[str]) -> str:
         "default": "default",
         "standard": "default",
         "legacy": "default",
+        "explorer": "default",
+        "hover": "default",
         "scroll_only": "scroll_only",
         "scroll-only": "scroll_only",
         "scrollonly": "scroll_only",
@@ -63,6 +65,11 @@ def resolve_smart_cursor_mode(raw_value: Optional[str]) -> str:
         "descend-only": "scroll_only",
         "down_only": "scroll_only",
         "down-only": "scroll_only",
+        "cta_analyzer": "scroll_only",
+        "cta-analyzer": "scroll_only",
+        "ctaanalyzer": "scroll_only",
+        "cta": "scroll_only",
+        "analyzer": "scroll_only",
     }
     resolved = aliases.get(raw_mode)
     if resolved:
@@ -1729,6 +1736,248 @@ async def try_close_chat_widgets(page: Any) -> bool:
             await _recover_after_nav(page)
         return False
     return False
+
+
+async def try_close_cookie_banner(
+    page: Any,
+    cursor_pos: Tuple[float, float],
+    viewport_width: int,
+    viewport_height: int,
+) -> Tuple[Tuple[float, float], bool]:
+    """Ищет и закрывает cookie-баннеры по универсальным эвристикам.
+
+    Правило: ищем элементы (button, a, div) с z-index > 100,
+    позицией fixed/absolute, текст содержит cookie-related ключевые слова
+    на разных языках.
+    """
+    try:
+        cookie_target = await page.evaluate(
+            """
+            ({ viewportWidth, viewportHeight }) => {
+                const cookieAcceptWords = [
+                    'accept', 'accept all', 'allow', 'allow all', 'got it', 'agree',
+                    'ok', 'okay', 'i understand', 'understood', 'dismiss', 'close',
+                    'принять', 'згоден', 'согласен', 'понятно', 'хорошо',
+                    'accepter', 'tout accepter', 'akzeptieren', 'alle akzeptieren',
+                    'aceptar', 'aceptar todo', 'aceitar', 'accetta', 'accetta tutto',
+                    'aanvaarden', 'acceptera', 'godkänn',
+                ];
+
+                const bannerId = /cookie|consent|gdpr|privacy|cc-|cmp-|onetrust|cookiebot|klaro|tarteaucitron|osano|axeptio/i;
+
+                const candidates = [];
+                const interactives = document.querySelectorAll(
+                    'button, a, div[role="button"], span[role="button"], '
+                    + '[class*="cookie"] button, [class*="consent"] button, '
+                    + '[class*="cookie"] a, [class*="consent"] a, '
+                    + '[id*="cookie"] button, [id*="consent"] button, '
+                    + '[class*="accept"], [class*="agree"], [class*="dismiss"]'
+                );
+
+                for (const el of interactives) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden'
+                        || Number(style.opacity || '1') < 0.05) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 30 || rect.height < 16) continue;
+                    if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+
+                    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                    if (!text || text.length > 80) continue;
+
+                    const matchesKeyword = cookieAcceptWords.some(kw => text.includes(kw));
+                    if (!matchesKeyword) continue;
+
+                    // Проверяем, что элемент или его предок — баннероподобный контейнер
+                    let bannerLike = false;
+                    let current = el;
+                    let depth = 0;
+                    while (current && current instanceof HTMLElement && depth < 10) {
+                        const cs = window.getComputedStyle(current);
+                        const pos = cs.position;
+                        const z = parseInt(cs.zIndex) || 0;
+                        const isFixed = (pos === 'fixed' || pos === 'sticky');
+                        const isAbsolute = pos === 'absolute';
+                        const isHighZ = z > 100;
+
+                        // Баннер обычно внизу или вверху экрана
+                        const cRect = current.getBoundingClientRect();
+                        const atBottom = cRect.bottom > viewportHeight * 0.55;
+                        const atTop = cRect.top < viewportHeight * 0.35;
+
+                        if ((isFixed || isAbsolute || isHighZ) && (atBottom || atTop)) {
+                            bannerLike = true;
+                            break;
+                        }
+
+                        // Распознаём по class/id паттернам
+                        const hint = ((current.className || '').toString()
+                            + ' ' + (current.id || '')).toLowerCase();
+                        if (bannerId.test(hint)) {
+                            bannerLike = true;
+                            break;
+                        }
+                        current = current.parentElement;
+                        depth++;
+                    }
+
+                    if (!bannerLike) continue;
+
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+
+                    candidates.push({
+                        x: Math.max(2, Math.min(viewportWidth - 2, cx)),
+                        y: Math.max(2, Math.min(viewportHeight - 2, cy)),
+                        text: text.slice(0, 40),
+                        score: (style.cursor === 'pointer' ? 60 : 0)
+                            + (rect.width * rect.height > 2000 ? 40 : 0)
+                            + (/accept|принять|agree|zgod/i.test(text) ? 80 : 0)
+                    });
+                }
+
+                if (candidates.length === 0) return null;
+                candidates.sort((a, b) => b.score - a.score);
+                return candidates[0];
+            }
+            """,
+            {"viewportWidth": viewport_width, "viewportHeight": viewport_height},
+        )
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+        return cursor_pos, False
+
+    if not cookie_target:
+        return cursor_pos, False
+
+    tx = float(cookie_target["x"])
+    ty = float(cookie_target["y"])
+    text_hint = str(cookie_target.get("text", "")).strip()
+
+    logger.info(f"🍪 Обнаружен cookie-баннер: '{text_hint[:30]}', закрываем...")
+
+    cursor_pos = await move_mouse_human_like(
+        page, cursor_pos, (tx, ty),
+        viewport_width, viewport_height,
+        random.randint(300, 700),
+    )
+    await page.wait_for_timeout(random.randint(100, 300))
+    await page.mouse.click(tx, ty, delay=random.randint(40, 100))
+    await page.wait_for_timeout(random.randint(500, 1200))
+
+    logger.info("✅ Cookie-баннер закрыт")
+    return cursor_pos, True
+
+
+async def find_viewport_cta_elements(
+    page: Any,
+    viewport_width: int,
+    viewport_height: int,
+    limit: int = 3,
+) -> List[Dict[str, Any]]:
+    """Находит CTA-кнопки в текущем viewport с учётом контрастности фона."""
+    try:
+        return await page.evaluate(
+            """
+            ({ viewportWidth, viewportHeight, limit }) => {
+                const ctaKeywords = [
+                    'get started', 'start', 'download', 'contact', 'buy', 'sign up',
+                    'join', 'try', 'learn more', 'discover', 'explore', 'book',
+                    'schedule', 'demo', 'pricing', 'quote', 'request', 'subscribe',
+                    'apply', 'shop', 'free trial', "let's talk", 'lets talk',
+                    'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
+                    'записаться', 'связаться', 'заказать',
+                ];
+
+                function getLuminance(rgb) {
+                    const match = rgb.match(/\\d+/g);
+                    if (!match || match.length < 3) return 0.5;
+                    const [r, g, b] = match.map(Number);
+                    const sR = r / 255, sG = g / 255, sB = b / 255;
+                    const R = sR <= 0.03928 ? sR / 12.92 : Math.pow((sR + 0.055) / 1.055, 2.4);
+                    const G = sG <= 0.03928 ? sG / 12.92 : Math.pow((sG + 0.055) / 1.055, 2.4);
+                    const B = sB <= 0.03928 ? sB / 12.92 : Math.pow((sB + 0.055) / 1.055, 2.4);
+                    return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+                }
+
+                function hasContrastWithParent(el) {
+                    const style = window.getComputedStyle(el);
+                    const bgColor = style.backgroundColor;
+                    if (!bgColor || bgColor === 'transparent'
+                        || bgColor === 'rgba(0, 0, 0, 0)') return false;
+                    let parent = el.parentElement;
+                    let parentBg = 'rgba(0, 0, 0, 0)';
+                    let depth = 0;
+                    while (parent && depth < 6) {
+                        const pStyle = window.getComputedStyle(parent);
+                        const pBg = pStyle.backgroundColor;
+                        if (pBg && pBg !== 'transparent' && pBg !== 'rgba(0, 0, 0, 0)') {
+                            parentBg = pBg;
+                            break;
+                        }
+                        parent = parent.parentElement;
+                        depth++;
+                    }
+                    if (parentBg === 'rgba(0, 0, 0, 0)') parentBg = 'rgb(255, 255, 255)';
+                    const elLum = getLuminance(bgColor);
+                    const parentLum = getLuminance(parentBg);
+                    const ratio = (Math.max(elLum, parentLum) + 0.05)
+                        / (Math.min(elLum, parentLum) + 0.05);
+                    return ratio >= 2.0;
+                }
+
+                const candidates = [];
+                const elements = document.querySelectorAll(
+                    'button, a, [role="button"], [class*="btn"], [class*="cta"], [class*="action"]'
+                );
+
+                for (const el of elements) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden'
+                        || Number(style.opacity || '1') < 0.05) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 50 || rect.height < 18) continue;
+                    if (rect.top < -4 || rect.bottom > viewportHeight + 4) continue;
+                    if (rect.left < 0 || rect.right > viewportWidth) continue;
+
+                    const text = (el.innerText || '').trim().toLowerCase();
+                    if (text.length < 2 || text.length > 50) continue;
+
+                    const hasKeyword = ctaKeywords.some(kw => text.includes(kw));
+                    const hasContrast = hasContrastWithParent(el);
+
+                    if (!hasKeyword && !hasContrast) continue;
+
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+
+                    candidates.push({
+                        x: Math.max(2, Math.min(viewportWidth - 2, cx)),
+                        y: Math.max(2, Math.min(viewportHeight - 2, cy)),
+                        text: text.slice(0, 40),
+                        hasKeyword: hasKeyword,
+                        hasContrast: hasContrast,
+                        score: (hasKeyword ? 100 : 0)
+                            + (hasContrast ? 80 : 0)
+                            + (style.cursor === 'pointer' ? 30 : 0)
+                    });
+                }
+
+                candidates.sort((a, b) => b.score - a.score);
+                return candidates.slice(0, limit);
+            }
+            """,
+            {"viewportWidth": viewport_width, "viewportHeight": viewport_height, "limit": limit},
+        )
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+        return []
 
 
 async def perform_followup_click_sequence(
@@ -4589,6 +4838,9 @@ def is_scroll_only_cta_landmark(target: Dict[str, Any], viewport_height: int) ->
         "pricing", "price", "quote", "request", "learn more", "discover",
         "explore", "join", "subscribe", "sign up", "apply", "buy", "shop",
         "download", "free trial", "trial", "let's talk", "lets talk",
+        "try", "try free", "try now", "get it", "order",
+        "начать", "попробовать", "купить", "скачать", "подписаться",
+        "записаться", "связаться", "заказать", "бронировать",
     )
     button_like = tag in {"button", "a", "summary"} or bool(href)
     compact_label = len(text_low) <= 44 and len(text_low.split()) <= 6
@@ -4600,6 +4852,8 @@ def build_scroll_only_section_landmarks(
     targets: List[Dict[str, Any]],
     viewport_height: int,
 ) -> List[Dict[str, Any]]:
+    """Возвращает только CTA-лендмарки из предварительно собранных целей.
+    Заголовки (h1–h4) обнаруживаются в реальном времени во время прокрутки."""
     raw_landmarks: List[Dict[str, Any]] = []
 
     for item in targets:
@@ -4611,41 +4865,23 @@ def build_scroll_only_section_landmarks(
         if not text:
             continue
 
-        kind: Optional[str] = None
-        if is_scroll_only_heading_landmark(item):
-            kind = "heading"
-        elif is_scroll_only_cta_landmark(item, viewport_height):
-            kind = "cta"
-
-        if not kind:
+        if not is_scroll_only_cta_landmark(item, viewport_height):
             continue
 
         raw_landmarks.append({
-            "key": str(item.get("key", "")) or f"{kind}|{int(abs_y)}|{text[:24]}",
+            "key": str(item.get("key", "")) or f"cta|{int(abs_y)}|{text[:24]}",
             "absY": abs_y,
-            "kind": kind,
+            "kind": "cta",
             "label": text[:72],
         })
 
-    raw_landmarks.sort(key=lambda item: (float(item.get("absY", 0.0)), 0 if item.get("kind") == "heading" else 1))
+    raw_landmarks.sort(key=lambda item: float(item.get("absY", 0.0)))
 
     deduped: List[Dict[str, Any]] = []
     min_gap = max(140.0, viewport_height * 0.18)
     for item in raw_landmarks:
-        if not deduped:
+        if not deduped or (float(item.get("absY", 0.0)) - float(deduped[-1].get("absY", 0.0))) >= min_gap:
             deduped.append(item)
-            continue
-
-        prev = deduped[-1]
-        close_enough = (float(item.get("absY", 0.0)) - float(prev.get("absY", 0.0))) < min_gap
-        if not close_enough:
-            deduped.append(item)
-            continue
-
-        prev_priority = 0 if prev.get("kind") == "heading" else 1
-        item_priority = 0 if item.get("kind") == "heading" else 1
-        if item_priority < prev_priority:
-            deduped[-1] = item
 
     return deduped
 
@@ -4664,8 +4900,10 @@ async def run_scroll_only_down_pass(
     require_bottom_max_ms: int,
     bottom_debug: bool,
     stall_timeout_ms: int,
-) -> bool:
-    """Чистый режим прокрутки: только движение вниз без hover, кликов и навигации."""
+    cursor_pos: Tuple[float, float] = (960.0, 540.0),
+) -> Tuple[bool, Tuple[float, float]]:
+    """Режим прокрутки с CTA-анализом: спуск вниз, замедление на заголовках,
+    наведение курсора на CTA-кнопки для демонстрации."""
     reached_bottom = False
     section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 500), 4000))
     section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.58), 0.20, 1.0)
@@ -4673,6 +4911,7 @@ async def run_scroll_only_down_pass(
     section_landmarks: List[Dict[str, Any]] = []
     next_landmark_index = 0
     slowdown_rounds_remaining = 0
+    seen_heading_keys: Set[str] = set()
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -4690,7 +4929,7 @@ async def run_scroll_only_down_pass(
         section_landmarks = build_scroll_only_section_landmarks(section_targets, viewport_height)
         if section_landmarks:
             logger.info(
-                "🧭 Scroll-only landmarks: "
+                "🧭 Scroll-only CTA-landmarks: "
                 f"found={len(section_landmarks)}, pause={section_pause_ms}ms, "
                 f"slowdown={section_slowdown_factor:.2f}x/{section_slowdown_rounds} rounds"
             )
@@ -4762,14 +5001,41 @@ async def run_scroll_only_down_pass(
             break
 
         if visible_landmark is not None:
-            landmark_kind = "CTA" if visible_landmark.get("kind") == "cta" else "section"
             landmark_label = str(visible_landmark.get("label", "")).strip()
             logger.info(
-                f"🧭 Scroll-only: новая {landmark_kind} зона '{landmark_label[:56]}' — пауза {section_pause_ms}ms"
+                f"🧭 Scroll-only: CTA-зона '{landmark_label[:56]}' — пауза {section_pause_ms}ms"
             )
             if section_pause_ms > 0:
                 await page.wait_for_timeout(section_pause_ms)
             slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
+
+            # Наведение курсора на CTA-кнопку для демонстрации
+            try:
+                viewport_ctas = await find_viewport_cta_elements(
+                    page, viewport_width, viewport_height, limit=2,
+                )
+                if viewport_ctas:
+                    cta = viewport_ctas[0]
+                    cta_x = float(cta.get("x", viewport_width * 0.5))
+                    cta_y = float(cta.get("y", viewport_height * 0.5))
+                    cta_text = str(cta.get("text", "")).strip()
+                    logger.info(f"🎯 Scroll-only: наведение на CTA '{cta_text[:30]}'")
+                    cursor_pos = await move_mouse_human_like(
+                        page, cursor_pos, (cta_x, cta_y),
+                        viewport_width, viewport_height,
+                        random.randint(300, 700),
+                    )
+                    await page.wait_for_timeout(random.randint(1000, 1500))
+                    # Уводим мышь в сторону, чтобы не перекрывать контент
+                    cursor_pos = await move_mouse_human_like(
+                        page, cursor_pos,
+                        (viewport_width * 0.15, viewport_height * 0.5),
+                        viewport_width, viewport_height,
+                        random.randint(200, 450),
+                    )
+            except Exception as _cta_exc:
+                if _is_nav_error(_cta_exc):
+                    await _recover_after_nav(page)
 
         effective_scroll_speed_factor = scroll_speed_factor
         effective_scroll_pause_min_ms = scroll_pause_min_ms
@@ -4816,6 +5082,72 @@ async def run_scroll_only_down_pass(
                 at_bottom = False
             else:
                 raise
+
+        # Живое определение заголовков в текущем viewport ──────────────────────
+        try:
+            live_headings = await page.evaluate(
+                """() => {
+                    const result = [];
+                    const vh = window.innerHeight;
+                    const vw = window.innerWidth;
+                    const els = document.querySelectorAll('h1, h2, h3, h4');
+                    for (const el of els) {
+                        const text = (el.textContent || '').trim();
+                        if (!text) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top >= -4 && rect.top <= vh * 0.45 && rect.height > 0) {
+                            result.push({
+                                text: text.slice(0, 80),
+                                x: Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2)),
+                                y: Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))
+                            });
+                        }
+                    }
+                    return result;
+                }"""
+            )
+            for h_item in (live_headings or []):
+                h_text = h_item.get("text", "") if isinstance(h_item, dict) else str(h_item)
+                if h_text not in seen_heading_keys:
+                    seen_heading_keys.add(h_text)
+                    logger.info(
+                        f"🧭 Scroll-only: заголовок '{h_text[:56]}' — пауза {section_pause_ms}ms"
+                    )
+                    if section_pause_ms > 0:
+                        await page.wait_for_timeout(section_pause_ms)
+                    slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
+
+            # После обнаружения заголовков, ищем CTA в viewport для наведения курсора
+            if live_headings:
+                try:
+                    viewport_ctas = await find_viewport_cta_elements(
+                        page, viewport_width, viewport_height, limit=2,
+                    )
+                    if viewport_ctas:
+                        cta = viewport_ctas[0]
+                        cta_x = float(cta.get("x", viewport_width * 0.5))
+                        cta_y = float(cta.get("y", viewport_height * 0.5))
+                        cta_text = str(cta.get("text", "")).strip()
+                        logger.info(f"🎯 Scroll-only: CTA рядом с заголовком '{cta_text[:30]}'")
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos, (cta_x, cta_y),
+                            viewport_width, viewport_height,
+                            random.randint(250, 600),
+                        )
+                        await page.wait_for_timeout(random.randint(800, 1300))
+                        cursor_pos = await move_mouse_human_like(
+                            page, cursor_pos,
+                            (viewport_width * 0.15, viewport_height * 0.5),
+                            viewport_width, viewport_height,
+                            random.randint(180, 400),
+                        )
+                except Exception as _cta_exc2:
+                    if _is_nav_error(_cta_exc2):
+                        await _recover_after_nav(page)
+        except Exception as _exc:
+            if _is_nav_error(_exc):
+                await _recover_after_nav(page)
+        # ────────────────────────────────────────────────────────────────────────
 
         scroll_advanced = current_scroll_y > (last_scroll_y + 6)
         if scroll_advanced:
@@ -4946,7 +5278,7 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.warning(f"⚠️ Scroll-only: ошибка финального доскролла: {exc}")
 
-    return reached_bottom
+    return reached_bottom, cursor_pos
 
 
 async def run_smart_cursor(
@@ -5038,9 +5370,26 @@ async def run_smart_cursor(
 
     await ensure_page_within_allowed_site(page, site_url, fallback_url=site_url, timeout=15000)
 
+    # Закрытие cookie-баннеров (универсально для всех режимов)
+    try:
+        cursor_pos, cookie_closed = await try_close_cookie_banner(
+            page, cursor_pos, viewport_width, viewport_height,
+        )
+        if cookie_closed:
+            await page.wait_for_timeout(random.randint(300, 600))
+    except Exception as exc:
+        if _is_nav_error(exc):
+            await _recover_after_nav(page)
+
+    # Скрытие чат-виджетов (Intercom, Drift и т.д.)
+    try:
+        await try_close_chat_widgets(page)
+    except Exception:
+        pass
+
     if scroll_only_mode_active:
-        logger.info("🧭 Smart cursor: режим SCROLL_ONLY (только спуск вниз, без hover/click/nav)")
-        reached_bottom = await run_scroll_only_down_pass(
+        logger.info("🧭 Smart cursor: режим CTA_ANALYZER / SCROLL_ONLY (спуск с акцентом на CTA)")
+        reached_bottom, cursor_pos = await run_scroll_only_down_pass(
             page=page,
             viewport_width=viewport_width,
             viewport_height=viewport_height,
@@ -5054,11 +5403,12 @@ async def run_smart_cursor(
             require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
             bottom_debug=bottom_debug,
             stall_timeout_ms=strict_stall_timeout_ms,
+            cursor_pos=cursor_pos,
         )
         if reached_bottom:
-            logger.info("🧭 Smart cursor: режим SCROLL_ONLY завершён, страница прокручена до конца")
+            logger.info("🧭 Smart cursor: режим CTA_ANALYZER завершён, страница прокручена до конца")
         else:
-            logger.warning("⚠️ Smart cursor: режим SCROLL_ONLY завершился по таймауту до достижения конца страницы")
+            logger.warning("⚠️ Smart cursor: режим CTA_ANALYZER завершился по таймауту до достижения конца страницы")
         return hovered_count
 
     strict_mode_active = strict_top_to_bottom_mode or always_descend
