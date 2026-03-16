@@ -7,6 +7,7 @@ import random
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
+import subprocess
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 
@@ -4997,9 +4998,49 @@ _JS_SCROLL_ONE_VIEWPORT = """
         resolve({ isBottom, headings, ctas, scrollY: Math.round(window.scrollY) });
     }
 
+    // Smart Virtual Scroll Detector:
+    // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
+    // document.body at ~100vh while the real content lives inside a transformed
+    // container. We first look for that container, then measure its true height.
+    function findScrollContainer() {
+        // Priority 1: explicit virtual-scroll container attributes/ids
+        const byAttr = document.querySelector(
+            '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content'
+        );
+        if (byAttr) return byAttr;
+        // Priority 2: tallest direct child of body that exceeds 1.5× viewport
+        let tallest = null;
+        let tallestH = 0;
+        const vhMin = window.innerHeight * 1.5;
+        for (const child of (document.body ? document.body.children : [])) {
+            const h = child.scrollHeight || child.offsetHeight || 0;
+            if (h > tallestH && h > vhMin) {
+                tallestH = h;
+                tallest = child;
+            }
+        }
+        return tallest;
+    }
+
     function isAtBottom() {
-        return Math.ceil(window.scrollY + window.innerHeight) >=
-               document.documentElement.scrollHeight - 50;
+        // Standard native-scroll check (works on most sites)
+        if (Math.ceil(window.scrollY + window.innerHeight) >=
+            document.documentElement.scrollHeight - 50) {
+            return true;
+        }
+        // Virtual scroll container check (Locomotive / Lenis / GSAP)
+        // Formula: |container.top| + innerHeight >= container.scrollHeight - 100
+        const container = findScrollContainer();
+        if (container &&
+            container !== document.documentElement &&
+            container !== document.body) {
+            const rect = container.getBoundingClientRect();
+            const csh  = container.scrollHeight || container.offsetHeight || 0;
+            if (csh > window.innerHeight) {
+                return Math.abs(rect.top) + window.innerHeight >= csh - 100;
+            }
+        }
+        return false;
     }
 
     function collectVisible() {
@@ -5267,6 +5308,27 @@ async def run_scroll_only_down_pass(
         # ── True Bottom: immediate exit — no timeout polling ─────────────────────
         if js_is_bottom:
             elapsed_since_start_ms = (time.monotonic() - started_at) * 1000
+
+            # ── Fake Bottom guard: virtual scroll (Locomotive / Lenis / GSAP) ────
+            # On sites where document.body is ~100vh and content is driven by CSS
+            # transform inside a container, scrollY stays near 0 while the page
+            # appears to scroll. If we hit "bottom" in the first 5 s with no real
+            # scrollY movement, treat this as a false positive: keep driving the
+            # virtual scroller via page.mouse.wheel() instead of exiting.
+            if elapsed_since_start_ms < 5000 and last_scroll_y < 50:
+                logger.info(
+                    f"🟡 Scroll-only: Fake Bottom (виртуальный скролл?) — "
+                    f"дно в первые {int(elapsed_since_start_ms)}ms при scrollY={last_scroll_y}, "
+                    "крутим wheel() и игнорируем флаг"
+                )
+                try:
+                    await page.mouse.wheel(0, viewport_height)
+                except Exception:
+                    pass
+                stagnant_rounds = 0
+                continue
+            # ─────────────────────────────────────────────────────────────────────
+
             if elapsed_since_start_ms < min_duration_ms:
                 logger.info(
                     f"🧭 Scroll-only: дно найдено слишком рано "
@@ -6226,6 +6288,88 @@ async def run_smart_cursor(
     return hovered_count
 
 
+def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
+    """Запускает FFmpeg для захвата виртуального дисплея Xvfb.
+
+    Строит команду из стандартных env-переменных (VIEWPORT_WIDTH, FFMPEG_FRAMERATE
+    и т.д.) и возвращает subprocess.Popen-объект. Вызывается из main() после
+    30-секундного прогрева страницы, до старта основного цикла прокрутки.
+    """
+    output_path = os.getenv('OUTPUT_PATH', '/app/output')
+    os.makedirs(output_path, exist_ok=True)
+
+    screen_width  = env_int('VIEWPORT_WIDTH',  1920)
+    screen_height = env_int('VIEWPORT_HEIGHT', 1080)
+    # libx264/yuv420p требует чётных размеров
+    if screen_width  % 2 != 0:
+        screen_width  -= 1
+    if screen_height % 2 != 0:
+        screen_height -= 1
+
+    framerate  = max(8, min(60, env_int('FFMPEG_FRAMERATE', 15)))
+    preset     = os.getenv('FFMPEG_PRESET', 'ultrafast')
+    crf        = env_int('FFMPEG_CRF', 24)
+    threads    = max(1, env_int('FFMPEG_THREADS', 2))
+    nice_level = max(-20, min(19, env_int('FFMPEG_NICE_LEVEL', 10)))
+    _dm_raw    = os.getenv('FFMPEG_DRAW_MOUSE', '0')
+    draw_mouse = _dm_raw if _dm_raw in ('0', '1') else '0'
+    display    = os.getenv('DISPLAY', ':99')
+
+    crop_top  = env_int('FFMPEG_CROP_TOP', 0)
+    auto_crop = env_bool('FFMPEG_AUTO_CROP_BROWSER_UI', True)
+    if crop_top == 0 and auto_crop:
+        crop_top = screen_height // 11
+    if crop_top % 2 != 0:
+        crop_top += 1
+
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_file = os.path.join(output_path, f"recording_{timestamp}.mp4")
+
+    cmd: List[str] = [
+        'nice', '-n', str(nice_level),
+        'ffmpeg',
+        '-f', 'x11grab',
+        '-video_size', f'{screen_width}x{screen_height}',
+        '-framerate', str(framerate),
+        '-draw_mouse', draw_mouse,
+        '-i', display,
+    ]
+
+    if crop_top > 0:
+        crop_height = screen_height - crop_top
+        if crop_height < 100:
+            crop_height = 100
+        if crop_height % 2 != 0:
+            crop_height -= 1
+        crop_top = screen_height - crop_height   # пересчёт после коррекции
+        cmd.extend(['-vf', f'crop={screen_width}:{crop_height}:0:{crop_top}'])
+
+    cmd.extend([
+        '-c:v', 'libx264',
+        '-preset', preset,
+        '-crf', str(crf),
+        '-threads', str(threads),
+        '-pix_fmt', 'yuv420p',
+        '-y',
+        video_file,
+    ])
+
+    logger.info(f"🎥 FFmpeg command: {' '.join(cmd)}")
+    logger.info(f"   Recording to: {video_file}")
+    if crop_top > 0:
+        logger.info(f"   Crop top: {crop_top}px")
+    logger.info(f"   Framerate: {framerate}fps, preset={preset}, crf={crf}, nice={nice_level}")
+
+    try:
+        ffmpeg_log = open('/tmp/ffmpeg.log', 'w', encoding='utf-8', errors='replace')
+        proc = subprocess.Popen(cmd, stdout=ffmpeg_log, stderr=subprocess.STDOUT)
+        logger.info(f"   FFmpeg PID: {proc.pid}")
+        return proc
+    except Exception as exc:
+        logger.error(f"❌ Не удалось запустить FFmpeg: {exc}")
+        return None
+
+
 async def _run_preload_mode() -> None:
     """Режим предзагрузки: открываем сайт, ждём загрузки всего контента и выходим.
 
@@ -6305,6 +6449,7 @@ async def _run_preload_mode() -> None:
 async def main():
     """Главная функция для рендеринга веб-сайта на сервере с Xvfb и FFmpeg видеозаписью."""
     browser = None
+    ffmpeg_proc: Optional[subprocess.Popen] = None
 
     # ── PRELOAD_MODE: прогрев без FFmpeg-записи (используется entrypoint.sh) ──
     preload_mode = env_bool('PRELOAD_MODE', False)
@@ -6560,28 +6705,25 @@ async def main():
                 except Exception:
                     logger.warning("⚠️ Не удалось переключить браузер в fullscreen")
 
-            # ── Вместо статического сна двигаем курсор во время прогрева ──
-            # Это делает появление курсора заметным сразу, без 17-секундной паузы.
-            logger.info(f"⏳ Прогрев страницы: медленное движение курсора ({render_timeout}ms)...")
-            if visible_cursor_enabled and render_timeout >= 800:
-                _warm_target = (
-                    viewport_width * random.uniform(0.44, 0.62),
-                    viewport_height * random.uniform(0.30, 0.52),
+            # ── Прогрев 30 секунд: ждём полной инициализации прелоадеров и WebGL ──
+            # FFmpeg стартует только ПОСЛЕ прогрева, чтобы запись не начиналась
+            # со спиннерами / незагруженными ресурсами — всё в одной браузерной
+            # сессии (нет разделения «preload» / «render»).
+            logger.info("⏳ Прогрев страницы: 30 секунд для прелоадеров и WebGL...")
+            await page.wait_for_timeout(30000)
+
+            # ── Запуск FFmpeg прямо из Python ────────────────────────────────────
+            logger.info("🎥 Запуск FFmpeg записи...")
+            ffmpeg_proc = _spawn_ffmpeg()
+            if ffmpeg_proc is None:
+                raise RuntimeError("FFmpeg не удалось запустить — прерываем рендер")
+            logger.info("⏳ Даём FFmpeg 2 секунды на инициализацию файла...")
+            await asyncio.sleep(2)
+            if ffmpeg_proc.poll() is not None:
+                raise RuntimeError(
+                    "FFmpeg завершился преждевременно после старта — смотрите /tmp/ffmpeg.log"
                 )
-                try:
-                    await move_mouse_human_like(
-                        page,
-                        (_entry_cx, _entry_cy),
-                        _warm_target,
-                        viewport_width,
-                        viewport_height,
-                        max(700, render_timeout - 400),
-                    )
-                    await page.wait_for_timeout(min(400, render_timeout))
-                except Exception:
-                    await page.wait_for_timeout(render_timeout)
-            else:
-                await page.wait_for_timeout(render_timeout)
+            logger.info("✅ FFmpeg успешно записывает")
 
             if smart_cursor_enabled and smart_cursor_timeout > 0:
                 logger.info(
@@ -6653,15 +6795,38 @@ async def main():
             else:
                 logger.info("📸 Скриншот пропущен по конфигурации")
 
+            # ── Остановка FFmpeg после завершения прокрутки ────────────────────
+            if ffmpeg_proc is not None:
+                logger.info("🎬 Остановка FFmpeg...")
+                try:
+                    ffmpeg_proc.terminate()
+                    ffmpeg_proc.wait(timeout=15)
+                    logger.info("✅ FFmpeg остановлен корректно")
+                except subprocess.TimeoutExpired:
+                    logger.warning("⚠️ FFmpeg не ответил на SIGTERM, принудительное завершение...")
+                    ffmpeg_proc.kill()
+                    ffmpeg_proc.wait()
+                except Exception as _ffe:
+                    logger.warning(f"⚠️ Ошибка при остановке FFmpeg: {_ffe}")
+                ffmpeg_proc = None
+
             await context.close()
             logger.info("✨ Рендеринг завершен успешно")
-            logger.info("📹 FFmpeg продолжает запись (будет остановлен в entrypoint.sh)")
             sys.exit(0)
 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка: {e}", exc_info=True)
         sys.exit(1)
     finally:
+        if ffmpeg_proc is not None:
+            try:
+                ffmpeg_proc.terminate()
+                ffmpeg_proc.wait(timeout=10)
+            except Exception:
+                try:
+                    ffmpeg_proc.kill()
+                except Exception:
+                    pass
         if browser:
             try:
                 await browser.close()
