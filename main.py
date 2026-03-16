@@ -4959,20 +4959,25 @@ def build_scroll_only_section_landmarks(
 # True Bottom: container-based — |container.getBoundingClientRect().top| + innerHeight >= container.scrollHeight - 100
 # Works for both native scroll and virtual scroll (Locomotive / Lenis / GSAP transform containers).
 _JS_SCROLL_ONE_VIEWPORT = """
-(step) => new Promise((resolve) => {
+(step) => new Promise(async (resolve) => {
     // Anti-Overlap: если уже идёт скролл — немедленно вернуть текущий статус
     if (window._isPlaywrightScrolling) {
-        resolve({ isBottom: false, headings: [], ctas: [], scrollY: Math.round(window.scrollY) });
+        resolve({ isBottom: false, headings: [], ctas: [], scrollY: Math.round(window.scrollY), containerTop: 0 });
         return;
     }
     window._isPlaywrightScrolling = true;
 
-    // Delta Time: скорость в px/сек не зависит от FPS
-    // step=4 → 400px/s (нормальная езда), step=2 → 200px/s (замедление у заголовков)
-    const SPEED_PX_PER_SEC = ((typeof step === 'number' && step > 0) ? step : 4) * 100;
-    const targetDist = Math.round(window.innerHeight * 0.90);
-    const startScrollY = window.scrollY;
-    const targetScrollY = startScrollY + targetDist;
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+
+    // step=2 → slow mode (heading/CTA section): 14 × 70ms ≈ 1000ms per viewport
+    // step=4 → normal mode:                     10 × 50ms ≈  500ms per viewport
+    const slowMode = (typeof step === 'number' && step > 0 && step <= 2);
+    const targetDist = Math.round(vh * 0.90);
+    const totalSteps = slowMode ? 14 : 10;
+    const stepDelayMs = slowMode ? 70 : 50;
+    const deltaPerStep = targetDist / totalSteps;
+
     const headings = [];
     const ctas = [];
     const seenTexts = new Set();
@@ -4992,20 +4997,6 @@ _JS_SCROLL_ONE_VIEWPORT = """
         '\u0437\u0430\u043a\u0430\u0437\u0430\u0442\u044c',
         '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
     ];
-    let lastTime = null;
-    let lastFrameScrollY = -999999;
-    let stagnantFrames = 0;
-
-    function done(isBottom) {
-        window._isPlaywrightScrolling = false;
-        const _dc = findScrollContainer() || document.body;
-        const _dr = _dc.getBoundingClientRect();
-        resolve({
-            isBottom, headings, ctas,
-            scrollY: Math.round(window.scrollY),
-            containerTop: Math.round(_dr.top),
-        });
-    }
 
     // Smart Virtual Scroll Detector:
     // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
@@ -5013,7 +5004,6 @@ _JS_SCROLL_ONE_VIEWPORT = """
     // container. We locate that container and measure scroll progress via
     // getBoundingClientRect().top — works for both transform-based and native scroll.
     function findScrollContainer() {
-        const vh = window.innerHeight;
         // Priority 1: explicit virtual-scroll marker attributes / well-known ids
         const byAttr = document.querySelector(
             '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content, .lenis'
@@ -5056,8 +5046,6 @@ _JS_SCROLL_ONE_VIEWPORT = """
     }
 
     function collectVisible() {
-        const vh = window.innerHeight;
-        const vw = window.innerWidth;
         // Smart Focus Zone: триггер только когда элемент попал в центральные 50% экрана
         const focusTop = vh * 0.25;
         const focusBottom = vh * 0.75;
@@ -5098,45 +5086,44 @@ _JS_SCROLL_ONE_VIEWPORT = """
         }
     }
 
-    function tick(currentTime) {
-        // Первый кадр: инициализируем lastTime и ждём следующего для корректного deltaTime
-        if (lastTime === null) {
-            lastTime = currentTime;
-            lastFrameScrollY = Math.round(window.scrollY);
-            requestAnimationFrame(tick);
-            return;
-        }
-        // Ограничиваем deltaTime до 100ms (защита от фриза / фоновой вкладки)
-        const deltaTime = Math.min(currentTime - lastTime, 100);
-        lastTime = currentTime;
+    // ── Phase 1: Native smooth scroll for classic/native-scroll sites ────────────
+    // scrollBy with behavior:'smooth' gives the browser a graceful easing curve
+    // without buffering inertia the way raw WheelEvents do.
+    try { window.scrollBy({ top: targetDist, behavior: 'smooth' }); } catch(e) {}
 
-        // JS-level stagnation guard: fixed-viewport / 3D-canvas sites (e.g. Phantom.com)
-        // where window.scrollBy() is a no-op and scrollY never moves — without this the
-        // rAF loop would spin forever and page.evaluate() would never resolve.
-        // Exit after 90 consecutive frozen frames (~1.5 s at 60 fps).
-        const curY = Math.round(window.scrollY);
-        if (curY === lastFrameScrollY) {
-            stagnantFrames++;
-        } else {
-            stagnantFrames = 0;
-            lastFrameScrollY = curY;
-        }
-        if (stagnantFrames >= 90) { done(false); return; }
-
+    // ── Phase 2: Synthetic WheelEvents dispatched to document.body ───────────────
+    // Virtual-scroll engines (Lenis / Locomotive / GSAP ScrollTrigger) intercept
+    // wheel events on the body element and drive their internal animation.
+    // Dispatching to document.body (not window, not the element under cursor)
+    // avoids scroll-hijacking by in-page widgets like currency calculators,
+    // Google Maps, or carousels that only intercept events when hovered.
+    for (let i = 0; i < totalSteps; i++) {
+        try {
+            document.body.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: deltaPerStep,
+                deltaMode: 0,   // DOM_DELTA_PIXEL
+                bubbles: true,
+                cancelable: true,
+                clientX: vw / 2,
+                clientY: vh / 2,
+            }));
+        } catch(e) {}
         collectVisible();
-        if (isAtBottom()) { done(true); return; }
-        if (window.scrollY >= targetScrollY - 1) { done(false); return; }
-
-        // Delta Time scroll: фиксированная скорость в px/сек, независимо от FPS
-        const advance = Math.min(
-            Math.max(1, Math.round(SPEED_PX_PER_SEC * deltaTime / 1000)),
-            Math.ceil(targetScrollY - window.scrollY)
-        );
-        window.scrollBy(0, advance);
-        requestAnimationFrame(tick);
+        await new Promise(r => setTimeout(r, stepDelayMs));
     }
 
-    requestAnimationFrame(tick);
+    collectVisible();
+
+    const container = findScrollContainer() || document.body;
+    const containerRect = container.getBoundingClientRect();
+    window._isPlaywrightScrolling = false;
+    resolve({
+        isBottom: isAtBottom(),
+        headings,
+        ctas,
+        scrollY: Math.round(window.scrollY),
+        containerTop: Math.round(containerRect.top),
+    });
 })"""
 
 
@@ -5170,10 +5157,11 @@ async def run_scroll_only_down_pass(
     except Exception:
         pass
 
-    # Centre the cursor before scrolling: virtual-scroll engines (Lenis, Locomotive)
-    # ignore wheel events dispatched outside viewport content — hover is required.
+    # Park cursor at the left safe zone before scrolling starts.
+    # Staying at x≈10 ensures the cursor never hovers over an interactive widget
+    # (currency calculator, Google Maps, carousel) that would intercept scroll events.
     try:
-        await page.mouse.move(viewport_width * 0.5, viewport_height * 0.5)
+        await page.mouse.move(10, viewport_height * 0.5)
         await page.wait_for_timeout(120)
     except Exception:
         pass
@@ -5213,9 +5201,15 @@ async def run_scroll_only_down_pass(
         round_index += 1
         before_scroll_y = max(last_scroll_y, 0)
 
-        # ── JS rAF smooth scroll engine ──────────────────────────────────────────
-        # step=2 gives ~30fps (slows on CTA sections), step=4 gives ~60fps normal travel
+        # ── JS scroll engine: scrollBy + synthetic WheelEvents to document.body ─────
+        # step=2 → slow (heading/CTA pause), step=4 → normal speed
         js_step = 2 if slowdown_rounds_remaining > 0 else 4
+        # Return cursor to left safe zone before dispatching scroll — prevents
+        # accidental hover over widgets (currency calculator, maps, carousels).
+        try:
+            await page.mouse.move(10, viewport_height * 0.5)
+        except Exception:
+            pass
         try:
             result = await page.evaluate(_JS_SCROLL_ONE_VIEWPORT, js_step)
         except Exception as exc:
@@ -5374,15 +5368,29 @@ async def run_scroll_only_down_pass(
             # transform inside a container, scrollY stays near 0 while the page
             # appears to scroll. If we hit "bottom" in the first 5 s with no real
             # scrollY movement, treat this as a false positive: keep driving the
-            # virtual scroller via page.mouse.wheel() instead of exiting.
+            # virtual scroller via JS body-WheelEvent injection instead of exiting.
             if elapsed_since_start_ms < 5000 and last_scroll_y < 50:
                 logger.info(
                     f"🟡 Scroll-only: Fake Bottom (виртуальный скролл?) — "
                     f"дно в первые {int(elapsed_since_start_ms)}ms при scrollY={last_scroll_y}, "
-                    "крутим wheel() и игнорируем флаг"
+                    "инжектируем WheelEvent в body и игнорируем флаг"
                 )
                 try:
-                    await page.mouse.wheel(0, viewport_height)
+                    await page.evaluate(
+                        """(delta) => {
+                            const d = Math.round(delta * 0.9);
+                            try {
+                                document.body.dispatchEvent(new WheelEvent('wheel', {
+                                    deltaY: d, deltaMode: 0,
+                                    bubbles: true, cancelable: true,
+                                    clientX: window.innerWidth / 2,
+                                    clientY: window.innerHeight / 2,
+                                }));
+                            } catch(e) {}
+                            try { window.scrollBy({ top: d, behavior: 'smooth' }); } catch(e) {}
+                        }""",
+                        viewport_height,
+                    )
                 except Exception:
                     pass
                 stagnant_rounds = 0
