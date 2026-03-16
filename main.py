@@ -4959,7 +4959,7 @@ def build_scroll_only_section_landmarks(
 # True Bottom: container-based — |container.getBoundingClientRect().top| + innerHeight >= container.scrollHeight - 100
 # Works for both native scroll and virtual scroll (Locomotive / Lenis / GSAP transform containers).
 _JS_SCROLL_ONE_VIEWPORT = """
-(step) => new Promise(async (resolve) => {
+(step) => new Promise((resolve) => {
     // Anti-Overlap: если уже идёт скролл — немедленно вернуть текущий статус
     if (window._isPlaywrightScrolling) {
         resolve({ isBottom: false, headings: [], ctas: [], scrollY: Math.round(window.scrollY), containerTop: 0 });
@@ -4970,12 +4970,11 @@ _JS_SCROLL_ONE_VIEWPORT = """
     const vh = window.innerHeight;
     const vw = window.innerWidth;
 
-    // step=2 → slow mode (heading/CTA section): 14 × 70ms ≈ 1000ms per viewport
-    // step=4 → normal mode:                     10 × 50ms ≈  500ms per viewport
+    // step=2 → slow mode (heading/CTA section): 60 rAF × ~16ms ≈ 1000ms per viewport
+    // step=4 → normal mode:                     30 rAF × ~16ms ≈  500ms per viewport
     const slowMode = (typeof step === 'number' && step > 0 && step <= 2);
     const targetDist = Math.round(vh * 0.90);
-    const totalSteps = slowMode ? 14 : 10;
-    const stepDelayMs = slowMode ? 70 : 50;
+    const totalSteps = slowMode ? 60 : 30;  // мелкие приращения по одному на каждый rAF-фрейм
     const deltaPerStep = targetDist / totalSteps;
 
     const headings = [];
@@ -5091,13 +5090,26 @@ _JS_SCROLL_ONE_VIEWPORT = """
     // without buffering inertia the way raw WheelEvents do.
     try { window.scrollBy({ top: targetDist, behavior: 'smooth' }); } catch(e) {}
 
-    // ── Phase 2: Synthetic WheelEvents dispatched to document.body ───────────────
-    // Virtual-scroll engines (Lenis / Locomotive / GSAP ScrollTrigger) intercept
-    // wheel events on the body element and drive their internal animation.
-    // Dispatching to document.body (not window, not the element under cursor)
-    // avoids scroll-hijacking by in-page widgets like currency calculators,
-    // Google Maps, or carousels that only intercept events when hovered.
-    for (let i = 0; i < totalSteps; i++) {
+    // ── Phase 2: rAF-driven WheelEvents – one event per display frame (60 FPS) ─────
+    // requestAnimationFrame выравнивает доставку wheel-событий по частоте обновления экрана
+    // («16мс на кадр»), давая Lenis / Locomotive / GSAP плавный натуральный вход.
+    // deltaPerStep = targetDist / totalSteps ≈ 16-32px — нет скачков по 300px.
+    let stepsDone = 0;
+    function rafTick() {
+        if (stepsDone >= totalSteps) {
+            collectVisible();
+            const container = findScrollContainer() || document.body;
+            const containerRect = container.getBoundingClientRect();
+            window._isPlaywrightScrolling = false;
+            resolve({
+                isBottom: isAtBottom(),
+                headings,
+                ctas,
+                scrollY: Math.round(window.scrollY),
+                containerTop: Math.round(containerRect.top),
+            });
+            return;
+        }
         try {
             document.body.dispatchEvent(new WheelEvent('wheel', {
                 deltaY: deltaPerStep,
@@ -5109,21 +5121,10 @@ _JS_SCROLL_ONE_VIEWPORT = """
             }));
         } catch(e) {}
         collectVisible();
-        await new Promise(r => setTimeout(r, stepDelayMs));
+        stepsDone++;
+        requestAnimationFrame(rafTick);
     }
-
-    collectVisible();
-
-    const container = findScrollContainer() || document.body;
-    const containerRect = container.getBoundingClientRect();
-    window._isPlaywrightScrolling = false;
-    resolve({
-        isBottom: isAtBottom(),
-        headings,
-        ctas,
-        scrollY: Math.round(window.scrollY),
-        containerTop: Math.round(containerRect.top),
-    });
+    requestAnimationFrame(rafTick);
 })"""
 
 
@@ -6385,10 +6386,11 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
     if screen_height % 2 != 0:
         screen_height -= 1
 
-    framerate  = max(8, min(60, env_int('FFMPEG_FRAMERATE', 15)))
-    preset     = os.getenv('FFMPEG_PRESET', 'ultrafast')
+    framerate  = max(8, min(60, env_int('FFMPEG_FRAMERATE', 60)))
+    preset     = os.getenv('FFMPEG_PRESET', 'veryfast')
     crf        = env_int('FFMPEG_CRF', 24)
-    threads    = max(1, env_int('FFMPEG_THREADS', 2))
+    threads_raw = env_int('FFMPEG_THREADS', 0)
+    threads     = threads_raw if threads_raw == 0 else max(1, threads_raw)  # 0 = auto (все ядра)
     nice_level = max(-20, min(19, env_int('FFMPEG_NICE_LEVEL', 10)))
     _dm_raw    = os.getenv('FFMPEG_DRAW_MOUSE', '0')
     draw_mouse = _dm_raw if _dm_raw in ('0', '1') else '0'
@@ -6473,6 +6475,7 @@ async def _run_preload_mode() -> None:
             browser_args = [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage', '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-extensions', '--kiosk', '--start-fullscreen',
                 f'--window-size={viewport_width},{viewport_height}',
                 '--hide-crash-restore-bubble', '--disable-infobars',
@@ -6480,7 +6483,10 @@ async def _run_preload_mode() -> None:
             if browser_performance_mode:
                 browser_args.extend([
                     '--ignore-gpu-blocklist', '--enable-webgl',
-                    '--enable-unsafe-swiftshader', '--use-angle=swiftshader',
+                    '--enable-unsafe-swiftshader',
+                    '--use-gl=angle',
+                    '--use-angle=swiftshader',
+                    '--disable-gpu-compositing',
                     '--enable-gpu-rasterization', '--enable-zero-copy',
                 ])
             browser = await p.chromium.launch(headless=False, args=browser_args)
@@ -6619,6 +6625,7 @@ async def main():
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
                 '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-extensions',
                 '--kiosk',
                 '--start-fullscreen',
@@ -6634,9 +6641,11 @@ async def main():
                     '--ignore-gpu-blocklist',
                     '--enable-webgl',
                     '--enable-unsafe-swiftshader',
-                    '--use-angle=swiftshader',
+                    '--use-gl=angle',           # ANGLE программный WebGL-рендерер
+                    '--use-angle=swiftshader',  # заставляет SwiftShader использовать многопоточность CPU
                     '--enable-gpu-rasterization',
                     '--enable-zero-copy',
+                    '--disable-gpu-compositing',
                     '--disable-renderer-backgrounding',
                     '--disable-backgrounding-occluded-windows',
                     '--disable-background-timer-throttling',

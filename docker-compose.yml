@@ -52,12 +52,12 @@ services:
       SCREENSHOT_ENABLED: ${SCREENSHOT_ENABLED:-true}
       SCREENSHOT_TIMEOUT_MS: ${SCREENSHOT_TIMEOUT_MS:-8000}
       FFMPEG_AUTO_CROP_BROWSER_UI: ${FFMPEG_AUTO_CROP_BROWSER_UI:-true}
-      FFMPEG_FRAMERATE: ${FFMPEG_FRAMERATE:-15}
-      FFMPEG_PRESET: ${FFMPEG_PRESET:-ultrafast}
+      FFMPEG_FRAMERATE: ${FFMPEG_FRAMERATE:-60}
+      FFMPEG_PRESET: ${FFMPEG_PRESET:-veryfast}
       FFMPEG_CRF: ${FFMPEG_CRF:-24}
       FFMPEG_CROP_TOP: ${FFMPEG_CROP_TOP:-0}
       FFMPEG_DRAW_MOUSE: ${FFMPEG_DRAW_MOUSE:-0}
-      FFMPEG_THREADS: ${FFMPEG_THREADS:-2}
+      FFMPEG_THREADS: ${FFMPEG_THREADS:-0}
       FFMPEG_NICE_LEVEL: ${FFMPEG_NICE_LEVEL:-10}
       # Предзагрузка: PRELOAD_TIME_S > 0 → прогрев сайта ДО начала FFmpeg-записи
       PRELOAD_TIME_S: ${PRELOAD_TIME_S:-30}
@@ -69,7 +69,7 @@ services:
     cpu_shares: ${CPU_SHARES:-2048}
     mem_limit: ${MEMORY_LIMIT:-6G}
     memswap_limit: ${MEMSWAP_LIMIT:-8G}
-    shm_size: ${SHM_SIZE:-4G}
+    shm_size: ${SHM_SIZE:-4gb}
     logging:
       driver: "json-file"
       options:
