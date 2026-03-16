@@ -4951,12 +4951,23 @@ def build_scroll_only_section_landmarks(
 
 # ── JS rAF smooth scroll engine for Mode 2 (CTA Analyzer) ─────────────────────
 # Evaluates inside the browser: scrolls one viewport height using requestAnimationFrame
-# (window.scrollBy step px/frame → ~60fps), collects headings/CTAs along the way,
-# and returns {isBottom, headings, ctas, scrollY} to Python when done.
+# with Delta Time animation (speed = step*100 px/sec, step=4 → 400px/s, step=2 → 200px/s).
+# Anti-overlap: window._isPlaywrightScrolling prevents concurrent scroll commands.
+# Smart Focus Zone: headings/CTAs only trigger when rect.top ∈ [vh*0.25, vh*0.75].
+# Returns {isBottom, headings, ctas, scrollY} to Python when done.
 # True Bottom formula: Math.ceil(scrollY + innerHeight) >= scrollHeight - 50
 _JS_SCROLL_ONE_VIEWPORT = """
 (step) => new Promise((resolve) => {
-    const STEP = (typeof step === 'number' && step > 0) ? step : 4;
+    // Anti-Overlap: если уже идёт скролл — немедленно вернуть текущий статус
+    if (window._isPlaywrightScrolling) {
+        resolve({ isBottom: false, headings: [], ctas: [], scrollY: Math.round(window.scrollY) });
+        return;
+    }
+    window._isPlaywrightScrolling = true;
+
+    // Delta Time: скорость в px/сек не зависит от FPS
+    // step=4 → 400px/s (нормальная езда), step=2 → 200px/s (замедление у заголовков)
+    const SPEED_PX_PER_SEC = ((typeof step === 'number' && step > 0) ? step : 4) * 100;
     const targetDist = Math.round(window.innerHeight * 0.90);
     const startScrollY = window.scrollY;
     const targetScrollY = startScrollY + targetDist;
@@ -4979,6 +4990,12 @@ _JS_SCROLL_ONE_VIEWPORT = """
         '\u0437\u0430\u043a\u0430\u0437\u0430\u0442\u044c',
         '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
     ];
+    let lastTime = null;
+
+    function done(isBottom) {
+        window._isPlaywrightScrolling = false;
+        resolve({ isBottom, headings, ctas, scrollY: Math.round(window.scrollY) });
+    }
 
     function isAtBottom() {
         return Math.ceil(window.scrollY + window.innerHeight) >=
@@ -4988,13 +5005,16 @@ _JS_SCROLL_ONE_VIEWPORT = """
     function collectVisible() {
         const vh = window.innerHeight;
         const vw = window.innerWidth;
+        // Smart Focus Zone: триггер только когда элемент попал в центральные 50% экрана
+        const focusTop = vh * 0.25;
+        const focusBottom = vh * 0.75;
         for (const el of document.querySelectorAll('h1,h2,h3,h4')) {
             const text = (el.textContent || '').trim().slice(0, 80);
             if (!text) continue;
             const key = 'h|' + text;
             if (seenTexts.has(key)) continue;
             const rect = el.getBoundingClientRect();
-            if (rect.top >= -20 && rect.top <= vh * 0.55 && rect.height > 0) {
+            if (rect.top >= focusTop && rect.top <= focusBottom && rect.height > 0) {
                 seenTexts.add(key);
                 headings.push({
                     text,
@@ -5012,7 +5032,7 @@ _JS_SCROLL_ONE_VIEWPORT = """
             if (seenTexts.has(key)) continue;
             const rect = el.getBoundingClientRect();
             if (rect.width < 72 || rect.height < 24) continue;
-            if (rect.top < 0 || rect.top > vh * 0.85) continue;
+            if (rect.top < focusTop || rect.top > focusBottom) continue;
             const textLow = text.toLowerCase();
             if (!CTA_WORDS.some(w => textLow.includes(w))) continue;
             seenTexts.add(key);
@@ -5025,18 +5045,27 @@ _JS_SCROLL_ONE_VIEWPORT = """
         }
     }
 
-    function tick() {
+    function tick(currentTime) {
+        // Первый кадр: инициализируем lastTime и ждём следующего для корректного deltaTime
+        if (lastTime === null) {
+            lastTime = currentTime;
+            requestAnimationFrame(tick);
+            return;
+        }
+        // Ограничиваем deltaTime до 100ms (защита от фриза / фоновой вкладки)
+        const deltaTime = Math.min(currentTime - lastTime, 100);
+        lastTime = currentTime;
+
         collectVisible();
-        if (isAtBottom()) {
-            resolve({ isBottom: true, headings, ctas, scrollY: Math.round(window.scrollY) });
-            return;
-        }
-        if (window.scrollY >= targetScrollY - 1) {
-            resolve({ isBottom: false, headings, ctas, scrollY: Math.round(window.scrollY) });
-            return;
-        }
-        const advance = Math.min(STEP, Math.ceil(targetScrollY - window.scrollY));
-        window.scrollBy(0, Math.max(1, advance));
+        if (isAtBottom()) { done(true); return; }
+        if (window.scrollY >= targetScrollY - 1) { done(false); return; }
+
+        // Delta Time scroll: фиксированная скорость в px/сек, независимо от FPS
+        const advance = Math.min(
+            Math.max(1, Math.round(SPEED_PX_PER_SEC * deltaTime / 1000)),
+            Math.ceil(targetScrollY - window.scrollY)
+        );
+        window.scrollBy(0, advance);
         requestAnimationFrame(tick);
     }
 
