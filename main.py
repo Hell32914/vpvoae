@@ -4993,10 +4993,18 @@ _JS_SCROLL_ONE_VIEWPORT = """
         '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
     ];
     let lastTime = null;
+    let lastFrameScrollY = -999999;
+    let stagnantFrames = 0;
 
     function done(isBottom) {
         window._isPlaywrightScrolling = false;
-        resolve({ isBottom, headings, ctas, scrollY: Math.round(window.scrollY) });
+        const _dc = findScrollContainer() || document.body;
+        const _dr = _dc.getBoundingClientRect();
+        resolve({
+            isBottom, headings, ctas,
+            scrollY: Math.round(window.scrollY),
+            containerTop: Math.round(_dr.top),
+        });
     }
 
     // Smart Virtual Scroll Detector:
@@ -5094,12 +5102,26 @@ _JS_SCROLL_ONE_VIEWPORT = """
         // Первый кадр: инициализируем lastTime и ждём следующего для корректного deltaTime
         if (lastTime === null) {
             lastTime = currentTime;
+            lastFrameScrollY = Math.round(window.scrollY);
             requestAnimationFrame(tick);
             return;
         }
         // Ограничиваем deltaTime до 100ms (защита от фриза / фоновой вкладки)
         const deltaTime = Math.min(currentTime - lastTime, 100);
         lastTime = currentTime;
+
+        // JS-level stagnation guard: fixed-viewport / 3D-canvas sites (e.g. Phantom.com)
+        // where window.scrollBy() is a no-op and scrollY never moves — without this the
+        // rAF loop would spin forever and page.evaluate() would never resolve.
+        // Exit after 90 consecutive frozen frames (~1.5 s at 60 fps).
+        const curY = Math.round(window.scrollY);
+        if (curY === lastFrameScrollY) {
+            stagnantFrames++;
+        } else {
+            stagnantFrames = 0;
+            lastFrameScrollY = curY;
+        }
+        if (stagnantFrames >= 90) { done(false); return; }
 
         collectVisible();
         if (isAtBottom()) { done(true); return; }
@@ -5166,7 +5188,9 @@ async def run_scroll_only_down_pass(
     gsap_failsafe_ms = max(60000, min(env_int("GSAP_SCROLL_FAILSAFE_MS", 180000), 600000))
 
     last_scroll_y = -1
+    last_container_top = 0       # for hybrid stagnation on virtual-scroll sites
     stagnant_rounds = 0
+    stall_exit_count = 0         # consecutive anti-stall interventions without real progress
     round_index = 0
     last_progress_at = time.monotonic()
     prev_dom_hash: int = 0  # для DOM-mutation guard (см. ниже)
@@ -5203,9 +5227,15 @@ async def run_scroll_only_down_pass(
 
         js_is_bottom = bool(result.get("isBottom", False))
         js_scroll_y = int(result.get("scrollY", before_scroll_y))
+        js_container_top = int(result.get("containerTop", 0))
         js_headings = result.get("headings") or []
         js_ctas = result.get("ctas") or []
         current_scroll_y = max(js_scroll_y, before_scroll_y)
+        logger.info(
+            f"[Scroll-only] Шаг {round_index} | scrollY={current_scroll_y} "
+            f"| containerTop={js_container_top} | застой={stagnant_rounds}/5 "
+            f"| дно={js_is_bottom} | elapsed={int(elapsed_ms)}ms"
+        )
 
         # ── Process headings & CTAs returned by the JS engine ────────────────────
         new_heading_found = False
@@ -5274,17 +5304,33 @@ async def run_scroll_only_down_pass(
             except Exception:
                 pass
 
-        if scroll_advanced or dom_is_mutating:
+        # Hybrid stagnation: only declare a stall when BOTH scrollY AND the
+        # container rect.top are frozen. On GSAP/Locomotive virtual-scroll sites
+        # the container's top shifts visibly even while scrollY stays at 0, so a
+        # single frozen metric is not enough evidence to count the round as stalled.
+        container_advanced = abs(js_container_top - last_container_top) > 2
+        last_container_top = js_container_top
+        if scroll_advanced or container_advanced or dom_is_mutating:
             stagnant_rounds = 0
+            stall_exit_count = 0
             last_progress_at = time.monotonic()
         else:
             stagnant_rounds += 1
 
         stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
-        if not js_is_bottom and (stagnant_rounds >= 6 or stall_elapsed_ms >= stall_timeout_ms):
+        if not js_is_bottom and (stagnant_rounds >= 5 or stall_elapsed_ms >= stall_timeout_ms):
+            stall_exit_count += 1
+            if stall_exit_count >= 4:
+                logger.warning(
+                    f"🔴 Scroll-only: застой исчерпал все попытки ({stall_exit_count} интервенций) "
+                    f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms) — "
+                    "фиксированный viewport или 3D-канвас, принудительное завершение"
+                )
+                break
             logger.info(
                 "🧭 Scroll-only: anti-stall форсирует продвижение вниз "
-                f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms)"
+                f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms, "
+                f"интервенция {stall_exit_count}/4)"
             )
             await force_scroll_progress(page, viewport_height)
             stagnant_rounds = 0
@@ -5310,12 +5356,6 @@ async def run_scroll_only_down_pass(
                 else:
                     raise
         # ────────────────────────────────────────────────────────────────────────
-
-        if round_index % 12 == 0:
-            logger.info(
-                f"🧭 Scroll-only progress: scrollY={current_scroll_y}, "
-                f"stagnant={stagnant_rounds}"
-            )
 
         last_scroll_y = max(last_scroll_y, current_scroll_y)
 
@@ -5529,22 +5569,33 @@ async def run_smart_cursor(
 
     if scroll_only_mode_active:
         logger.info("🧭 Smart cursor: режим CTA_ANALYZER / SCROLL_ONLY (спуск с акцентом на CTA)")
-        reached_bottom, cursor_pos = await run_scroll_only_down_pass(
-            page=page,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-            total_time_ms=total_time_ms,
-            bottom_stable_rounds_required=bottom_stable_rounds_required,
-            scroll_speed_factor=scroll_speed_factor,
-            scroll_pause_min_ms=scroll_pause_min_ms,
-            scroll_pause_max_ms=scroll_pause_max_ms,
-            scroll_finish_timeout_ms=scroll_finish_timeout_ms,
-            require_bottom=True,
-            require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
-            bottom_debug=bottom_debug,
-            stall_timeout_ms=strict_stall_timeout_ms,
-            cursor_pos=cursor_pos,
-        )
+        _hard_timeout_s = max(210, env_int("GSAP_SCROLL_FAILSAFE_MS", 180000) // 1000 + 30)
+        try:
+            reached_bottom, cursor_pos = await asyncio.wait_for(
+                run_scroll_only_down_pass(
+                    page=page,
+                    viewport_width=viewport_width,
+                    viewport_height=viewport_height,
+                    total_time_ms=total_time_ms,
+                    bottom_stable_rounds_required=bottom_stable_rounds_required,
+                    scroll_speed_factor=scroll_speed_factor,
+                    scroll_pause_min_ms=scroll_pause_min_ms,
+                    scroll_pause_max_ms=scroll_pause_max_ms,
+                    scroll_finish_timeout_ms=scroll_finish_timeout_ms,
+                    require_bottom=True,
+                    require_bottom_max_ms=smart_cursor_require_bottom_max_ms,
+                    bottom_debug=bottom_debug,
+                    stall_timeout_ms=strict_stall_timeout_ms,
+                    cursor_pos=cursor_pos,
+                ),
+                timeout=float(_hard_timeout_s),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"⚠️ [WARN] Достигнут лимит времени {_hard_timeout_s}s. "
+                "Принудительное завершение скролла — FFmpeg сохранит видео."
+            )
+            reached_bottom = False
         if reached_bottom:
             logger.info("🧭 Smart cursor: режим CTA_ANALYZER завершён, страница прокручена до конца")
         else:
