@@ -4956,7 +4956,8 @@ def build_scroll_only_section_landmarks(
 # Anti-overlap: window._isPlaywrightScrolling prevents concurrent scroll commands.
 # Smart Focus Zone: headings/CTAs only trigger when rect.top ∈ [vh*0.25, vh*0.75].
 # Returns {isBottom, headings, ctas, scrollY} to Python when done.
-# True Bottom formula: Math.ceil(scrollY + innerHeight) >= scrollHeight - 50
+# True Bottom: container-based — |container.getBoundingClientRect().top| + innerHeight >= container.scrollHeight - 100
+# Works for both native scroll and virtual scroll (Locomotive / Lenis / GSAP transform containers).
 _JS_SCROLL_ONE_VIEWPORT = """
 (step) => new Promise((resolve) => {
     // Anti-Overlap: если уже идёт скролл — немедленно вернуть текущий статус
@@ -5001,17 +5002,25 @@ _JS_SCROLL_ONE_VIEWPORT = """
     // Smart Virtual Scroll Detector:
     // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
     // document.body at ~100vh while the real content lives inside a transformed
-    // container. We first look for that container, then measure its true height.
+    // container. We locate that container and measure scroll progress via
+    // getBoundingClientRect().top — works for both transform-based and native scroll.
     function findScrollContainer() {
-        // Priority 1: explicit virtual-scroll container attributes/ids
+        const vh = window.innerHeight;
+        // Priority 1: explicit virtual-scroll marker attributes / well-known ids
         const byAttr = document.querySelector(
-            '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content'
+            '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content, .lenis'
         );
-        if (byAttr) return byAttr;
-        // Priority 2: tallest direct child of body that exceeds 1.5× viewport
+        if (byAttr && byAttr.scrollHeight > vh * 1.2) return byAttr;
+        // Priority 2: known SPA root containers
+        const bySpa = document.querySelector('#__next, #app');
+        if (bySpa && bySpa.scrollHeight > vh * 1.5) return bySpa;
+        // Priority 3: <main> element (only when substantially taller than viewport)
+        const byMain = document.querySelector('main');
+        if (byMain && byMain.scrollHeight > vh * 1.5) return byMain;
+        // Priority 4: tallest direct child of body that exceeds 1.5× viewport
         let tallest = null;
         let tallestH = 0;
-        const vhMin = window.innerHeight * 1.5;
+        const vhMin = vh * 1.5;
         for (const child of (document.body ? document.body.children : [])) {
             const h = child.scrollHeight || child.offsetHeight || 0;
             if (h > tallestH && h > vhMin) {
@@ -5019,28 +5028,23 @@ _JS_SCROLL_ONE_VIEWPORT = """
                 tallest = child;
             }
         }
-        return tallest;
+        return tallest;  // null → caller falls back to document.body
     }
 
     function isAtBottom() {
-        // Standard native-scroll check (works on most sites)
-        if (Math.ceil(window.scrollY + window.innerHeight) >=
-            document.documentElement.scrollHeight - 50) {
-            return true;
-        }
-        // Virtual scroll container check (Locomotive / Lenis / GSAP)
-        // Formula: |container.top| + innerHeight >= container.scrollHeight - 100
-        const container = findScrollContainer();
-        if (container &&
-            container !== document.documentElement &&
-            container !== document.body) {
-            const rect = container.getBoundingClientRect();
-            const csh  = container.scrollHeight || container.offsetHeight || 0;
-            if (csh > window.innerHeight) {
-                return Math.abs(rect.top) + window.innerHeight >= csh - 100;
-            }
-        }
-        return false;
+        // Pure container-based bottom detection — works for both native scroll
+        // and virtual scroll (Locomotive / Lenis / GSAP) where scrollY stays near 0.
+        //
+        // For native scroll:  document.body is the container.
+        //   body.getBoundingClientRect().top = -window.scrollY
+        //   ⇒ Math.abs(rect.top) = scrollY  ⇒ identical to the classic formula.
+        //
+        // For virtual scroll: the transform-driven container is used.
+        //   rect.top grows negative as the container is pushed upward by CSS transform.
+        const container = findScrollContainer() || document.body;
+        const rect = container.getBoundingClientRect();
+        const realHeight = container.scrollHeight || container.offsetHeight || 0;
+        return (Math.abs(rect.top) + window.innerHeight) >= (realHeight - 100);
     }
 
     function collectVisible() {
@@ -5141,6 +5145,14 @@ async def run_scroll_only_down_pass(
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
         await page.wait_for_timeout(random.randint(120, 260))
+    except Exception:
+        pass
+
+    # Centre the cursor before scrolling: virtual-scroll engines (Lenis, Locomotive)
+    # ignore wheel events dispatched outside viewport content — hover is required.
+    try:
+        await page.mouse.move(viewport_width * 0.5, viewport_height * 0.5)
+        await page.wait_for_timeout(120)
     except Exception:
         pass
 
@@ -5282,7 +5294,15 @@ async def run_scroll_only_down_pass(
                     """() => Math.round(window.scrollY)"""
                 )))
                 js_is_bottom = bool(await page.evaluate(
-                    """() => Math.ceil(window.scrollY + window.innerHeight) >= document.documentElement.scrollHeight - 50"""
+                    """() => {
+                        const el = document.querySelector(
+                            '[data-scroll-container],#smooth-wrapper,#scroll-container,.lenis,#__next,#app,main'
+                        );
+                        const c = (el && el.scrollHeight > window.innerHeight * 1.2) ? el : document.body;
+                        const rect = c.getBoundingClientRect();
+                        const h = c.scrollHeight || c.offsetHeight || 0;
+                        return (Math.abs(rect.top) + window.innerHeight) >= (h - 100);
+                    }"""
                 ))
             except Exception as exc:
                 if _is_nav_error(exc):
