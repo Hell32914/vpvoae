@@ -4949,6 +4949,101 @@ def build_scroll_only_section_landmarks(
     return deduped
 
 
+# ── JS rAF smooth scroll engine for Mode 2 (CTA Analyzer) ─────────────────────
+# Evaluates inside the browser: scrolls one viewport height using requestAnimationFrame
+# (window.scrollBy step px/frame → ~60fps), collects headings/CTAs along the way,
+# and returns {isBottom, headings, ctas, scrollY} to Python when done.
+# True Bottom formula: Math.ceil(scrollY + innerHeight) >= scrollHeight - 50
+_JS_SCROLL_ONE_VIEWPORT = """
+(step) => new Promise((resolve) => {
+    const STEP = (typeof step === 'number' && step > 0) ? step : 4;
+    const targetDist = Math.round(window.innerHeight * 0.90);
+    const startScrollY = window.scrollY;
+    const targetScrollY = startScrollY + targetDist;
+    const headings = [];
+    const ctas = [];
+    const seenTexts = new Set();
+    const CTA_WORDS = [
+        'get started', 'start', 'book', 'schedule', 'contact', 'talk', 'demo',
+        'pricing', 'price', 'quote', 'request', 'learn more', 'discover',
+        'explore', 'join', 'subscribe', 'sign up', 'apply', 'buy', 'shop',
+        'download', 'free trial', 'trial', "let's talk", 'lets talk',
+        'try', 'try free', 'try now', 'get it', 'order',
+        '\u043d\u0430\u0447\u0430\u0442\u044c',
+        '\u043f\u043e\u043f\u0440\u043e\u0431\u043e\u0432\u0430\u0442\u044c',
+        '\u043a\u0443\u043f\u0438\u0442\u044c',
+        '\u0441\u043a\u0430\u0447\u0430\u0442\u044c',
+        '\u043f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f',
+        '\u0437\u0430\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f',
+        '\u0441\u0432\u044f\u0437\u0430\u0442\u044c\u0441\u044f',
+        '\u0437\u0430\u043a\u0430\u0437\u0430\u0442\u044c',
+        '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
+    ];
+
+    function isAtBottom() {
+        return Math.ceil(window.scrollY + window.innerHeight) >=
+               document.documentElement.scrollHeight - 50;
+    }
+
+    function collectVisible() {
+        const vh = window.innerHeight;
+        const vw = window.innerWidth;
+        for (const el of document.querySelectorAll('h1,h2,h3,h4')) {
+            const text = (el.textContent || '').trim().slice(0, 80);
+            if (!text) continue;
+            const key = 'h|' + text;
+            if (seenTexts.has(key)) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.top >= -20 && rect.top <= vh * 0.55 && rect.height > 0) {
+                seenTexts.add(key);
+                headings.push({
+                    text,
+                    x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
+                    y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
+                });
+            }
+        }
+        for (const el of document.querySelectorAll('a,button,summary,[role="button"]')) {
+            const text = (el.textContent || '').trim();
+            if (!text || text.length < 3 || text.length > 44) continue;
+            if (text.split(' ').length > 6) continue;
+            const dedup = text.slice(0, 40);
+            const key = 'c|' + dedup;
+            if (seenTexts.has(key)) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 72 || rect.height < 24) continue;
+            if (rect.top < 0 || rect.top > vh * 0.85) continue;
+            const textLow = text.toLowerCase();
+            if (!CTA_WORDS.some(w => textLow.includes(w))) continue;
+            seenTexts.add(key);
+            ctas.push({
+                text: text.slice(0, 60),
+                dedupKey: dedup,
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2),
+            });
+        }
+    }
+
+    function tick() {
+        collectVisible();
+        if (isAtBottom()) {
+            resolve({ isBottom: true, headings, ctas, scrollY: Math.round(window.scrollY) });
+            return;
+        }
+        if (window.scrollY >= targetScrollY - 1) {
+            resolve({ isBottom: false, headings, ctas, scrollY: Math.round(window.scrollY) });
+            return;
+        }
+        const advance = Math.min(STEP, Math.ceil(targetScrollY - window.scrollY));
+        window.scrollBy(0, Math.max(1, advance));
+        requestAnimationFrame(tick);
+    }
+
+    requestAnimationFrame(tick);
+})"""
+
+
 async def run_scroll_only_down_pass(
     page: Any,
     viewport_width: int,
@@ -4965,14 +5060,10 @@ async def run_scroll_only_down_pass(
     stall_timeout_ms: int,
     cursor_pos: Tuple[float, float] = (960.0, 540.0),
 ) -> Tuple[bool, Tuple[float, float]]:
-    """Режим прокрутки с CTA-анализом: спуск вниз, замедление на заголовках,
-    наведение курсора на CTA-кнопки для демонстрации."""
+    """CTA-Analyzer mode: JS rAF smooth scroll engine, True Bottom detection, 60fps compatible."""
     reached_bottom = False
     section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 500), 4000))
-    section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.58), 0.20, 1.0)
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 2), 6))
-    section_landmarks: List[Dict[str, Any]] = []
-    next_landmark_index = 0
     slowdown_rounds_remaining = 0
     seen_heading_keys: Set[str] = set()
     hovered_cta_keys: Set[str] = set()
@@ -4982,26 +5073,6 @@ async def run_scroll_only_down_pass(
         await page.wait_for_timeout(random.randint(120, 260))
     except Exception:
         pass
-
-    try:
-        section_targets = await collect_document_interaction_targets(
-            page=page,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-            limit=1200,
-        )
-        section_landmarks = build_scroll_only_section_landmarks(section_targets, viewport_height)
-        if section_landmarks:
-            logger.info(
-                "🧭 Scroll-only CTA-landmarks: "
-                f"found={len(section_landmarks)}, pause={section_pause_ms}ms, "
-                f"slowdown={section_slowdown_factor:.2f}x/{section_slowdown_rounds} rounds"
-            )
-    except Exception as exc:
-        if _is_nav_error(exc):
-            await _recover_after_nav(page)
-        else:
-            logger.warning(f"⚠️ Scroll-only: не удалось собрать landmarks секций: {exc}")
 
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
@@ -5014,7 +5085,6 @@ async def run_scroll_only_down_pass(
 
     last_scroll_y = -1
     stagnant_rounds = 0
-    bottom_stable_rounds = 0
     round_index = 0
     last_progress_at = time.monotonic()
     prev_dom_hash: int = 0  # для DOM-mutation guard (см. ниже)
@@ -5035,218 +5105,77 @@ async def run_scroll_only_down_pass(
             break
 
         round_index += 1
+        before_scroll_y = max(last_scroll_y, 0)
 
+        # ── JS rAF smooth scroll engine ──────────────────────────────────────────
+        # step=2 gives ~30fps (slows on CTA sections), step=4 gives ~60fps normal travel
+        js_step = 2 if slowdown_rounds_remaining > 0 else 4
         try:
-            before_metrics = await get_scroll_metrics(page)
-            before_scroll_raw = int(before_metrics.get("scrollY", max(last_scroll_y, 0)))
-            if bottom_debug and last_scroll_y >= 0 and before_scroll_raw + 8 < last_scroll_y:
-                logger.info(
-                    "🧭 Scroll-only rebound detected: "
-                    f"raw={before_scroll_raw}, last={last_scroll_y}. Держим движение вниз"
-                )
-            before_scroll_y = max(before_scroll_raw, max(last_scroll_y, 0))
-            at_bottom_before = bool(before_metrics.get("atBottom", False))
+            result = await page.evaluate(_JS_SCROLL_ONE_VIEWPORT, js_step)
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
-                before_metrics = {
-                    "scrollY": max(last_scroll_y, 0),
-                    "maxScroll": 0,
-                    "atBottom": False,
-                    "documentHeight": 0,
-                    "viewportHeight": viewport_height,
-                    "bottomGap": 0,
-                }
-                before_scroll_y = max(last_scroll_y, 0)
-                at_bottom_before = False
+                result = {"isBottom": False, "headings": [], "ctas": [], "scrollY": before_scroll_y}
             else:
                 raise
 
-        visible_landmark: Optional[Dict[str, Any]] = None
-        trigger_top = before_scroll_y + int(viewport_height * 0.06)
-        trigger_bottom = before_scroll_y + int(viewport_height * 0.62)
-        while next_landmark_index < len(section_landmarks):
-            landmark = section_landmarks[next_landmark_index]
-            landmark_abs_y = int(_to_float(landmark.get("absY"), 0.0))
-            if landmark_abs_y < trigger_top:
-                next_landmark_index += 1
-                continue
-            if landmark_abs_y <= trigger_bottom:
-                visible_landmark = landmark
-                next_landmark_index += 1
-            break
+        js_is_bottom = bool(result.get("isBottom", False))
+        js_scroll_y = int(result.get("scrollY", before_scroll_y))
+        js_headings = result.get("headings") or []
+        js_ctas = result.get("ctas") or []
+        current_scroll_y = max(js_scroll_y, before_scroll_y)
 
-        if visible_landmark is not None:
-            landmark_label = str(visible_landmark.get("label", "")).strip()
-            logger.info(
-                f"🧭 Scroll-only: CTA-зона '{landmark_label[:56]}' — пауза {section_pause_ms}ms"
-            )
-            if section_pause_ms > 0:
-                await page.wait_for_timeout(section_pause_ms)
-            slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
+        # ── Process headings & CTAs returned by the JS engine ────────────────────
+        new_heading_found = False
+        for h_item in js_headings:
+            h_text = h_item.get("text", "") if isinstance(h_item, dict) else str(h_item)
+            if h_text and h_text not in seen_heading_keys:
+                seen_heading_keys.add(h_text)
+                logger.info(f"🧭 Scroll-only: заголовок '{h_text[:56]}' — пауза {section_pause_ms}ms")
+                new_heading_found = True
+                if section_pause_ms > 0:
+                    await page.wait_for_timeout(section_pause_ms)
+                slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
 
-            # Наведение курсора на CTA-кнопку для демонстрации
-            try:
-                viewport_ctas = await find_viewport_cta_elements(
-                    page, viewport_width, viewport_height, limit=4,
-                )
-                picked_cta = None
-                for _c in (viewport_ctas or []):
-                    _key = str(_c.get("dedupKey", _c.get("text", "")))
-                    if _key not in hovered_cta_keys:
-                        picked_cta = _c
-                        hovered_cta_keys.add(_key)
-                        break
-                if picked_cta:
-                    cta_x = float(picked_cta.get("x", viewport_width * 0.5))
-                    cta_y = float(picked_cta.get("y", viewport_height * 0.5))
-                    cta_text = str(picked_cta.get("text", "")).strip()
-                    logger.info(f"🎯 Scroll-only: наведение на CTA '{cta_text[:30]}'")
+        if new_heading_found or js_ctas:
+            picked_cta: Optional[Dict[str, Any]] = None
+            for _c in js_ctas:
+                _key = str(_c.get("dedupKey", _c.get("text", "")))
+                if _key not in hovered_cta_keys:
+                    picked_cta = _c
+                    hovered_cta_keys.add(_key)
+                    break
+            if picked_cta:
+                cta_x = float(picked_cta.get("x", viewport_width * 0.5))
+                cta_y = float(picked_cta.get("y", viewport_height * 0.5))
+                cta_text = str(picked_cta.get("text", "")).strip()
+                logger.info(f"🎯 Scroll-only: наведение на CTA '{cta_text[:30]}'")
+                try:
                     cursor_pos = await move_mouse_human_like(
                         page, cursor_pos, (cta_x, cta_y),
                         viewport_width, viewport_height,
                         random.randint(300, 700),
                     )
-                    await page.wait_for_timeout(random.randint(1000, 1500))
-                    # Уводим мышь к левому краю на той же высоте — плавный уход
+                    await page.wait_for_timeout(random.randint(900, 1400))
                     cursor_pos = await move_mouse_human_like(
                         page, cursor_pos,
                         (viewport_width * 0.05, cta_y),
                         viewport_width, viewport_height,
                         random.randint(200, 450),
                     )
-            except Exception as _cta_exc:
-                if _is_nav_error(_cta_exc):
-                    await _recover_after_nav(page)
+                except Exception as _cta_exc:
+                    if _is_nav_error(_cta_exc):
+                        await _recover_after_nav(page)
+        # ────────────────────────────────────────────────────────────────────────
 
-        effective_scroll_speed_factor = scroll_speed_factor
-        effective_scroll_pause_min_ms = scroll_pause_min_ms
-        effective_scroll_pause_max_ms = scroll_pause_max_ms
-        if slowdown_rounds_remaining > 0:
-            effective_scroll_speed_factor = clamp(scroll_speed_factor * section_slowdown_factor, 0.25, scroll_speed_factor)
-            effective_scroll_pause_min_ms = max(scroll_pause_min_ms, int(scroll_pause_min_ms * 1.6))
-            effective_scroll_pause_max_ms = max(effective_scroll_pause_min_ms + 5, int(scroll_pause_max_ms * 1.85))
-
-        await perform_gsap_micro_scroll(
-            page=page,
-            viewport_height=viewport_height,
-            scroll_speed_factor=effective_scroll_speed_factor,
-            scroll_pause_min_ms=effective_scroll_pause_min_ms,
-            scroll_pause_max_ms=effective_scroll_pause_max_ms,
-        )
         if slowdown_rounds_remaining > 0:
             slowdown_rounds_remaining -= 1
 
-        # Даём браузеру/GSAP время отрендерить новый контент и пересчитать scrollHeight
-        # (критично для Lazy Load и ScrollTrigger refresh)
-        await page.wait_for_timeout(500)
+        # ── Stagnation detection ─────────────────────────────────────────────────
+        scroll_advanced = current_scroll_y > (before_scroll_y + 6)
 
-        try:
-            after_metrics = await get_scroll_metrics(page)
-            current_scroll_raw = int(after_metrics.get("scrollY", before_scroll_y))
-            if bottom_debug and last_scroll_y >= 0 and current_scroll_raw + 8 < last_scroll_y:
-                logger.info(
-                    "🧭 Scroll-only rebound detected (post-scroll): "
-                    f"raw={current_scroll_raw}, last={last_scroll_y}. Игнорируем откат"
-                )
-            current_scroll_y = max(current_scroll_raw, before_scroll_y, max(last_scroll_y, 0))
-            max_scroll_y = int(after_metrics.get("maxScroll", 0))
-            at_bottom = bool(after_metrics.get("atBottom", at_bottom_before))
-        except Exception as exc:
-            if _is_nav_error(exc):
-                await _recover_after_nav(page)
-                after_metrics = {
-                    "scrollY": before_scroll_y,
-                    "maxScroll": 0,
-                    "atBottom": False,
-                    "documentHeight": 0,
-                    "viewportHeight": viewport_height,
-                    "bottomGap": 0,
-                }
-                current_scroll_y = before_scroll_y
-                max_scroll_y = 0
-                at_bottom = False
-            else:
-                raise
-
-        # Живое определение заголовков в текущем viewport ──────────────────────
-        try:
-            live_headings = await page.evaluate(
-                """() => {
-                    const result = [];
-                    const vh = window.innerHeight;
-                    const vw = window.innerWidth;
-                    const els = document.querySelectorAll('h1, h2, h3, h4');
-                    for (const el of els) {
-                        const text = (el.textContent || '').trim();
-                        if (!text) continue;
-                        const rect = el.getBoundingClientRect();
-                        if (rect.top >= -4 && rect.top <= vh * 0.45 && rect.height > 0) {
-                            result.push({
-                                text: text.slice(0, 80),
-                                x: Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2)),
-                                y: Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))
-                            });
-                        }
-                    }
-                    return result;
-                }"""
-            )
-            for h_item in (live_headings or []):
-                h_text = h_item.get("text", "") if isinstance(h_item, dict) else str(h_item)
-                if h_text not in seen_heading_keys:
-                    seen_heading_keys.add(h_text)
-                    logger.info(
-                        f"🧭 Scroll-only: заголовок '{h_text[:56]}' — пауза {section_pause_ms}ms"
-                    )
-                    if section_pause_ms > 0:
-                        await page.wait_for_timeout(section_pause_ms)
-                    slowdown_rounds_remaining = max(slowdown_rounds_remaining, section_slowdown_rounds)
-
-            # После обнаружения заголовков, ищем CTA в viewport для наведения курсора
-            if live_headings:
-                try:
-                    viewport_ctas = await find_viewport_cta_elements(
-                        page, viewport_width, viewport_height, limit=4,
-                    )
-                    picked_cta = None
-                    for _c in (viewport_ctas or []):
-                        _key = str(_c.get("dedupKey", _c.get("text", "")))
-                        if _key not in hovered_cta_keys:
-                            picked_cta = _c
-                            hovered_cta_keys.add(_key)
-                            break
-                    if picked_cta:
-                        cta_x = float(picked_cta.get("x", viewport_width * 0.5))
-                        cta_y = float(picked_cta.get("y", viewport_height * 0.5))
-                        cta_text = str(picked_cta.get("text", "")).strip()
-                        logger.info(f"🎯 Scroll-only: CTA рядом с заголовком '{cta_text[:30]}'")
-                        cursor_pos = await move_mouse_human_like(
-                            page, cursor_pos, (cta_x, cta_y),
-                            viewport_width, viewport_height,
-                            random.randint(250, 600),
-                        )
-                        await page.wait_for_timeout(random.randint(800, 1300))
-                        cursor_pos = await move_mouse_human_like(
-                            page, cursor_pos,
-                            (viewport_width * 0.05, cta_y),
-                            viewport_width, viewport_height,
-                            random.randint(180, 400),
-                        )
-                except Exception as _cta_exc2:
-                    if _is_nav_error(_cta_exc2):
-                        await _recover_after_nav(page)
-        except Exception as _exc:
-            if _is_nav_error(_exc):
-                await _recover_after_nav(page)
-        # ────────────────────────────────────────────────────────────────────────
-
-        scroll_advanced = current_scroll_y > (last_scroll_y + 6)
-
-        # ── DOM mutation guard ───────────────────────────────────────────────────
-        # На GSAP-сайтах window.scrollY стоит на месте пока идёт pinned-анимация.
-        # Если DOM меняется (innerHTML.length изменился) — значит анимация активна,
-        # скролл не завис по-настоящему, счётчик стагнации не трогаем.
+        # DOM mutation guard: on GSAP-pinned sites scrollY stalls while animation plays.
+        # If body HTML length changed, the animation is still active — don't count as stall.
         dom_is_mutating = False
         if not scroll_advanced:
             try:
@@ -5262,7 +5191,6 @@ async def run_scroll_only_down_pass(
                 prev_dom_hash = cur_dom_hash
             except Exception:
                 pass
-        # ────────────────────────────────────────────────────────────────────────
 
         if scroll_advanced or dom_is_mutating:
             stagnant_rounds = 0
@@ -5271,7 +5199,7 @@ async def run_scroll_only_down_pass(
             stagnant_rounds += 1
 
         stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
-        if not at_bottom and (stagnant_rounds >= 6 or stall_elapsed_ms >= stall_timeout_ms):
+        if not js_is_bottom and (stagnant_rounds >= 6 or stall_elapsed_ms >= stall_timeout_ms):
             logger.info(
                 "🧭 Scroll-only: anti-stall форсирует продвижение вниз "
                 f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms)"
@@ -5280,136 +5208,55 @@ async def run_scroll_only_down_pass(
             stagnant_rounds = 0
             last_progress_at = time.monotonic()
             try:
-                after_metrics = await get_scroll_metrics(page)
-                current_scroll_y = max(int(after_metrics.get("scrollY", current_scroll_y)), current_scroll_y)
-                max_scroll_y = int(after_metrics.get("maxScroll", max_scroll_y))
-                at_bottom = bool(after_metrics.get("atBottom", at_bottom))
+                current_scroll_y = max(current_scroll_y, int(await page.evaluate(
+                    """() => Math.round(window.scrollY)"""
+                )))
+                js_is_bottom = bool(await page.evaluate(
+                    """() => Math.ceil(window.scrollY + window.innerHeight) >= document.documentElement.scrollHeight - 50"""
+                ))
             except Exception as exc:
                 if _is_nav_error(exc):
                     await _recover_after_nav(page)
                 else:
                     raise
+        # ────────────────────────────────────────────────────────────────────────
 
         if round_index % 12 == 0:
             logger.info(
-                f"🧭 Scroll-only progress: scrollY={current_scroll_y}, maxScroll={max_scroll_y}, "
+                f"🧭 Scroll-only progress: scrollY={current_scroll_y}, "
                 f"stagnant={stagnant_rounds}"
             )
 
         last_scroll_y = max(last_scroll_y, current_scroll_y)
-        bottom_confirmed, bottom_reason = confirm_bottom_state_from_metrics(
-            metrics=after_metrics,
-            viewport_height=viewport_height,
-            round_index=round_index,
-            bottom_stable_rounds_required=bottom_stable_rounds_required,
-            stagnant_rounds=stagnant_rounds,
-        )
-        metric_document_height = metrics_document_height(after_metrics, viewport_height)
 
-        # ── GSAP/ScrollTrigger: DOM-height formula ──────────────────────────────
-        # На scroll-jacked сайтах (GSAP pinned, Locomotive) window.scrollY может
-        # замирать пока идёт анимация; проверяем конец напрямую через scrollHeight.
-        try:
-            gsap_at_real_bottom: bool = bool(await page.evaluate(
-                """() => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2"""
-            ))
-        except Exception:
-            gsap_at_real_bottom = False
-
-        # ── Визуальный детектор подвала (Footer Detector) ───────────────────────
-        # Ищем <footer> или последний видимый блочный дочерний элемент <body>.
-        # Если его низ (getBoundingClientRect().bottom) ≤ window.innerHeight —
-        # низ сайта физически появился на экране, даже если scrollY стоит на месте.
-        try:
-            footer_in_viewport: bool = bool(await page.evaluate(
-                """() => {
-                    const footer = document.querySelector('footer');
-                    if (footer) {
-                        const r = footer.getBoundingClientRect();
-                        if (r.height > 0) return r.bottom <= window.innerHeight + 4;
-                    }
-                    // Fallback: последний видимый блочный ребёнок body
-                    const children = Array.from(document.body.children).reverse();
-                    for (const el of children) {
-                        const st = getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden') continue;
-                        const r = el.getBoundingClientRect();
-                        if (r.height > 0) return r.bottom <= window.innerHeight + 4;
-                    }
-                    return false;
-                }"""
-            ))
-        except Exception:
-            footer_in_viewport = False
-
-        # Принимаем оба сигнала: классические метрики ИЛИ прямая DOM-формула ИЛИ footer виден
-        effective_confirmed = bottom_confirmed or gsap_at_real_bottom or footer_in_viewport
-
-        if bottom_debug and (
-            round_index % 8 == 0
-            or (at_bottom and not bottom_confirmed)
-            or bottom_confirmed
-            or gsap_at_real_bottom
-            or footer_in_viewport
-        ):
+        if bottom_debug and (round_index % 8 == 0 or js_is_bottom):
             logger.info(
                 "🧭 Scroll-only bottom check: "
-                f"atBottom={at_bottom}, confirmed={bottom_confirmed}, "
-                f"gsapDOM={gsap_at_real_bottom}, footerVisible={footer_in_viewport}, "
-                f"reason={bottom_reason}, "
-                f"scrollY={current_scroll_y}, maxScroll={max_scroll_y}, docHeight={metric_document_height}, "
-                f"stable={bottom_stable_rounds}"
+                f"jsBottom={js_is_bottom}, scrollY={current_scroll_y}"
             )
 
-        if (gsap_at_real_bottom or footer_in_viewport) and not bottom_confirmed:
-            logger.info(
-                f"🧭 Scroll-only GSAP/footer: конец страницы обнаружен визуально "
-                f"(gsap={gsap_at_real_bottom}, footer={footer_in_viewport}, scrollY={current_scroll_y}), "
-                "ждём подтверждения"
-            )
-
-        if effective_confirmed:
-            bottom_stable_rounds += 1
-        else:
-            bottom_stable_rounds = 0
-
-        if bottom_stable_rounds >= bottom_stable_rounds_required:
+        # ── True Bottom: immediate exit — no timeout polling ─────────────────────
+        if js_is_bottom:
             elapsed_since_start_ms = (time.monotonic() - started_at) * 1000
             if elapsed_since_start_ms < min_duration_ms:
                 logger.info(
                     f"🧭 Scroll-only: дно найдено слишком рано "
                     f"({int(elapsed_since_start_ms)}мс из минимума {int(min_duration_ms)}мс) — продолжаем"
                 )
-                bottom_stable_rounds = 0
                 stagnant_rounds = 0
                 continue
 
-            metric_viewport_height = metrics_viewport_height(after_metrics, viewport_height)
-            visible_end = current_scroll_y + metric_viewport_height
-            remaining_gap = metric_document_height - visible_end
-            if remaining_gap > metric_viewport_height * 0.12:
-                logger.info(
-                    f"🧭 Scroll-only: atBottom=true, но до конца контента ещё {remaining_gap}px "
-                    f"(docH={metric_document_height}, visEnd={visible_end}) — продолжаем"
-                )
-                bottom_stable_rounds = 0
-                stagnant_rounds = 0
-                await force_scroll_progress(page, viewport_height)
-                continue
-
-            # ── GSAP lazy-load guard: счётчик попыток ──────────────────────────
-            # Даже если "дно" обнаружено, делаем 4 попытки с 1-секундными паузами:
-            # если scrollHeight вырос — контент ещё подгружается, скроллим дальше.
+            # ── GSAP lazy-load guard: even at True Bottom, wait for content inflation ─
+            # Dynamic sites may expand scrollHeight after we reach what looks like the end.
             try:
                 prev_scroll_height = int(await page.evaluate(
                     """() => document.documentElement.scrollHeight"""
                 ))
             except Exception:
-                prev_scroll_height = metric_document_height
+                prev_scroll_height = 0
 
             gsap_content_grew = False
-            gsap_retry_count = 4
-            for _retry in range(gsap_retry_count):
+            for _retry in range(4):
                 await force_scroll_progress(page, viewport_height)
                 await page.wait_for_timeout(1000)
                 try:
@@ -5423,18 +5270,17 @@ async def run_scroll_only_down_pass(
                     logger.info(
                         f"🧭 Scroll-only GSAP guard: scrollHeight вырос "
                         f"{prev_scroll_height}→{new_scroll_height} "
-                        f"(попытка {_retry + 1}/{gsap_retry_count}) — продолжаем"
+                        f"(попытка {_retry + 1}/4) — продолжаем"
                     )
                     prev_scroll_height = new_scroll_height
-                    bottom_stable_rounds = 0
                     stagnant_rounds = 0
                     last_progress_at = time.monotonic()
-                    break  # выходим из retry-цикла, возвращаемся к основному while
+                    break
 
             if gsap_content_grew:
                 continue  # основной while-цикл — скроллим дальше
 
-            logger.info("🧭 Scroll-only: GSAP guard пройден, scrollHeight стабилен — дно подтверждено")
+            logger.info("🧭 JS True Bottom: Math.ceil(scrollY+innerHeight) >= scrollHeight-50 — дно подтверждено")
             reached_bottom = True
             break
 
