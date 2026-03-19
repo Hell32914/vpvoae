@@ -5311,19 +5311,14 @@ async def run_scroll_only_down_pass(
     started_at = time.monotonic()
     soft_budget_ms = max(8000, int(total_time_ms))
     hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
-    min_duration_ms = max(4000, int(soft_budget_ms * 0.18))
-    stall_timeout_ms = max(3500, min(int(stall_timeout_ms), 90000))
     # Абсолютный предохранитель: не зависаем на бесконечных GSAP-лендингах дольше N секунд.
     # Когда срабатывает — выходим штатно, entrypoint.sh посылает SIGTERM в FFmpeg → видео сохраняется.
     gsap_failsafe_ms = max(60000, min(env_int("GSAP_SCROLL_FAILSAFE_MS", 180000), 600000))
 
     last_scroll_y = -1
-    last_container_top = 0       # for hybrid stagnation on virtual-scroll sites
-    stagnant_rounds = 0
-    stall_exit_count = 0         # consecutive anti-stall interventions without real progress
+    previous_container_top = 0
+    stagnant_scrolls = 0
     round_index = 0
-    last_progress_at = time.monotonic()
-    prev_dom_hash: int = 0  # для DOM-mutation guard (см. ниже)
 
     while True:
         elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -5335,7 +5330,7 @@ async def run_scroll_only_down_pass(
             )
             break
         # ────────────────────────────────────────────────────────────────────────
-        if elapsed_ms >= soft_budget_ms and (reached_bottom or not require_bottom):
+        if elapsed_ms >= soft_budget_ms and not require_bottom:
             break
         if elapsed_ms >= hard_budget_ms:
             break
@@ -5363,17 +5358,28 @@ async def run_scroll_only_down_pass(
             else:
                 raise
 
-        js_is_bottom = bool(result.get("isBottom", False))
         js_scroll_y = int(result.get("scrollY", before_scroll_y))
-        js_container_top = int(result.get("containerTop", 0))
+        current_container_top = int(result.get("containerTop", 0))
         js_headings = result.get("headings") or []
         js_ctas = result.get("ctas") or []
         current_scroll_y = max(js_scroll_y, before_scroll_y)
+
+        if abs(current_container_top - previous_container_top) < 2:
+            stagnant_scrolls += 1
+        else:
+            stagnant_scrolls = 0
+        previous_container_top = current_container_top
+
         logger.info(
             f"[Scroll-only] Шаг {round_index} | scrollY={current_scroll_y} "
-            f"| containerTop={js_container_top} | застой={stagnant_rounds}/5 "
-            f"| дно={js_is_bottom} | elapsed={int(elapsed_ms)}ms"
+            f"| containerTop={current_container_top} | застой={stagnant_scrolls}/5 "
+            f"| elapsed={int(elapsed_ms)}ms"
         )
+
+        if stagnant_scrolls >= 5:
+            logger.info("[INFO] Дно найдено по застою координат. Завершаем.")
+            reached_bottom = True
+            break
 
         # ── Process headings & CTAs returned by the JS engine ────────────────────
         new_heading_found = False
@@ -5421,194 +5427,7 @@ async def run_scroll_only_down_pass(
         if slowdown_rounds_remaining > 0:
             slowdown_rounds_remaining -= 1
 
-        # ── Stagnation detection ─────────────────────────────────────────────────
-        scroll_advanced = current_scroll_y > (before_scroll_y + 6)
-
-        # DOM mutation guard: on GSAP-pinned sites scrollY stalls while animation plays.
-        # If body HTML length changed, the animation is still active — don't count as stall.
-        dom_is_mutating = False
-        if not scroll_advanced:
-            try:
-                cur_dom_hash = int(await page.evaluate(
-                    """() => document.body ? document.body.innerHTML.length : 0"""
-                ))
-                if prev_dom_hash != 0 and cur_dom_hash != prev_dom_hash:
-                    dom_is_mutating = True
-                    logger.info(
-                        "🧭 Scroll-only DOM мутирует (GSAP анимация активна, scrollY не двигается) — "
-                        f"hash {prev_dom_hash}→{cur_dom_hash}, stagnant не считаем"
-                    )
-                prev_dom_hash = cur_dom_hash
-            except Exception:
-                pass
-
-        # Hybrid stagnation: only declare a stall when BOTH scrollY AND the
-        # container rect.top are frozen. On GSAP/Locomotive virtual-scroll sites
-        # the container's top shifts visibly even while scrollY stays at 0, so a
-        # single frozen metric is not enough evidence to count the round as stalled.
-        container_advanced = abs(js_container_top - last_container_top) > 2
-        last_container_top = js_container_top
-        if scroll_advanced or container_advanced or dom_is_mutating:
-            stagnant_rounds = 0
-            stall_exit_count = 0
-            last_progress_at = time.monotonic()
-        else:
-            stagnant_rounds += 1
-
-        stall_elapsed_ms = (time.monotonic() - last_progress_at) * 1000
-        if not js_is_bottom and (stagnant_rounds >= 5 or stall_elapsed_ms >= stall_timeout_ms):
-            stall_exit_count += 1
-            if stall_exit_count >= 4:
-                logger.warning(
-                    f"🔴 Scroll-only: застой исчерпал все попытки ({stall_exit_count} интервенций) "
-                    f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms) — "
-                    "фиксированный viewport или 3D-канвас, принудительное завершение"
-                )
-                break
-            logger.info(
-                "🧭 Scroll-only: anti-stall форсирует продвижение вниз "
-                f"(rounds={stagnant_rounds}, elapsed={int(stall_elapsed_ms)}ms, "
-                f"интервенция {stall_exit_count}/4)"
-            )
-            await force_scroll_progress(page, viewport_height)
-            stagnant_rounds = 0
-            last_progress_at = time.monotonic()
-            try:
-                current_scroll_y = max(current_scroll_y, int(await page.evaluate(
-                    """() => Math.round(window.scrollY)"""
-                )))
-                js_is_bottom = bool(await page.evaluate(
-                    """() => {
-                        const el = document.querySelector(
-                            '[data-scroll-container],#smooth-wrapper,#scroll-container,.lenis,#__next,#app,main'
-                        );
-                        const c = (el && el.scrollHeight > window.innerHeight * 1.2) ? el : document.body;
-                        const rect = c.getBoundingClientRect();
-                        const h = c.scrollHeight || c.offsetHeight || 0;
-                        return (Math.abs(rect.top) + window.innerHeight) >= (h - 100);
-                    }"""
-                ))
-            except Exception as exc:
-                if _is_nav_error(exc):
-                    await _recover_after_nav(page)
-                else:
-                    raise
-        # ────────────────────────────────────────────────────────────────────────
-
         last_scroll_y = max(last_scroll_y, current_scroll_y)
-
-        if bottom_debug and (round_index % 8 == 0 or js_is_bottom):
-            logger.info(
-                "🧭 Scroll-only bottom check: "
-                f"jsBottom={js_is_bottom}, scrollY={current_scroll_y}"
-            )
-
-        # ── True Bottom: immediate exit — no timeout polling ─────────────────────
-        if js_is_bottom:
-            elapsed_since_start_ms = (time.monotonic() - started_at) * 1000
-
-            # ── Fake Bottom guard: virtual scroll (Locomotive / Lenis / GSAP) ────
-            # On sites where document.body is ~100vh and content is driven by CSS
-            # transform inside a container, scrollY stays near 0 while the page
-            # appears to scroll. If we hit "bottom" in the first 5 s with no real
-            # scrollY movement, treat this as a false positive: keep driving the
-            # virtual scroller via JS body-WheelEvent injection instead of exiting.
-            if elapsed_since_start_ms < 5000 and last_scroll_y < 50:
-                logger.info(
-                    f"🟡 Scroll-only: Fake Bottom (виртуальный скролл?) — "
-                    f"дно в первые {int(elapsed_since_start_ms)}ms при scrollY={last_scroll_y}, "
-                    "инжектируем WheelEvent в body и игнорируем флаг"
-                )
-                try:
-                    await page.evaluate(
-                        """(delta) => {
-                            const d = Math.round(delta * 0.9);
-                            try {
-                                document.body.dispatchEvent(new WheelEvent('wheel', {
-                                    deltaY: d, deltaMode: 0,
-                                    bubbles: true, cancelable: true,
-                                    clientX: window.innerWidth / 2,
-                                    clientY: window.innerHeight / 2,
-                                }));
-                            } catch(e) {}
-                            try { window.scrollBy({ top: d, behavior: 'smooth' }); } catch(e) {}
-                        }""",
-                        viewport_height,
-                    )
-                except Exception:
-                    pass
-                stagnant_rounds = 0
-                continue
-            # ─────────────────────────────────────────────────────────────────────
-
-            if elapsed_since_start_ms < min_duration_ms:
-                logger.info(
-                    f"🧭 Scroll-only: дно найдено слишком рано "
-                    f"({int(elapsed_since_start_ms)}мс из минимума {int(min_duration_ms)}мс) — продолжаем"
-                )
-                stagnant_rounds = 0
-                continue
-
-            # ── GSAP lazy-load guard: even at True Bottom, wait for content inflation ─
-            # Dynamic sites may expand scrollHeight after we reach what looks like the end.
-            try:
-                prev_scroll_height = int(await page.evaluate(
-                    """() => document.documentElement.scrollHeight"""
-                ))
-            except Exception:
-                prev_scroll_height = 0
-
-            gsap_content_grew = False
-            for _retry in range(4):
-                await force_scroll_progress(page, viewport_height)
-                await page.wait_for_timeout(1000)
-                try:
-                    new_scroll_height = int(await page.evaluate(
-                        """() => document.documentElement.scrollHeight"""
-                    ))
-                except Exception:
-                    new_scroll_height = prev_scroll_height
-                if new_scroll_height > prev_scroll_height + 10:
-                    gsap_content_grew = True
-                    logger.info(
-                        f"🧭 Scroll-only GSAP guard: scrollHeight вырос "
-                        f"{prev_scroll_height}→{new_scroll_height} "
-                        f"(попытка {_retry + 1}/4) — продолжаем"
-                    )
-                    prev_scroll_height = new_scroll_height
-                    stagnant_rounds = 0
-                    last_progress_at = time.monotonic()
-                    break
-
-            if gsap_content_grew:
-                continue  # основной while-цикл — скроллим дальше
-
-            logger.info("🧭 JS True Bottom: Math.ceil(scrollY+innerHeight) >= scrollHeight-50 — дно подтверждено")
-            reached_bottom = True
-            break
-
-    if require_bottom and not reached_bottom:
-        elapsed_ms = (time.monotonic() - started_at) * 1000
-        remaining_ms = max(0, int(hard_budget_ms - elapsed_ms))
-        finish_budget_ms = min(max(4000, int(scroll_finish_timeout_ms)), remaining_ms)
-        if finish_budget_ms <= 0:
-            finish_budget_ms = max(8000, min(30000, int(scroll_finish_timeout_ms)))
-        if finish_budget_ms > 0:
-            try:
-                reached_bottom = await force_scroll_to_page_end(
-                    page=page,
-                    viewport_height=viewport_height,
-                    scroll_speed_factor=scroll_speed_factor,
-                    scroll_pause_min_ms=scroll_pause_min_ms,
-                    scroll_pause_max_ms=scroll_pause_max_ms,
-                    finish_timeout_ms=finish_budget_ms,
-                    bottom_debug=bottom_debug,
-                )
-            except Exception as exc:
-                if _is_nav_error(exc):
-                    await _recover_after_nav(page)
-                else:
-                    logger.warning(f"⚠️ Scroll-only: ошибка финального доскролла: {exc}")
 
     return reached_bottom, cursor_pos
 
@@ -5749,9 +5568,9 @@ async def run_smart_cursor(
             )
             reached_bottom = False
         if reached_bottom:
-            logger.info("🧭 Smart cursor: режим CTA_ANALYZER завершён, страница прокручена до конца")
+            logger.info("🧭 Smart cursor: режим CTA_ANALYZER завершён, страница прокручена до визуального конца")
         else:
-            logger.warning("⚠️ Smart cursor: режим CTA_ANALYZER завершился по таймауту до достижения конца страницы")
+            logger.warning("⚠️ Smart cursor: режим CTA_ANALYZER завершился по таймауту до достижения визуального конца страницы")
         return hovered_count
 
     strict_mode_active = strict_top_to_bottom_mode or always_descend
