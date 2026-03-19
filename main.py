@@ -4952,30 +4952,30 @@ def build_scroll_only_section_landmarks(
     return deduped
 
 
-# ── JS rAF smooth scroll engine for Mode 2 (CTA Analyzer) ─────────────────────
-# Evaluates inside the browser: scrolls one viewport height using requestAnimationFrame
-# with Delta Time animation (speed = step*100 px/sec, step=4 → 400px/s, step=2 → 200px/s).
+# ── JS rAF sniper scroll engine for Mode 2 (CTA Analyzer) ─────────────────────
+# Evaluates inside the browser: moves frame-by-frame without native smooth scroll,
+# stops immediately when a fresh heading/CTA enters the sweet spot [35%, 55%].
 # Anti-overlap: window._isPlaywrightScrolling prevents concurrent scroll commands.
-# Smart Focus Zone: headings/CTAs only trigger when rect.top ∈ [vh*0.25, vh*0.75].
-# Returns {isBottom, headings, ctas, scrollY} to Python when done.
-# True Bottom: container-based — |container.getBoundingClientRect().top| + innerHeight >= container.scrollHeight - 100
-# Works for both native scroll and virtual scroll (Locomotive / Lenis / GSAP transform containers).
+# Each JS session travels at most one viewport height; Python decides whether to continue.
+# Returns {isBottom, focusFound, focusKind, focusTarget, headings, ctas, scrollY, containerTop}.
+# True Bottom diagnostics remain container-based for both native and virtual scroll containers.
 _JS_SCROLL_ONE_VIEWPORT = """
 async (step) => {
     const vh = window.innerHeight;
     const vw = window.innerWidth;
-    const quietWindowMs = 150;
-    const hardStopMs = 1500;
+    const slowMode = (typeof step === 'number' && step > 0 && step <= 2);
+    const stepPx = slowMode ? 15 : 20;
+    const sessionLimitPx = Math.max(1, Math.round(vh));
+    const sweetTop = vh * 0.35;
+    const sweetBottom = vh * 0.55;
+    const sweetCenter = (sweetTop + sweetBottom) / 2;
+    const maxFrames = Math.max(1, Math.ceil(sessionLimitPx / Math.max(1, stepPx)) + 2);
+    const hardStopMs = Math.max(1400, maxFrames * 34);
 
     function getRootScrollContainer() {
         return document.scrollingElement || document.documentElement || document.body;
     }
 
-    // Smart Virtual Scroll Detector:
-    // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
-    // document.body at ~100vh while the real content lives inside a transformed
-    // container. We locate that container and measure scroll progress via
-    // getBoundingClientRect().top — works for both transform-based and native scroll.
     function findScrollContainer() {
         const byAttr = document.querySelector(
             '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content, .lenis'
@@ -5012,6 +5012,9 @@ async (step) => {
     if (window._isPlaywrightScrolling) {
         return {
             isBottom: isAtBottom(),
+            focusFound: false,
+            focusKind: '',
+            focusTarget: null,
             headings: [],
             ctas: [],
             scrollY: Math.round(window.scrollY),
@@ -5020,14 +5023,6 @@ async (step) => {
     }
     window._isPlaywrightScrolling = true;
 
-    const slowMode = (typeof step === 'number' && step > 0 && step <= 2);
-    const targetDist = Math.round(vh * 0.90);
-    const totalSteps = slowMode ? 60 : 30;
-    const deltaPerStep = targetDist / totalSteps;
-
-    const headings = [];
-    const ctas = [];
-    const seenTexts = new Set();
     const CTA_WORDS = [
         'get started', 'start', 'book', 'schedule', 'contact', 'talk', 'demo',
         'pricing', 'price', 'quote', 'request', 'learn more', 'discover',
@@ -5045,6 +5040,10 @@ async (step) => {
         '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
     ];
 
+    function normalizeText(text, maxLen) {
+        return (text || '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+    }
+
     function hasFixedOrStickyAncestor(node) {
         let depth = 0;
         while (node && depth < 12) {
@@ -5059,210 +5058,227 @@ async (step) => {
         return false;
     }
 
-    function isInFocusZone(rect) {
-        const centerY = rect.top + rect.height / 2;
-        return Number.isFinite(centerY) && centerY >= vh * 0.25 && centerY <= vh * 0.75;
+    function isInSweetSpot(rect) {
+        return Number.isFinite(rect.top) && rect.top >= sweetTop && rect.top <= sweetBottom;
     }
 
-    function collectVisible() {
+    function hasRenderableBox(el, rect, style) {
+        if (!(el instanceof HTMLElement)) return false;
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        if (rect.right < 0 || rect.left > vw) return false;
+        if (rect.bottom < 0 || rect.top > vh) return false;
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (Number(style.opacity || '1') < 0.05) return false;
+        return true;
+    }
+
+    function ensureSeenKey(el, kind) {
+        if (!(el instanceof HTMLElement)) return kind + '-0';
+        const existing = (el.dataset && el.dataset.vpvoaeKey) ? String(el.dataset.vpvoaeKey) : '';
+        if (existing) return existing;
+        const nextId = Number(window.__vpvoaeSeenSeq || 0) + 1;
+        window.__vpvoaeSeenSeq = nextId;
+        const newKey = 'vpvoae-' + kind + '-' + nextId;
+        try {
+            el.dataset.vpvoaeKey = newKey;
+        } catch (e) {}
+        return newKey;
+    }
+
+    function markSeen(el, kind) {
+        const seenKey = ensureSeenKey(el, kind);
+        try {
+            el.dataset.vpvoaeSeen = 'true';
+        } catch (e) {}
+        return seenKey;
+    }
+
+    function buildTargetPayload(el, kind, rect, seenKey) {
+        const textLimit = kind === 'cta' ? 60 : 80;
+        const text = normalizeText(el.textContent || el.innerText || '', textLimit);
+        return {
+            kind,
+            text,
+            dedupKey: seenKey || ensureSeenKey(el, kind),
+            x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
+            y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
+            top: Math.round(rect.top),
+        };
+    }
+
+    function maybePickHeading(best, el) {
+        if (!(el instanceof HTMLElement)) return best;
+        if (el.dataset && el.dataset.vpvoaeSeen === 'true') return best;
+        if (hasFixedOrStickyAncestor(el)) return best;
+
+        const text = normalizeText(el.textContent || el.innerText || '', 80);
+        if (!text) return best;
+
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        if (!hasRenderableBox(el, rect, style)) return best;
+        if (!isInSweetSpot(rect)) return best;
+
+        const distance = Math.abs(rect.top - sweetCenter);
+        if (!best || distance < best.distance) {
+            return { el, kind: 'heading', rect, distance };
+        }
+        return best;
+    }
+
+    function maybePickCta(best, el) {
+        if (!(el instanceof HTMLElement)) return best;
+        if (el.dataset && el.dataset.vpvoaeSeen === 'true') return best;
+
+        const style = window.getComputedStyle(el);
+        if (style.position === 'fixed' || style.position === 'sticky') return best;
+        if (hasFixedOrStickyAncestor(el)) return best;
+        if (style.pointerEvents === 'none') return best;
+
+        const text = normalizeText(el.textContent || el.innerText || '', 60);
+        if (!text || text.length < 3 || text.length > 44) return best;
+        if (text.split(' ').length > 6) return best;
+
+        const rect = el.getBoundingClientRect();
+        if (!hasRenderableBox(el, rect, style)) return best;
+        if (rect.width < 72 || rect.height < 24) return best;
+        if (!isInSweetSpot(rect)) return best;
+
+        const textLow = text.toLowerCase();
+        if (!CTA_WORDS.some((word) => textLow.includes(word))) return best;
+
+        const distance = Math.abs(rect.top - sweetCenter);
+        if (!best || distance < best.distance || (distance === best.distance && best.kind !== 'cta')) {
+            return { el, kind: 'cta', rect, distance };
+        }
+        return best;
+    }
+
+    function findFocusTarget() {
+        let best = null;
+
         for (const el of document.querySelectorAll('h1,h2,h3,h4')) {
-            const text = (el.textContent || '').trim().slice(0, 80);
-            if (!text) continue;
-            const key = 'h|' + text;
-            if (seenTexts.has(key)) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width <= 0 || rect.height <= 0) continue;
-            if (!isInFocusZone(rect)) continue;
-
-            seenTexts.add(key);
-            headings.push({
-                text,
-                x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
-                y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
-            });
+            best = maybePickHeading(best, el);
         }
 
         for (const el of document.querySelectorAll('a,button,summary,[role="button"]')) {
-            if (!(el instanceof HTMLElement)) continue;
+            best = maybePickCta(best, el);
+        }
 
-            const text = (el.textContent || '').trim();
-            if (!text || text.length < 3 || text.length > 44) continue;
-            if (text.split(' ').length > 6) continue;
+        if (!best || !(best.el instanceof HTMLElement) || !best.rect) {
+            return null;
+        }
 
-            const style = window.getComputedStyle(el);
-            if (style.position === 'fixed' || style.position === 'sticky') continue;
-            if (hasFixedOrStickyAncestor(el.parentElement)) continue;
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            if (Number(style.opacity || '1') < 0.05 || style.pointerEvents === 'none') continue;
+        const seenKey = markSeen(best.el, best.kind);
+        return buildTargetPayload(best.el, best.kind, best.rect, seenKey);
+    }
 
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 72 || rect.height < 24) continue;
-            if (rect.right < 0 || rect.left > vw) continue;
-            if (rect.bottom < 0 || rect.top > vh) continue;
-            if (!isInFocusZone(rect)) continue;
-
-            const textLow = text.toLowerCase();
-            if (!CTA_WORDS.some(w => textLow.includes(w))) continue;
-
-            const dedup = text.slice(0, 40);
-            const key = 'c|' + dedup;
-            if (seenTexts.has(key)) continue;
-
-            seenTexts.add(key);
-            ctas.push({
-                text: text.slice(0, 60),
-                dedupKey: dedup,
-                x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
-                y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
-            });
+    function dispatchSyntheticWheel(deltaY) {
+        const wheelTargets = [
+            findScrollContainer(),
+            document.body,
+            document.documentElement,
+            window,
+        ];
+        const uniqueTargets = new Set();
+        for (const wheelTarget of wheelTargets) {
+            if (!wheelTarget || uniqueTargets.has(wheelTarget)) continue;
+            uniqueTargets.add(wheelTarget);
+            try {
+                wheelTarget.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY,
+                    deltaMode: 0,
+                    bubbles: true,
+                    cancelable: true,
+                    clientX: vw / 2,
+                    clientY: vh / 2,
+                }));
+            } catch (e) {}
         }
     }
 
-    function dispatchSyntheticWheel() {
-        const wheelTarget = document.body || document.documentElement || window;
-        try {
-            wheelTarget.dispatchEvent(new WheelEvent('wheel', {
-                deltaY: deltaPerStep,
-                deltaMode: 0,
-                bubbles: true,
-                cancelable: true,
-                clientX: vw / 2,
-                clientY: vh / 2,
-            }));
-        } catch (e) {}
-    }
-
-    function waitForScrollSettled() {
+    function runFrameScrollSession() {
         return new Promise((resolve) => {
             let finished = false;
-            let wheelLoopDone = false;
-            let settleTimer = 0;
             let hardTimer = 0;
-            let motionFrame = 0;
-            let wheelFrame = 0;
-            let wheelDone = null;
-            let lastActivityAt = Date.now();
-            let activeContainer = findScrollContainer() || getRootScrollContainer();
-            let lastScrollY = Math.round(window.scrollY);
-            let lastContainerTop = Math.round(activeContainer.getBoundingClientRect().top);
+            let frameId = 0;
+            let travelledPx = 0;
 
             const cleanup = () => {
-                if (settleTimer) window.clearTimeout(settleTimer);
                 if (hardTimer) window.clearTimeout(hardTimer);
-                if (motionFrame) window.cancelAnimationFrame(motionFrame);
-                if (wheelFrame) window.cancelAnimationFrame(wheelFrame);
-                window.removeEventListener('scroll', scrollHandler, true);
-                if (typeof wheelDone === 'function') {
-                    const finalizeWheel = wheelDone;
-                    wheelDone = null;
-                    finalizeWheel();
-                }
+                if (frameId) window.cancelAnimationFrame(frameId);
             };
 
-            const finish = () => {
+            const snapshot = () => {
+                const container = findScrollContainer() || getRootScrollContainer();
+                const containerRect = container.getBoundingClientRect();
+                return {
+                    isBottom: isAtBottom(),
+                    focusFound: false,
+                    focusKind: '',
+                    focusTarget: null,
+                    headings: [],
+                    ctas: [],
+                    scrollY: Math.round(window.scrollY),
+                    containerTop: Math.round(containerRect.top),
+                    sessionTravelPx: Math.round(travelledPx),
+                };
+            };
+
+            const finish = (payload) => {
                 if (finished) return;
                 finished = true;
                 cleanup();
-                resolve();
+                resolve(payload);
             };
 
-            const scheduleSettleCheck = () => {
-                if (finished) return;
-                if (settleTimer) window.clearTimeout(settleTimer);
-                settleTimer = window.setTimeout(() => {
-                    if (finished) return;
-                    const quietForMs = Date.now() - lastActivityAt;
-                    if (wheelLoopDone && quietForMs >= quietWindowMs) {
-                        finish();
-                        return;
-                    }
-                    scheduleSettleCheck();
-                }, quietWindowMs);
-            };
-
-            const markActivity = () => {
-                lastActivityAt = Date.now();
-                scheduleSettleCheck();
-            };
-
-            const scrollHandler = () => {
-                markActivity();
-            };
-
-            const probeMotion = () => {
-                if (finished) return;
-                activeContainer = findScrollContainer() || getRootScrollContainer();
-                const currentScrollY = Math.round(window.scrollY);
-                const currentContainerTop = Math.round(activeContainer.getBoundingClientRect().top);
-                if (
-                    Math.abs(currentScrollY - lastScrollY) > 0
-                    || Math.abs(currentContainerTop - lastContainerTop) > 1
-                ) {
-                    lastScrollY = currentScrollY;
-                    lastContainerTop = currentContainerTop;
-                    markActivity();
+            const finishWithTarget = (target) => {
+                const payload = snapshot();
+                payload.focusFound = true;
+                payload.focusKind = target.kind;
+                payload.focusTarget = target;
+                if (target.kind === 'heading') {
+                    payload.headings = [target];
+                } else if (target.kind === 'cta') {
+                    payload.ctas = [target];
                 }
-                motionFrame = window.requestAnimationFrame(probeMotion);
+                finish(payload);
             };
 
-            const runWheelLoop = () => new Promise((done) => {
-                wheelDone = done;
-                let stepsDone = 0;
-                const tick = () => {
-                    if (finished) {
-                        if (typeof wheelDone === 'function') {
-                            const finalizeWheel = wheelDone;
-                            wheelDone = null;
-                            finalizeWheel();
-                        }
-                        return;
-                    }
-                    if (stepsDone >= totalSteps) {
-                        if (typeof wheelDone === 'function') {
-                            const finalizeWheel = wheelDone;
-                            wheelDone = null;
-                            finalizeWheel();
-                        }
-                        return;
-                    }
-                    dispatchSyntheticWheel();
-                    stepsDone += 1;
-                    wheelFrame = window.requestAnimationFrame(tick);
-                };
-                wheelFrame = window.requestAnimationFrame(tick);
-            });
+            const tick = () => {
+                if (finished) return;
 
-            window.addEventListener('scroll', scrollHandler, true);
-            scheduleSettleCheck();
-            hardTimer = window.setTimeout(finish, hardStopMs);
-            motionFrame = window.requestAnimationFrame(probeMotion);
+                const preScrollTarget = findFocusTarget();
+                if (preScrollTarget) {
+                    finishWithTarget(preScrollTarget);
+                    return;
+                }
 
-            Promise.resolve()
-                .then(async () => {
-                    try { window.scrollBy({ top: targetDist, behavior: 'smooth' }); } catch (e) {}
-                    await runWheelLoop();
-                })
-                .catch(() => {})
-                .finally(() => {
-                    wheelLoopDone = true;
-                    scheduleSettleCheck();
-                });
+                dispatchSyntheticWheel(stepPx);
+                try { window.scrollBy(0, stepPx); } catch (e) {}
+                travelledPx += stepPx;
+
+                const postScrollTarget = findFocusTarget();
+                if (postScrollTarget) {
+                    finishWithTarget(postScrollTarget);
+                    return;
+                }
+
+                if (travelledPx >= sessionLimitPx || isAtBottom()) {
+                    finish(snapshot());
+                    return;
+                }
+
+                frameId = window.requestAnimationFrame(tick);
+            };
+
+            hardTimer = window.setTimeout(() => finish(snapshot()), hardStopMs);
+            frameId = window.requestAnimationFrame(tick);
         });
     }
 
     try {
-        await waitForScrollSettled();
-        collectVisible();
-        const container = findScrollContainer() || getRootScrollContainer();
-        const containerRect = container.getBoundingClientRect();
-        return {
-            isBottom: isAtBottom(),
-            headings,
-            ctas,
-            scrollY: Math.round(window.scrollY),
-            containerTop: Math.round(containerRect.top),
-        };
+        return await runFrameScrollSession();
     } finally {
         window._isPlaywrightScrolling = false;
     }
@@ -5285,7 +5301,7 @@ async def run_scroll_only_down_pass(
     stall_timeout_ms: int,
     cursor_pos: Tuple[float, float] = (960.0, 540.0),
 ) -> Tuple[bool, Tuple[float, float]]:
-    """CTA-Analyzer mode: JS smooth-scroll engine with settle-aware DOM analysis."""
+    """CTA-Analyzer mode: JS rAF sniper scroll with real-time landmark centering."""
     reached_bottom = False
     section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 500), 4000))
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 2), 6))
@@ -5338,7 +5354,7 @@ async def run_scroll_only_down_pass(
         round_index += 1
         before_scroll_y = max(last_scroll_y, 0)
 
-        # ── JS scroll engine: scrollBy + synthetic WheelEvents to document.body ─────
+        # ── JS scroll engine: frame-by-frame scrollBy + synthetic WheelEvents ─────
         # step=2 → slow (heading/CTA pause), step=4 → normal speed
         js_step = 2 if slowdown_rounds_remaining > 0 else 4
         # Return cursor to left safe zone before dispatching scroll — prevents
@@ -5348,20 +5364,42 @@ async def run_scroll_only_down_pass(
         except Exception:
             pass
         try:
-            # JS promise resolves only after scroll inertia fully settles,
-            # so headings/CTAs are sampled from a stable viewport.
+            # JS returns after one viewport-height session or immediately when
+            # a fresh heading/CTA enters the sweet spot in the current frame.
             result = await page.evaluate(_JS_SCROLL_ONE_VIEWPORT, js_step)
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
-                result = {"isBottom": False, "headings": [], "ctas": [], "scrollY": before_scroll_y}
+                result = {
+                    "isBottom": False,
+                    "focusFound": False,
+                    "focusKind": "",
+                    "focusTarget": None,
+                    "headings": [],
+                    "ctas": [],
+                    "scrollY": before_scroll_y,
+                    "containerTop": previous_container_top,
+                }
             else:
                 raise
 
         js_scroll_y = int(result.get("scrollY", before_scroll_y))
         current_container_top = int(result.get("containerTop", 0))
+        js_focus_found = bool(result.get("focusFound", False))
+        raw_focus_target = result.get("focusTarget")
+        js_focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
+        js_focus_kind = str(
+            result.get("focusKind", js_focus_target.get("kind", "") if js_focus_target else "")
+        ).strip().lower()
         js_headings = result.get("headings") or []
         js_ctas = result.get("ctas") or []
+        if js_focus_found and js_focus_target:
+            if js_focus_kind == "heading":
+                js_headings = [js_focus_target]
+                js_ctas = []
+            elif js_focus_kind == "cta":
+                js_ctas = [js_focus_target]
+                js_headings = []
         current_scroll_y = max(js_scroll_y, before_scroll_y)
 
         if abs(current_container_top - previous_container_top) < 2:
@@ -5385,8 +5423,9 @@ async def run_scroll_only_down_pass(
         new_heading_found = False
         for h_item in js_headings:
             h_text = h_item.get("text", "") if isinstance(h_item, dict) else str(h_item)
-            if h_text and h_text not in seen_heading_keys:
-                seen_heading_keys.add(h_text)
+            h_key = str(h_item.get("dedupKey", h_text)) if isinstance(h_item, dict) else h_text
+            if h_text and h_key not in seen_heading_keys:
+                seen_heading_keys.add(h_key)
                 logger.info(f"🧭 Scroll-only: заголовок '{h_text[:56]}' — пауза {section_pause_ms}ms")
                 new_heading_found = True
                 if section_pause_ms > 0:
@@ -6471,7 +6510,7 @@ async def _run_preload_mode() -> None:
             # Прокручиваем страницу вниз/вверх, чтобы триггернуть lazyload медиа
             try:
                 for _ in range(4):
-                    await page.evaluate("() => window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' })")
+                    await page.evaluate("() => window.scrollBy(0, Math.round(window.innerHeight * 0.8))")
                     await page.wait_for_timeout(600)
                 await page.evaluate("() => window.scrollTo({ top: 0, behavior: 'auto' })")
             except Exception:
