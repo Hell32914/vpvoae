@@ -1879,7 +1879,7 @@ async def find_viewport_cta_elements(
     viewport_height: int,
     limit: int = 3,
 ) -> List[Dict[str, Any]]:
-    """Находит CTA-кнопки в текущем viewport с учётом контрастности фона."""
+    """Находит CTA-кнопки в текущем viewport с учётом focus-zone и контрастности."""
     try:
         return await page.evaluate(
             """
@@ -1930,23 +1930,20 @@ async def find_viewport_cta_elements(
                     return ratio >= 2.0;
                 }
 
-                function isFixedOrSticky(el) {
-                    let node = el;
+                function hasFixedOrStickyAncestor(node) {
                     let depth = 0;
                     while (node && depth < 10) {
                         if (node.nodeType !== 1) break;
                         const pos = window.getComputedStyle(node).position;
                         if (pos === 'fixed' || pos === 'sticky') return true;
-                        const tag = node.tagName.toLowerCase();
-                        if (tag === 'header' || tag === 'nav') return true;
-                        if (node.getAttribute('role') === 'banner'
-                            || node.getAttribute('role') === 'navigation') return true;
                         node = node.parentElement;
                         depth++;
                     }
                     return false;
                 }
 
+                const focusTop = viewportHeight * 0.25;
+                const focusBottom = viewportHeight * 0.75;
                 const centerX = viewportWidth / 2;
                 const centerY = viewportHeight / 2;
                 const diag = Math.sqrt(centerX * centerX + centerY * centerY);
@@ -1958,16 +1955,23 @@ async def find_viewport_cta_elements(
 
                 for (const el of elements) {
                     if (!(el instanceof HTMLElement)) continue;
-                    if (isFixedOrSticky(el)) continue;
 
                     const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' || style.position === 'sticky') continue;
+                    if (hasFixedOrStickyAncestor(el.parentElement)) continue;
                     if (style.display === 'none' || style.visibility === 'hidden'
                         || Number(style.opacity || '1') < 0.05) continue;
+                    if (style.pointerEvents === 'none') continue;
 
                     const rect = el.getBoundingClientRect();
                     if (rect.width < 50 || rect.height < 18) continue;
-                    if (rect.top < -4 || rect.bottom > viewportHeight + 4) continue;
-                    if (rect.left < 0 || rect.right > viewportWidth) continue;
+                    if (rect.right < 0 || rect.left > viewportWidth) continue;
+                    if (rect.bottom < 0 || rect.top > viewportHeight) continue;
+
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+                    if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+                    if (cy < focusTop || cy > focusBottom) continue;
 
                     const text = (el.innerText || '').trim().toLowerCase();
                     if (text.length < 2 || text.length > 50) continue;
@@ -1977,8 +1981,6 @@ async def find_viewport_cta_elements(
 
                     if (!hasKeyword && !hasContrast) continue;
 
-                    const cx = rect.left + rect.width / 2;
-                    const cy = rect.top + rect.height / 2;
                     const area = rect.width * rect.height;
                     const distFromCenter = Math.sqrt(
                         (cx - centerX) * (cx - centerX) + (cy - centerY) * (cy - centerY)
@@ -4959,22 +4961,68 @@ def build_scroll_only_section_landmarks(
 # True Bottom: container-based — |container.getBoundingClientRect().top| + innerHeight >= container.scrollHeight - 100
 # Works for both native scroll and virtual scroll (Locomotive / Lenis / GSAP transform containers).
 _JS_SCROLL_ONE_VIEWPORT = """
-(step) => new Promise((resolve) => {
-    // Anti-Overlap: если уже идёт скролл — немедленно вернуть текущий статус
+async (step) => {
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    const quietWindowMs = 150;
+    const hardStopMs = 1500;
+
+    function getRootScrollContainer() {
+        return document.scrollingElement || document.documentElement || document.body;
+    }
+
+    // Smart Virtual Scroll Detector:
+    // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
+    // document.body at ~100vh while the real content lives inside a transformed
+    // container. We locate that container and measure scroll progress via
+    // getBoundingClientRect().top — works for both transform-based and native scroll.
+    function findScrollContainer() {
+        const byAttr = document.querySelector(
+            '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content, .lenis'
+        );
+        if (byAttr && byAttr.scrollHeight > vh * 1.2) return byAttr;
+
+        const bySpa = document.querySelector('#__next, #app');
+        if (bySpa && bySpa.scrollHeight > vh * 1.5) return bySpa;
+
+        const byMain = document.querySelector('main');
+        if (byMain && byMain.scrollHeight > vh * 1.5) return byMain;
+
+        let tallest = null;
+        let tallestH = 0;
+        const vhMin = vh * 1.5;
+        for (const child of (document.body ? document.body.children : [])) {
+            const h = child.scrollHeight || child.offsetHeight || 0;
+            if (h > tallestH && h > vhMin) {
+                tallestH = h;
+                tallest = child;
+            }
+        }
+        return tallest || getRootScrollContainer();
+    }
+
+    function isAtBottom() {
+        const container = findScrollContainer() || getRootScrollContainer();
+        const rect = container.getBoundingClientRect();
+        const realHeight = container.scrollHeight || container.offsetHeight || 0;
+        return (Math.abs(rect.top) + window.innerHeight) >= (realHeight - 100);
+    }
+
+    const overlapContainer = findScrollContainer() || getRootScrollContainer();
     if (window._isPlaywrightScrolling) {
-        resolve({ isBottom: false, headings: [], ctas: [], scrollY: Math.round(window.scrollY), containerTop: 0 });
-        return;
+        return {
+            isBottom: isAtBottom(),
+            headings: [],
+            ctas: [],
+            scrollY: Math.round(window.scrollY),
+            containerTop: Math.round(overlapContainer.getBoundingClientRect().top),
+        };
     }
     window._isPlaywrightScrolling = true;
 
-    const vh = window.innerHeight;
-    const vw = window.innerWidth;
-
-    // step=2 → slow mode (heading/CTA section): 60 rAF × ~16ms ≈ 1000ms per viewport
-    // step=4 → normal mode:                     30 rAF × ~16ms ≈  500ms per viewport
     const slowMode = (typeof step === 'number' && step > 0 && step <= 2);
     const targetDist = Math.round(vh * 0.90);
-    const totalSteps = slowMode ? 60 : 30;  // мелкие приращения по одному на каждый rAF-фрейм
+    const totalSteps = slowMode ? 60 : 30;
     const deltaPerStep = targetDist / totalSteps;
 
     const headings = [];
@@ -4997,135 +5045,228 @@ _JS_SCROLL_ONE_VIEWPORT = """
         '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
     ];
 
-    // Smart Virtual Scroll Detector:
-    // Locomotive Scroll / Lenis / GSAP ScrollTrigger pin-spacer sites keep
-    // document.body at ~100vh while the real content lives inside a transformed
-    // container. We locate that container and measure scroll progress via
-    // getBoundingClientRect().top — works for both transform-based and native scroll.
-    function findScrollContainer() {
-        // Priority 1: explicit virtual-scroll marker attributes / well-known ids
-        const byAttr = document.querySelector(
-            '[data-scroll-container], #smooth-wrapper, #scroll-container, #smooth-content, .lenis'
-        );
-        if (byAttr && byAttr.scrollHeight > vh * 1.2) return byAttr;
-        // Priority 2: known SPA root containers
-        const bySpa = document.querySelector('#__next, #app');
-        if (bySpa && bySpa.scrollHeight > vh * 1.5) return bySpa;
-        // Priority 3: <main> element (only when substantially taller than viewport)
-        const byMain = document.querySelector('main');
-        if (byMain && byMain.scrollHeight > vh * 1.5) return byMain;
-        // Priority 4: tallest direct child of body that exceeds 1.5× viewport
-        let tallest = null;
-        let tallestH = 0;
-        const vhMin = vh * 1.5;
-        for (const child of (document.body ? document.body.children : [])) {
-            const h = child.scrollHeight || child.offsetHeight || 0;
-            if (h > tallestH && h > vhMin) {
-                tallestH = h;
-                tallest = child;
+    function hasFixedOrStickyAncestor(node) {
+        let depth = 0;
+        while (node && depth < 12) {
+            if (!(node instanceof Element)) break;
+            const style = window.getComputedStyle(node);
+            if (style.position === 'fixed' || style.position === 'sticky') {
+                return true;
             }
+            node = node.parentElement;
+            depth += 1;
         }
-        return tallest;  // null → caller falls back to document.body
+        return false;
     }
 
-    function isAtBottom() {
-        // Pure container-based bottom detection — works for both native scroll
-        // and virtual scroll (Locomotive / Lenis / GSAP) where scrollY stays near 0.
-        //
-        // For native scroll:  document.body is the container.
-        //   body.getBoundingClientRect().top = -window.scrollY
-        //   ⇒ Math.abs(rect.top) = scrollY  ⇒ identical to the classic formula.
-        //
-        // For virtual scroll: the transform-driven container is used.
-        //   rect.top grows negative as the container is pushed upward by CSS transform.
-        const container = findScrollContainer() || document.body;
-        const rect = container.getBoundingClientRect();
-        const realHeight = container.scrollHeight || container.offsetHeight || 0;
-        return (Math.abs(rect.top) + window.innerHeight) >= (realHeight - 100);
+    function isInFocusZone(rect) {
+        const centerY = rect.top + rect.height / 2;
+        return Number.isFinite(centerY) && centerY >= vh * 0.25 && centerY <= vh * 0.75;
     }
 
     function collectVisible() {
-        // Smart Focus Zone: триггер только когда элемент попал в центральные 50% экрана
-        const focusTop = vh * 0.25;
-        const focusBottom = vh * 0.75;
         for (const el of document.querySelectorAll('h1,h2,h3,h4')) {
             const text = (el.textContent || '').trim().slice(0, 80);
             if (!text) continue;
             const key = 'h|' + text;
             if (seenTexts.has(key)) continue;
+
             const rect = el.getBoundingClientRect();
-            if (rect.top >= focusTop && rect.top <= focusBottom && rect.height > 0) {
-                seenTexts.add(key);
-                headings.push({
-                    text,
-                    x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
-                    y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
-                });
-            }
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            if (!isInFocusZone(rect)) continue;
+
+            seenTexts.add(key);
+            headings.push({
+                text,
+                x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
+                y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
+            });
         }
+
         for (const el of document.querySelectorAll('a,button,summary,[role="button"]')) {
+            if (!(el instanceof HTMLElement)) continue;
+
             const text = (el.textContent || '').trim();
             if (!text || text.length < 3 || text.length > 44) continue;
             if (text.split(' ').length > 6) continue;
+
+            const style = window.getComputedStyle(el);
+            if (style.position === 'fixed' || style.position === 'sticky') continue;
+            if (hasFixedOrStickyAncestor(el.parentElement)) continue;
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (Number(style.opacity || '1') < 0.05 || style.pointerEvents === 'none') continue;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 72 || rect.height < 24) continue;
+            if (rect.right < 0 || rect.left > vw) continue;
+            if (rect.bottom < 0 || rect.top > vh) continue;
+            if (!isInFocusZone(rect)) continue;
+
+            const textLow = text.toLowerCase();
+            if (!CTA_WORDS.some(w => textLow.includes(w))) continue;
+
             const dedup = text.slice(0, 40);
             const key = 'c|' + dedup;
             if (seenTexts.has(key)) continue;
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 72 || rect.height < 24) continue;
-            if (rect.top < focusTop || rect.top > focusBottom) continue;
-            const textLow = text.toLowerCase();
-            if (!CTA_WORDS.some(w => textLow.includes(w))) continue;
+
             seenTexts.add(key);
             ctas.push({
                 text: text.slice(0, 60),
                 dedupKey: dedup,
-                x: Math.round(rect.left + rect.width / 2),
-                y: Math.round(rect.top + rect.height / 2),
+                x: Math.round(Math.max(2, Math.min(vw - 2, rect.left + rect.width / 2))),
+                y: Math.round(Math.max(2, Math.min(vh - 2, rect.top + rect.height / 2))),
             });
         }
     }
 
-    // ── Phase 1: Native smooth scroll for classic/native-scroll sites ────────────
-    // scrollBy with behavior:'smooth' gives the browser a graceful easing curve
-    // without buffering inertia the way raw WheelEvents do.
-    try { window.scrollBy({ top: targetDist, behavior: 'smooth' }); } catch(e) {}
-
-    // ── Phase 2: rAF-driven WheelEvents – one event per display frame (60 FPS) ─────
-    // requestAnimationFrame выравнивает доставку wheel-событий по частоте обновления экрана
-    // («16мс на кадр»), давая Lenis / Locomotive / GSAP плавный натуральный вход.
-    // deltaPerStep = targetDist / totalSteps ≈ 16-32px — нет скачков по 300px.
-    let stepsDone = 0;
-    function rafTick() {
-        if (stepsDone >= totalSteps) {
-            collectVisible();
-            const container = findScrollContainer() || document.body;
-            const containerRect = container.getBoundingClientRect();
-            window._isPlaywrightScrolling = false;
-            resolve({
-                isBottom: isAtBottom(),
-                headings,
-                ctas,
-                scrollY: Math.round(window.scrollY),
-                containerTop: Math.round(containerRect.top),
-            });
-            return;
-        }
+    function dispatchSyntheticWheel() {
+        const wheelTarget = document.body || document.documentElement || window;
         try {
-            document.body.dispatchEvent(new WheelEvent('wheel', {
+            wheelTarget.dispatchEvent(new WheelEvent('wheel', {
                 deltaY: deltaPerStep,
-                deltaMode: 0,   // DOM_DELTA_PIXEL
+                deltaMode: 0,
                 bubbles: true,
                 cancelable: true,
                 clientX: vw / 2,
                 clientY: vh / 2,
             }));
-        } catch(e) {}
-        collectVisible();
-        stepsDone++;
-        requestAnimationFrame(rafTick);
+        } catch (e) {}
     }
-    requestAnimationFrame(rafTick);
-})"""
+
+    function waitForScrollSettled() {
+        return new Promise((resolve) => {
+            let finished = false;
+            let wheelLoopDone = false;
+            let settleTimer = 0;
+            let hardTimer = 0;
+            let motionFrame = 0;
+            let wheelFrame = 0;
+            let wheelDone = null;
+            let lastActivityAt = Date.now();
+            let activeContainer = findScrollContainer() || getRootScrollContainer();
+            let lastScrollY = Math.round(window.scrollY);
+            let lastContainerTop = Math.round(activeContainer.getBoundingClientRect().top);
+
+            const cleanup = () => {
+                if (settleTimer) window.clearTimeout(settleTimer);
+                if (hardTimer) window.clearTimeout(hardTimer);
+                if (motionFrame) window.cancelAnimationFrame(motionFrame);
+                if (wheelFrame) window.cancelAnimationFrame(wheelFrame);
+                window.removeEventListener('scroll', scrollHandler, true);
+                if (typeof wheelDone === 'function') {
+                    const finalizeWheel = wheelDone;
+                    wheelDone = null;
+                    finalizeWheel();
+                }
+            };
+
+            const finish = () => {
+                if (finished) return;
+                finished = true;
+                cleanup();
+                resolve();
+            };
+
+            const scheduleSettleCheck = () => {
+                if (finished) return;
+                if (settleTimer) window.clearTimeout(settleTimer);
+                settleTimer = window.setTimeout(() => {
+                    if (finished) return;
+                    const quietForMs = Date.now() - lastActivityAt;
+                    if (wheelLoopDone && quietForMs >= quietWindowMs) {
+                        finish();
+                        return;
+                    }
+                    scheduleSettleCheck();
+                }, quietWindowMs);
+            };
+
+            const markActivity = () => {
+                lastActivityAt = Date.now();
+                scheduleSettleCheck();
+            };
+
+            const scrollHandler = () => {
+                markActivity();
+            };
+
+            const probeMotion = () => {
+                if (finished) return;
+                activeContainer = findScrollContainer() || getRootScrollContainer();
+                const currentScrollY = Math.round(window.scrollY);
+                const currentContainerTop = Math.round(activeContainer.getBoundingClientRect().top);
+                if (
+                    Math.abs(currentScrollY - lastScrollY) > 0
+                    || Math.abs(currentContainerTop - lastContainerTop) > 1
+                ) {
+                    lastScrollY = currentScrollY;
+                    lastContainerTop = currentContainerTop;
+                    markActivity();
+                }
+                motionFrame = window.requestAnimationFrame(probeMotion);
+            };
+
+            const runWheelLoop = () => new Promise((done) => {
+                wheelDone = done;
+                let stepsDone = 0;
+                const tick = () => {
+                    if (finished) {
+                        if (typeof wheelDone === 'function') {
+                            const finalizeWheel = wheelDone;
+                            wheelDone = null;
+                            finalizeWheel();
+                        }
+                        return;
+                    }
+                    if (stepsDone >= totalSteps) {
+                        if (typeof wheelDone === 'function') {
+                            const finalizeWheel = wheelDone;
+                            wheelDone = null;
+                            finalizeWheel();
+                        }
+                        return;
+                    }
+                    dispatchSyntheticWheel();
+                    stepsDone += 1;
+                    wheelFrame = window.requestAnimationFrame(tick);
+                };
+                wheelFrame = window.requestAnimationFrame(tick);
+            });
+
+            window.addEventListener('scroll', scrollHandler, true);
+            scheduleSettleCheck();
+            hardTimer = window.setTimeout(finish, hardStopMs);
+            motionFrame = window.requestAnimationFrame(probeMotion);
+
+            Promise.resolve()
+                .then(async () => {
+                    try { window.scrollBy({ top: targetDist, behavior: 'smooth' }); } catch (e) {}
+                    await runWheelLoop();
+                })
+                .catch(() => {})
+                .finally(() => {
+                    wheelLoopDone = true;
+                    scheduleSettleCheck();
+                });
+        });
+    }
+
+    try {
+        await waitForScrollSettled();
+        collectVisible();
+        const container = findScrollContainer() || getRootScrollContainer();
+        const containerRect = container.getBoundingClientRect();
+        return {
+            isBottom: isAtBottom(),
+            headings,
+            ctas,
+            scrollY: Math.round(window.scrollY),
+            containerTop: Math.round(containerRect.top),
+        };
+    } finally {
+        window._isPlaywrightScrolling = false;
+    }
+}"""
 
 
 async def run_scroll_only_down_pass(
@@ -5144,7 +5285,7 @@ async def run_scroll_only_down_pass(
     stall_timeout_ms: int,
     cursor_pos: Tuple[float, float] = (960.0, 540.0),
 ) -> Tuple[bool, Tuple[float, float]]:
-    """CTA-Analyzer mode: JS rAF smooth scroll engine, True Bottom detection, 60fps compatible."""
+    """CTA-Analyzer mode: JS smooth-scroll engine with settle-aware DOM analysis."""
     reached_bottom = False
     section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 500), 4000))
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 2), 6))
@@ -5212,6 +5353,8 @@ async def run_scroll_only_down_pass(
         except Exception:
             pass
         try:
+            # JS promise resolves only after scroll inertia fully settles,
+            # so headings/CTAs are sampled from a stable viewport.
             result = await page.evaluate(_JS_SCROLL_ONE_VIEWPORT, js_step)
         except Exception as exc:
             if _is_nav_error(exc):
