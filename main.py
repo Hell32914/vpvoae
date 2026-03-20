@@ -1231,13 +1231,26 @@ async def wait_for_deep_page_ready(
 
 
 async def perform_prerender_scroll(page: Any) -> None:
-    """Прогревает lazy-load секции быстрым пролётом до старта записи."""
-    logger.info("🔄 Pre-render scroll: быстрый пролёт вниз и обратно наверх перед записью")
+    """Прогревает lazy-load секции ступенчатым пролётом до старта записи."""
+    logger.info("🔄 Pre-render scroll: 5 ступеней по 2000px перед записью")
     try:
-        await page.evaluate(
-            """() => window.scrollTo(0, Math.max(document.body?.scrollHeight || 0, document.documentElement?.scrollHeight || 0))"""
-        )
-        await page.wait_for_timeout(2000)
+        for _ in range(5):
+            await page.evaluate(
+                """(delta) => {
+                    const docHeight = Math.max(
+                        document.body?.scrollHeight || 0,
+                        document.documentElement?.scrollHeight || 0,
+                        window.innerHeight || 0,
+                    );
+                    const maxTop = Math.max(0, docHeight - (window.innerHeight || 0));
+                    const currentTop = Math.max(0, window.scrollY || window.pageYOffset || 0);
+                    const nextTop = Math.min(maxTop, currentTop + delta);
+                    window.scrollTo(0, nextTop);
+                    return nextTop;
+                }""",
+                2000,
+            )
+            await page.wait_for_timeout(1000)
         await page.evaluate("""() => window.scrollTo(0, 0)""")
         await page.wait_for_timeout(300)
     except Exception as exc:
@@ -5202,6 +5215,9 @@ _JS_HUNTER_ANALYZER = """
         currentScrollY + vh,
     ));
     const containerTop = Math.round(Number.isFinite(containerRect.top) ? containerRect.top : 0);
+    let visibleHeadingCount = 0;
+    let visibleInteractiveCount = 0;
+    const interactiveCountKeys = new Set();
 
     let bestHeading = null;
     for (const el of document.querySelectorAll('h1,h2,h3,h4')) {
@@ -5211,6 +5227,8 @@ _JS_HUNTER_ANALYZER = """
         if (!hasRenderableBox(el, rect, style)) continue;
         if (style.position === 'fixed' || style.position === 'sticky') continue;
         if (hasFixedOrStickyAncestor(el.parentElement)) continue;
+
+        visibleHeadingCount += 1;
         if (!isInCenterOnlyZone(rect)) continue;
 
         const text = textBundle(el, 96);
@@ -5267,8 +5285,6 @@ _JS_HUNTER_ANALYZER = """
         if (!hasRenderableBox(el, rect, style)) continue;
         if (style.position === 'fixed' || style.position === 'sticky') continue;
         if (hasFixedOrStickyAncestor(el.parentElement)) continue;
-        if (!isInCenterOnlyZone(rect)) continue;
-        if (rect.width < 28 || rect.height < 14) continue;
 
         const tag = el.tagName.toLowerCase();
         const role = lowerText(el.getAttribute('role') || '', 24);
@@ -5279,6 +5295,15 @@ _JS_HUNTER_ANALYZER = """
         const hasOnClick = el.hasAttribute('onclick');
         const hasHref = !!(el.getAttribute('href') || '');
         if (!interactiveTag && !roleButton && !hasPointerCursor && !hasOnClick && !hasHref) continue;
+
+        const interactiveCountKey = `${domSignature(el)}|${tag}|${Math.round(rect.top)}`;
+        if (!interactiveCountKeys.has(interactiveCountKey)) {
+            interactiveCountKeys.add(interactiveCountKey);
+            visibleInteractiveCount += 1;
+        }
+
+        if (!isInCenterOnlyZone(rect)) continue;
+        if (rect.width < 28 || rect.height < 14) continue;
 
         const text = textBundle(el, 84);
         const textLow = text.toLowerCase();
@@ -5340,9 +5365,11 @@ _JS_HUNTER_ANALYZER = """
     const headingPayload = buildHeadingPayload(bestHeading);
     const ctaPayload = buildCtaPayload(bestCta);
     const focusTarget = ctaPayload || headingPayload;
+    const isLoading = visibleHeadingCount === 0 && visibleInteractiveCount === 0;
 
     return {
         isBottom: currentScrollY + vh >= documentHeight - 50,
+        isLoading,
         focusFound: Boolean(focusTarget),
         focusKind: focusTarget ? focusTarget.kind : '',
         focusTarget,
@@ -5399,6 +5426,9 @@ async def run_scroll_only_down_pass(
     hunter_global_timeout_ms = 180000
     hunter_scroll_delta = 400
     hunter_scroll_pause_s = 0.6
+    loading_pause_s = 2.0
+    stagnation_limit = 5
+    stagnation_failsafe_window_ms = 30000
 
     last_scroll_y = -1
     previous_container_top: Optional[int] = None
@@ -5446,6 +5476,7 @@ async def run_scroll_only_down_pass(
                 await _recover_after_nav(page)
                 result = {
                     "isBottom": False,
+                    "isLoading": False,
                     "focusFound": False,
                     "focusKind": "",
                     "focusTarget": None,
@@ -5463,6 +5494,7 @@ async def run_scroll_only_down_pass(
         document_height = max(viewport_height, int(result.get("documentHeight", viewport_height)))
         current_container_top = int(result.get("containerTop", previous_container_top if previous_container_top is not None else 0))
         js_focus_found = bool(result.get("focusFound", False))
+        js_is_loading = bool(result.get("isLoading", False))
         raw_focus_target = result.get("focusTarget")
         js_focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
         js_focus_kind = str(
@@ -5479,6 +5511,13 @@ async def run_scroll_only_down_pass(
                 js_headings = []
         current_scroll_y = max(0, js_scroll_y)
         math_bottom = bool(result.get("isBottom", False)) or (current_scroll_y + viewport_height) >= (document_height - 50)
+
+        if js_is_loading:
+            stagnant_scrolls = 0
+            previous_container_top = current_container_top
+            last_scroll_y = current_scroll_y
+            await asyncio.sleep(loading_pause_s)
+            continue
 
         if last_scroll_y >= 0:
             scroll_delta = abs(current_scroll_y - last_scroll_y)
@@ -5534,7 +5573,7 @@ async def run_scroll_only_down_pass(
             cta_text = str(picked_cta.get("text", "")).strip()
             logger.info(f"🎯 Scroll-only: точное наведение на CTA '{cta_text[:30]}'")
             try:
-                await page.mouse.move(cta_x, cta_y, steps=30)
+                await page.mouse.move(cta_x, cta_y, steps=50)
                 cursor_pos = (cta_x, cta_y)
                 await page.wait_for_timeout(random.randint(900, 1400))
                 safe_x = clamp(viewport_width * 0.05, 10, viewport_width - 2)
@@ -5546,7 +5585,19 @@ async def run_scroll_only_down_pass(
 
         last_scroll_y = current_scroll_y
 
-        if stagnant_scrolls >= 4:
+        if stagnant_scrolls >= stagnation_limit:
+            if elapsed_ms < stagnation_failsafe_window_ms:
+                logger.info("[INFO] Scroll-only: ранний застой 5/5, делаем форсированный рывок вниз.")
+                stagnant_scrolls = 0
+                try:
+                    await page.mouse.wheel(0, 1000)
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                    else:
+                        raise
+                await asyncio.sleep(hunter_scroll_pause_s)
+                continue
             logger.info("[INFO] Scroll-only: дно найдено по застою координат. Завершаем.")
             reached_bottom = True
             break
