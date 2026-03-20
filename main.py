@@ -4,6 +4,7 @@ import sys
 import logging
 import math
 import random
+import signal
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
@@ -5004,9 +5005,9 @@ def build_scroll_only_section_landmarks(
 
 
 # ── JS Hunter analyzer for Mode 2 (CTA Analyzer) ──────────────────────────────
-# Inspects only the settled viewport. Scrolling math stays in Python.
-# Returns the freshest CTA plus minimal sync metrics:
-# {focusFound, focusKind, focusTarget, ctas, currentScrollY, documentHeight, hasContent}.
+# Only inspects the current viewport. Python owns all scrolling decisions.
+# Returns the freshest heading/CTA and viewport emptiness state:
+# {focusFound, focusKind, focusTarget, headings, ctas, currentScrollY, documentHeight, isEmpty}.
 _JS_HUNTER_ANALYZER = """
 () => {
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
@@ -5017,10 +5018,6 @@ _JS_HUNTER_ANALYZER = """
 
     function normalizeText(text, maxLen) {
         return (text || '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
-    }
-
-    function lowerText(text, maxLen) {
-        return normalizeText(text, maxLen).toLowerCase();
     }
 
     function domSignature(el) {
@@ -5042,8 +5039,6 @@ _JS_HUNTER_ANALYZER = """
             el.textContent || '',
             el.getAttribute('aria-label') || '',
             el.getAttribute('title') || '',
-            el.getAttribute('data-testid') || '',
-            el.getAttribute('data-qa') || '',
         ].filter(Boolean).join(' '), maxLen);
     }
 
@@ -5066,9 +5061,19 @@ _JS_HUNTER_ANALYZER = """
         if (!rect || rect.width <= 0 || rect.height <= 0) return false;
         if (rect.right < 0 || rect.left > vw) return false;
         if (rect.bottom < 0 || rect.top > vh) return false;
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
-        if (Number(style.opacity || '1') < 0.5) return false;
+        if (style.display === 'none' || style.visibility !== 'visible') return false;
+        if (Number(style.opacity || '1') <= 0.5) return false;
         if (style.pointerEvents === 'none') return false;
+        return true;
+    }
+
+    function isViewportContent(el) {
+        if (!(el instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        if (!hasRenderableBox(el, rect, style)) return false;
+        if (style.position === 'fixed' || style.position === 'sticky') return false;
+        if (hasFixedOrStickyAncestor(el.parentElement)) return false;
         return true;
     }
 
@@ -5120,131 +5125,97 @@ _JS_HUNTER_ANALYZER = """
         return Math.max(0, 160 - Math.abs(center.y - focusCenterY) * 1.3);
     }
 
-    const CTA_WORDS = [
-        'get started', 'sign up', 'invest now', 'learn more', 'open account', 'join',
-        'start', 'book', 'schedule', 'contact', 'talk', 'demo', 'pricing', 'price',
-        'quote', 'request', 'discover', 'explore', 'subscribe', 'apply', 'buy',
-        'shop', 'download', 'free trial', 'trial', "let's talk", 'lets talk',
-        'try', 'try free', 'try now', 'get it', 'order',
-        '\u043d\u0430\u0447\u0430\u0442\u044c',
-        '\u043f\u043e\u043f\u0440\u043e\u0431\u043e\u0432\u0430\u0442\u044c',
-        '\u043a\u0443\u043f\u0438\u0442\u044c',
-        '\u0441\u043a\u0430\u0447\u0430\u0442\u044c',
-        '\u043f\u043e\u0434\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f',
-        '\u0437\u0430\u043f\u0438\u0441\u0430\u0442\u044c\u0441\u044f',
-        '\u0441\u0432\u044f\u0437\u0430\u0442\u044c\u0441\u044f',
-        '\u0437\u0430\u043a\u0430\u0437\u0430\u0442\u044c',
-        '\u0431\u0440\u043e\u043d\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
-    ];
+    const CTA_WORDS = ['invest', 'learn', 'get started', 'sign up', 'trade'];
 
-    const nativeScrollY = Math.max(
+    const currentScrollY = Math.round(Math.max(
         Number(window.scrollY || window.pageYOffset || 0),
         Number(document.documentElement?.scrollTop || 0),
         Number(document.body?.scrollTop || 0),
-    );
-    const currentScrollY = Math.round(nativeScrollY);
+    ));
     const documentHeight = Math.round(Math.max(
         document.documentElement?.scrollHeight || 0,
         document.body?.scrollHeight || 0,
         currentScrollY + vh,
     ));
-    let hasContent = false;
-    for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,img')) {
+
+    let visibleImageCount = 0;
+    for (const el of document.querySelectorAll('img')) {
         if (!(el instanceof HTMLElement)) continue;
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        if (!hasRenderableBox(el, rect, style)) continue;
-        if (style.position === 'fixed' || style.position === 'sticky') continue;
-        if (hasFixedOrStickyAncestor(el.parentElement)) continue;
-
-        const tag = el.tagName.toLowerCase();
-        if (tag === 'img') {
-            const imgEl = el;
-            const imageReady = Number(imgEl.naturalWidth || rect.width || 0) > 12 && Number(imgEl.naturalHeight || rect.height || 0) > 12;
-            if (imageReady) {
-                hasContent = true;
-                break;
-            }
-            continue;
-        }
-
-        if (normalizeText(el.textContent || el.innerText || '', 120)) {
-            hasContent = true;
-            break;
+        if (!isViewportContent(el)) continue;
+        const imgEl = el;
+        if (Number(imgEl.naturalWidth || 0) > 12 && Number(imgEl.naturalHeight || 0) > 12) {
+            visibleImageCount += 1;
         }
     }
 
-    const baseSelectors = [
-        'a[href]',
-        'button',
-        'summary',
-        '[role="button"]',
-        '[data-action]',
-        '[class*="btn"]',
-        '[class*="cta"]',
-        '[class*="action"]',
-    ];
-    let bestCta = null;
-    for (const selector of baseSelectors) {
-        let nodes = [];
-        try {
-            nodes = Array.from(document.querySelectorAll(selector));
-        } catch (e) {
-            nodes = [];
-        }
-        for (const el of nodes) {
+    let visibleHeadingCount = 0;
+    let bestHeading = null;
+    for (const el of document.querySelectorAll('h1,h2,h3')) {
         if (!(el instanceof HTMLElement)) continue;
+        if (!isViewportContent(el)) continue;
+        const rect = el.getBoundingClientRect();
+        const text = normalizeText(el.textContent || el.innerText || '', 120);
+        if (!text) continue;
+        visibleHeadingCount += 1;
+        if (el.dataset && (el.dataset.seen === 'true' || el.dataset.vpvoaeSeen === 'true')) continue;
+        if (!isInFocusBand(rect)) continue;
+
+        const score = scoreByCenter(rect) + Math.min(text.length, 80) * 0.8;
+        if (!bestHeading || score > bestHeading.score) {
+            bestHeading = { el, rect, text, score };
+        }
+    }
+
+    let visibleButtonCount = 0;
+    for (const el of document.querySelectorAll('button,[role="button"]')) {
+        if (!(el instanceof HTMLElement)) continue;
+        if (isViewportContent(el)) {
+            visibleButtonCount += 1;
+        }
+    }
+
+    const ctaSelectors = ['button', 'a[href]', '[role="button"]', '[class*="btn"]', '[class*="cta"]', '[class*="action"]'];
+    const ctaPool = new Set();
+    for (const selector of ctaSelectors) {
+        try {
+            for (const el of document.querySelectorAll(selector)) {
+                if (el instanceof HTMLElement) ctaPool.add(el);
+            }
+        } catch (e) {}
+    }
+
+    let bestCta = null;
+    for (const el of ctaPool) {
+        if (!(el instanceof HTMLElement)) continue;
+        if (!isViewportContent(el)) continue;
         if (el.dataset && (el.dataset.seen === 'true' || el.dataset.vpvoaeSeen === 'true')) continue;
 
-        const style = window.getComputedStyle(el);
         const rect = el.getBoundingClientRect();
-        if (!hasRenderableBox(el, rect, style)) continue;
-        if (style.position === 'fixed' || style.position === 'sticky') continue;
-        if (hasFixedOrStickyAncestor(el.parentElement)) continue;
         if (!isInFocusBand(rect)) continue;
         if (rect.width < 28 || rect.height < 14) continue;
 
-        const tag = el.tagName.toLowerCase();
-        const role = lowerText(el.getAttribute('role') || '', 24);
-        const interactiveTag = tag === 'a' || tag === 'button' || tag === 'summary';
-        const roleButton = role === 'button';
-        const hasHref = !!(el.getAttribute('href') || '');
-        const hasDataAction = el.hasAttribute('data-action');
-        if (!interactiveTag && !roleButton && !hasHref && !hasDataAction) continue;
-
         const text = textBundle(el, 84);
         const textLow = text.toLowerCase();
-        const semanticHint = lowerText([
-            el.className || '',
-            el.id || '',
-            el.getAttribute('aria-label') || '',
-            el.getAttribute('title') || '',
-            el.getAttribute('href') || '',
-            el.getAttribute('data-action') || '',
-        ].join(' '), 160);
-
-        const keywordMatches = CTA_WORDS.filter((word) => textLow.includes(word) || semanticHint.includes(word));
+        const keywordMatches = CTA_WORDS.filter((word) => textLow.includes(word));
         if (!keywordMatches.length) continue;
 
         const area = rect.width * rect.height;
-        const keywordBoost = 220 + keywordMatches[0].length * 2;
-        const semanticsBoost = (interactiveTag ? 70 : 0) + (roleButton ? 80 : 0) + (hasHref ? 35 : 0) + (hasDataAction ? 35 : 0);
+        const keywordBoost = 220 + keywordMatches[0].length * 4;
         const areaBoost = Math.min(area, 48000) * 0.0025;
-        const textBoost = text ? Math.min(text.length, 40) * 1.2 : 0;
-        const score = keywordBoost + semanticsBoost + areaBoost + textBoost + scoreByCenter(rect);
+        const textBoost = text ? Math.min(text.length, 40) * 1.0 : 0;
+        const score = keywordBoost + areaBoost + textBoost + scoreByCenter(rect);
 
         if (!bestCta || score > bestCta.score) {
             bestCta = { el, rect, text, score };
         }
-        }
     }
 
-    function buildCtaPayload(candidate) {
+    function buildPayload(candidate, kind) {
         if (!candidate || !(candidate.el instanceof HTMLElement)) return null;
         const center = centerPoint(candidate.rect);
-        const seenKey = markSeen(candidate.el, 'cta', candidate.text, candidate.rect);
+        const seenKey = markSeen(candidate.el, kind, candidate.text, candidate.rect);
         return {
-            kind: 'cta',
+            kind,
             text: candidate.text,
             dedupKey: seenKey,
             x: Math.round(Math.max(2, Math.min(vw - 2, center.x))),
@@ -5254,14 +5225,23 @@ _JS_HUNTER_ANALYZER = """
         };
     }
 
-    const ctaPayload = buildCtaPayload(bestCta);
-    const focusTarget = ctaPayload;
+    const headingPayload = buildPayload(bestHeading, 'heading');
+    const ctaPayload = buildPayload(bestCta, 'cta');
+    let focusTarget = null;
+    if (headingPayload && ctaPayload) {
+        focusTarget = ctaPayload.score >= headingPayload.score ? ctaPayload : headingPayload;
+    } else {
+        focusTarget = ctaPayload || headingPayload;
+    }
+
+    const isEmpty = visibleImageCount === 0 && visibleHeadingCount === 0 && visibleButtonCount === 0;
 
     return {
-        hasContent,
+        isEmpty,
         focusFound: Boolean(focusTarget),
         focusKind: focusTarget ? focusTarget.kind : '',
         focusTarget,
+        headings: headingPayload ? [headingPayload] : [],
         ctas: ctaPayload ? [ctaPayload] : [],
         currentScrollY,
         scrollY: currentScrollY,
@@ -5286,9 +5266,9 @@ async def run_scroll_only_down_pass(
     stall_timeout_ms: int,
     cursor_pos: Tuple[float, float] = (960.0, 540.0),
 ) -> Tuple[bool, Tuple[float, float]]:
-    """CTA-Analyzer mode: deterministic coordinate scroll with predictive sync."""
+    """CTA-Analyzer mode: visual-first walking scroll with small wheel steps."""
     reached_bottom = False
-    hovered_cta_keys: Set[str] = set()
+    seen_focus_keys: Set[str] = set()
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -5305,50 +5285,31 @@ async def run_scroll_only_down_pass(
     except Exception:
         pass
 
-    started_at = time.monotonic()
-    soft_budget_ms = max(8000, int(total_time_ms))
-    hard_budget_ms = max(soft_budget_ms, int(require_bottom_max_ms) if require_bottom else soft_budget_ms)
-    hunter_global_timeout_ms = 180000
-    predicted_scroll_y = 0
-    predicted_scroll_step = 600
-    scroll_settle_s = 1.2
+    scroll_step = 300
+    scroll_pause_s = 0.8
+    empty_jump_step = 800
+    hover_pause_ms = 2000
     last_scroll_y: Optional[int] = 0
-    last_document_height = viewport_height
     last_logged_scroll_y: Optional[int] = None
     stagnant_scrolls = 0
+    empty_screens_in_row = 0
 
     while True:
-        elapsed_ms = (time.monotonic() - started_at) * 1000
-        if elapsed_ms >= hunter_global_timeout_ms:
-            logger.warning(
-                f"🔴 Scroll-only hunter timeout: {int(elapsed_ms / 1000)}s — "
-                "принудительное завершение (entrypoint.sh сохранит видео)"
-            )
-            break
-        if elapsed_ms >= soft_budget_ms and not require_bottom:
-            break
-        if elapsed_ms >= hard_budget_ms:
-            break
-
         # Держим курсор в безопасной левой зоне, чтобы ховер-виджеты не перехватывали скролл.
         try:
             await page.mouse.move(10, viewport_height * 0.5)
         except Exception:
             pass
 
-        predicted_scroll_y += predicted_scroll_step
         try:
-            await page.evaluate(
-                """(top) => window.scrollTo({ top, left: 0, behavior: 'smooth' })""",
-                predicted_scroll_y,
-            )
+            await page.mouse.wheel(0, scroll_step)
         except Exception as exc:
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
             else:
                 raise
 
-        await asyncio.sleep(scroll_settle_s)
+        await asyncio.sleep(scroll_pause_s)
 
         try:
             result = await page.evaluate(_JS_HUNTER_ANALYZER)
@@ -5356,95 +5317,85 @@ async def run_scroll_only_down_pass(
             if _is_nav_error(exc):
                 await _recover_after_nav(page)
                 result = {
-                    "hasContent": True,
+                    "isEmpty": False,
                     "focusFound": False,
                     "focusKind": "",
                     "focusTarget": None,
+                    "headings": [],
                     "ctas": [],
-                    "currentScrollY": max(last_scroll_y or 0, predicted_scroll_y),
-                    "scrollY": max(last_scroll_y or 0, predicted_scroll_y),
-                    "documentHeight": max(last_document_height, viewport_height),
+                    "currentScrollY": max(last_scroll_y or 0, 0),
+                    "scrollY": max(last_scroll_y or 0, 0),
+                    "documentHeight": viewport_height,
                 }
             else:
                 raise
 
-        current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", predicted_scroll_y))))
-        document_height = max(viewport_height, int(result.get("documentHeight", last_document_height)))
-        has_content = bool(result.get("hasContent", False))
-        js_ctas = result.get("ctas") or []
-
-        if current_scroll_y >= predicted_scroll_y + 1000:
-            logger.info(
-                f"[Scroll-only] overshoot detected: predicted={predicted_scroll_y}, real={current_scroll_y}. Возвращаемся назад."
-            )
-            try:
-                await page.evaluate(
-                    """(top) => window.scrollTo({ top, left: 0, behavior: 'auto' })""",
-                    predicted_scroll_y,
-                )
-                await asyncio.sleep(0.35)
-                result = await page.evaluate(_JS_HUNTER_ANALYZER)
-                current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", predicted_scroll_y))))
-                document_height = max(viewport_height, int(result.get("documentHeight", document_height)))
-                has_content = bool(result.get("hasContent", False))
-                js_ctas = result.get("ctas") or []
-            except Exception as exc:
-                if _is_nav_error(exc):
-                    await _recover_after_nav(page)
-                    current_scroll_y = predicted_scroll_y
-                else:
-                    raise
+        current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", last_scroll_y or 0))))
+        document_height = max(viewport_height, int(result.get("documentHeight", viewport_height)))
+        is_empty = bool(result.get("isEmpty", False))
+        raw_focus_target = result.get("focusTarget")
+        focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
 
         if last_scroll_y is not None and abs(current_scroll_y - last_scroll_y) < 6:
             stagnant_scrolls += 1
         else:
             stagnant_scrolls = 0
 
-        math_bottom = (current_scroll_y + viewport_height) >= (document_height - 50)
+        if is_empty:
+            empty_screens_in_row += 1
+        else:
+            empty_screens_in_row = 0
 
         if last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) > 100:
             logger.info(
-                f"[Scroll-only] predicted={predicted_scroll_y} | real={current_scroll_y} "
-                f"| docHeight={document_height} | hasContent={has_content} | stagnant={stagnant_scrolls}"
+                f"[Scroll-only] scrollY={current_scroll_y} | docHeight={document_height} "
+                f"| isEmpty={is_empty} | emptyStreak={empty_screens_in_row} | stagnant={stagnant_scrolls}"
             )
             last_logged_scroll_y = current_scroll_y
 
-        picked_cta: Optional[Dict[str, Any]] = None
-        for _c in js_ctas:
-            _key = str(_c.get("dedupKey", _c.get("text", "")))
-            if _key and _key not in hovered_cta_keys:
-                picked_cta = _c
-                hovered_cta_keys.add(_key)
-                break
-
-        if picked_cta:
-            cta_x = clamp(float(picked_cta.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
-            cta_y = clamp(float(picked_cta.get("y", viewport_height * 0.5)), 2, viewport_height - 2)
-            cta_text = str(picked_cta.get("text", "")).strip()
-            logger.info(f"🎯 Scroll-only: точное наведение на CTA '{cta_text[:30]}'")
+        focus_key = str(focus_target.get("dedupKey", "")) if isinstance(focus_target, dict) else ""
+        if focus_target and focus_key and focus_key not in seen_focus_keys:
+            seen_focus_keys.add(focus_key)
+            focus_x = clamp(float(focus_target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
+            focus_y = clamp(float(focus_target.get("y", viewport_height * 0.5)), 2, viewport_height - 2)
+            focus_text = str(focus_target.get("text", "")).strip()
+            focus_kind = str(focus_target.get("kind", "object")).strip() or "object"
+            logger.info(f"🎯 Scroll-only: найден {focus_kind} '{focus_text[:30]}'")
             try:
-                await page.mouse.move(cta_x, cta_y, steps=50)
-                cursor_pos = (cta_x, cta_y)
-                await page.wait_for_timeout(random.randint(900, 1400))
-                safe_x = clamp(viewport_width * 0.05, 10, viewport_width - 2)
-                await page.mouse.move(safe_x, cta_y, steps=18)
-                cursor_pos = (safe_x, cta_y)
-            except Exception as _cta_exc:
-                if _is_nav_error(_cta_exc):
+                await page.mouse.move(focus_x, focus_y, steps=40)
+                cursor_pos = (focus_x, focus_y)
+                await page.wait_for_timeout(hover_pause_ms)
+            except Exception as focus_exc:
+                if _is_nav_error(focus_exc):
                     await _recover_after_nav(page)
 
-        if not has_content and stagnant_scrolls >= 3:
-            logger.info("[INFO] Scroll-only: экран без контента и 3 шага застоя. Завершаем запись на white tail.")
-            reached_bottom = math_bottom
-            break
+        if empty_screens_in_row > 3:
+            logger.info("[INFO] Scroll-only: 4 пустых экрана подряд, делаем рывок на 800px.")
+            empty_screens_in_row = 0
+            stagnant_scrolls = 0
+            try:
+                await page.mouse.wheel(0, empty_jump_step)
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    raise
+            await asyncio.sleep(scroll_pause_s)
+            try:
+                post_jump = await page.evaluate(_JS_HUNTER_ANALYZER)
+                current_scroll_y = max(0, int(post_jump.get("currentScrollY", post_jump.get("scrollY", current_scroll_y))))
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    raise
 
-        if math_bottom:
-            logger.info("[INFO] Scroll-only: дно найдено по математическому условию. Завершаем.")
+        if stagnant_scrolls >= 5:
+            logger.info("[INFO] Scroll-only: зафиксирован застой 5/5, завершаем проход.")
             reached_bottom = True
             break
 
         last_scroll_y = current_scroll_y
-        last_document_height = document_height
 
     return reached_bottom, cursor_pos
 
@@ -6430,6 +6381,32 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
         return None
 
 
+async def _stop_ffmpeg_process(ffmpeg_process: Optional[subprocess.Popen]) -> None:
+    """Мягко завершает FFmpeg и затем принудительно закрывает процесс."""
+    if ffmpeg_process is None:
+        return
+
+    logger.info("🎬 Остановка FFmpeg...")
+    try:
+        ffmpeg_process.send_signal(signal.SIGINT)
+    except Exception as exc:
+        logger.warning(f"⚠️ Не удалось отправить SIGINT в FFmpeg: {exc}")
+
+    await asyncio.sleep(3)
+
+    if ffmpeg_process.poll() is None:
+        try:
+            ffmpeg_process.kill()
+        except Exception as exc:
+            logger.warning(f"⚠️ Не удалось принудительно завершить FFmpeg: {exc}")
+
+    try:
+        ffmpeg_process.wait(timeout=5)
+        logger.info("✅ FFmpeg остановлен")
+    except Exception as exc:
+        logger.warning(f"⚠️ Ошибка финализации FFmpeg: {exc}")
+
+
 async def _run_preload_mode() -> None:
     """Режим предзагрузки: открываем сайт, ждём загрузки всего контента и выходим.
 
@@ -6776,6 +6753,13 @@ async def main():
             )
             await perform_prerender_scroll(page)
 
+            try:
+                await page.mouse.move(500, 500)
+            except Exception:
+                pass
+            logger.info("⏳ Прогрев страницы: 30 секунд после пробуждения скриптов...")
+            await page.wait_for_timeout(30000)
+
             if visible_cursor_enabled:
                 try:
                     await page.evaluate(
@@ -6838,6 +6822,10 @@ async def main():
             else:
                 logger.info("🧭 Smart cursor пропущен по конфигурации")
 
+            if ffmpeg_proc is not None:
+                await _stop_ffmpeg_process(ffmpeg_proc)
+                ffmpeg_proc = None
+
             # Создаем директорию для результатов
             os.makedirs(output_path, exist_ok=True)
 
@@ -6869,21 +6857,6 @@ async def main():
             else:
                 logger.info("📸 Скриншот пропущен по конфигурации")
 
-            # ── Остановка FFmpeg после завершения прокрутки ────────────────────
-            if ffmpeg_proc is not None:
-                logger.info("🎬 Остановка FFmpeg...")
-                try:
-                    ffmpeg_proc.terminate()
-                    ffmpeg_proc.wait(timeout=15)
-                    logger.info("✅ FFmpeg остановлен корректно")
-                except subprocess.TimeoutExpired:
-                    logger.warning("⚠️ FFmpeg не ответил на SIGTERM, принудительное завершение...")
-                    ffmpeg_proc.kill()
-                    ffmpeg_proc.wait()
-                except Exception as _ffe:
-                    logger.warning(f"⚠️ Ошибка при остановке FFmpeg: {_ffe}")
-                ffmpeg_proc = None
-
             await context.close()
             logger.info("✨ Рендеринг завершен успешно")
             sys.exit(0)
@@ -6893,14 +6866,8 @@ async def main():
         sys.exit(1)
     finally:
         if ffmpeg_proc is not None:
-            try:
-                ffmpeg_proc.terminate()
-                ffmpeg_proc.wait(timeout=10)
-            except Exception:
-                try:
-                    ffmpeg_proc.kill()
-                except Exception:
-                    pass
+            await _stop_ffmpeg_process(ffmpeg_proc)
+            ffmpeg_proc = None
         if browser:
             try:
                 await browser.close()
