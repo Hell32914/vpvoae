@@ -5012,8 +5012,10 @@ _JS_HUNTER_ANALYZER = """
 () => {
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.30;
-    const focusTopMax = vh * 0.70;
+    const headingTopMin = vh * 0.30;
+    const headingTopMax = vh * 0.70;
+    const ctaTopMin = vh * 0.35;
+    const ctaTopMax = vh * 0.65;
     const focusCenterY = vh * 0.50;
 
     function normalizeText(text, maxLen) {
@@ -5058,9 +5060,11 @@ _JS_HUNTER_ANALYZER = """
 
     function hasRenderableBox(el, rect, style) {
         if (!(el instanceof HTMLElement)) return false;
+        const rects = typeof el.getClientRects === 'function' ? el.getClientRects() : [];
+        if (!rects || rects.length === 0) return false;
         if (!rect || rect.width <= 0 || rect.height <= 0) return false;
-        if (rect.right < 0 || rect.left > vw) return false;
-        if (rect.bottom < 0 || rect.top > vh) return false;
+        if (rect.left < 0 || rect.top < 0) return false;
+        if (rect.right > vw || rect.bottom > vh) return false;
         if (style.display === 'none' || style.visibility !== 'visible') return false;
         if (Number(style.opacity || '1') <= 0.5) return false;
         if (style.pointerEvents === 'none') return false;
@@ -5077,8 +5081,12 @@ _JS_HUNTER_ANALYZER = """
         return true;
     }
 
-    function isInFocusBand(rect) {
-        return Number.isFinite(rect.top) && rect.top >= focusTopMin && rect.top <= focusTopMax;
+    function isInHeadingBand(rect) {
+        return Number.isFinite(rect.top) && rect.top >= headingTopMin && rect.top <= headingTopMax;
+    }
+
+    function isInCtaBand(rect) {
+        return Number.isFinite(rect.top) && rect.top >= ctaTopMin && rect.top <= ctaTopMax;
     }
 
     function buildStableKey(el, kind, text, rect) {
@@ -5137,6 +5145,11 @@ _JS_HUNTER_ANALYZER = """
         document.body?.scrollHeight || 0,
         currentScrollY + vh,
     ));
+    const bodyScrollHeight = Math.round(Math.max(
+        document.body?.scrollHeight || 0,
+        document.documentElement?.scrollHeight || 0,
+        currentScrollY + vh,
+    ));
 
     let visibleImageCount = 0;
     for (const el of document.querySelectorAll('img')) {
@@ -5158,7 +5171,7 @@ _JS_HUNTER_ANALYZER = """
         if (!text) continue;
         visibleHeadingCount += 1;
         if (el.dataset && (el.dataset.seen === 'true' || el.dataset.vpvoaeSeen === 'true')) continue;
-        if (!isInFocusBand(rect)) continue;
+        if (!isInHeadingBand(rect)) continue;
 
         const score = scoreByCenter(rect) + Math.min(text.length, 80) * 0.8;
         if (!bestHeading || score > bestHeading.score) {
@@ -5191,7 +5204,7 @@ _JS_HUNTER_ANALYZER = """
         if (el.dataset && (el.dataset.seen === 'true' || el.dataset.vpvoaeSeen === 'true')) continue;
 
         const rect = el.getBoundingClientRect();
-        if (!isInFocusBand(rect)) continue;
+        if (!isInCtaBand(rect)) continue;
         if (rect.width < 28 || rect.height < 14) continue;
 
         const text = textBundle(el, 84);
@@ -5212,6 +5225,8 @@ _JS_HUNTER_ANALYZER = """
 
     function buildPayload(candidate, kind) {
         if (!candidate || !(candidate.el instanceof HTMLElement)) return null;
+        const rects = typeof candidate.el.getClientRects === 'function' ? candidate.el.getClientRects() : [];
+        if (!rects || rects.length === 0) return null;
         const center = centerPoint(candidate.rect);
         const seenKey = markSeen(candidate.el, kind, candidate.text, candidate.rect);
         return {
@@ -5243,6 +5258,7 @@ _JS_HUNTER_ANALYZER = """
         focusTarget,
         headings: headingPayload ? [headingPayload] : [],
         ctas: ctaPayload ? [ctaPayload] : [],
+        bodyScrollHeight,
         currentScrollY,
         scrollY: currentScrollY,
         documentHeight,
@@ -5269,6 +5285,7 @@ async def run_scroll_only_down_pass(
     """CTA-Analyzer mode: visual-first walking scroll with small wheel steps."""
     reached_bottom = False
     seen_focus_keys: Set[str] = set()
+    start_time = time.time()
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -5285,14 +5302,17 @@ async def run_scroll_only_down_pass(
     except Exception:
         pass
 
-    scroll_step = 300
-    scroll_pause_s = 0.8
+    scroll_step = 200
+    scroll_pause_s = 1.0
     empty_jump_step = 800
+    stubborn_push_step = 1000
     hover_pause_ms = 2000
     last_scroll_y: Optional[int] = 0
     last_logged_scroll_y: Optional[int] = None
     stagnant_scrolls = 0
     empty_screens_in_row = 0
+    stagnant_threshold = 5
+    early_stall_guard_s = 20.0
 
     while True:
         # Держим курсор в безопасной левой зоне, чтобы ховер-виджеты не перехватывали скролл.
@@ -5332,9 +5352,12 @@ async def run_scroll_only_down_pass(
 
         current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", last_scroll_y or 0))))
         document_height = max(viewport_height, int(result.get("documentHeight", viewport_height)))
+        body_scroll_height = max(viewport_height, int(result.get("bodyScrollHeight", document_height)))
         is_empty = bool(result.get("isEmpty", False))
         raw_focus_target = result.get("focusTarget")
         focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
+        elapsed_s = time.time() - start_time
+        math_bottom_reached = current_scroll_y + viewport_height >= body_scroll_height - 100
 
         if last_scroll_y is not None and abs(current_scroll_y - last_scroll_y) < 6:
             stagnant_scrolls += 1
@@ -5348,8 +5371,9 @@ async def run_scroll_only_down_pass(
 
         if last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) > 100:
             logger.info(
-                f"[Scroll-only] scrollY={current_scroll_y} | docHeight={document_height} "
-                f"| isEmpty={is_empty} | emptyStreak={empty_screens_in_row} | stagnant={stagnant_scrolls}"
+                f"[Scroll-only] scrollY={current_scroll_y} | docHeight={document_height} | bodyHeight={body_scroll_height} "
+                f"| isEmpty={is_empty} | emptyStreak={empty_screens_in_row} | stagnant={stagnant_scrolls} "
+                f"| elapsed={elapsed_s:.1f}s | mathBottom={math_bottom_reached}"
             )
             last_logged_scroll_y = current_scroll_y
 
@@ -5390,10 +5414,44 @@ async def run_scroll_only_down_pass(
                 else:
                     raise
 
-        if stagnant_scrolls >= 5:
-            logger.info("[INFO] Scroll-only: зафиксирован застой 5/5, завершаем проход.")
-            reached_bottom = True
-            break
+        if stagnant_scrolls >= stagnant_threshold:
+            if elapsed_s <= early_stall_guard_s:
+                logger.info(
+                    "[INFO] Scroll-only: ранний застой до 20s, пробиваем страницу толчком на 1000px."
+                )
+                stagnant_scrolls = 0
+                empty_screens_in_row = 0
+                try:
+                    await page.mouse.wheel(0, stubborn_push_step)
+                except Exception as exc:
+                    if _is_nav_error(exc):
+                        await _recover_after_nav(page)
+                    else:
+                        raise
+                await asyncio.sleep(scroll_pause_s)
+                last_scroll_y = None
+                continue
+
+            if math_bottom_reached:
+                logger.info("[INFO] Scroll-only: застой 5/5 подтвержден математикой дна, завершаем проход.")
+                reached_bottom = True
+                break
+
+            logger.info(
+                "[INFO] Scroll-only: застой без подтверждения дна, пробиваем страницу толчком на 1000px."
+            )
+            stagnant_scrolls = 0
+            empty_screens_in_row = 0
+            try:
+                await page.mouse.wheel(0, stubborn_push_step)
+            except Exception as exc:
+                if _is_nav_error(exc):
+                    await _recover_after_nav(page)
+                else:
+                    raise
+            await asyncio.sleep(scroll_pause_s)
+            last_scroll_y = None
+            continue
 
         last_scroll_y = current_scroll_y
 
