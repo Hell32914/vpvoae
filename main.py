@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import sys
 import logging
 import math
@@ -5386,7 +5387,7 @@ async def run_scroll_only_down_pass(
             focus_kind = str(focus_target.get("kind", "object")).strip() or "object"
             logger.info(f"🎯 Scroll-only: найден {focus_kind} '{focus_text[:30]}'")
             try:
-                await page.mouse.move(focus_x, focus_y, steps=40)
+                await page.mouse.move(focus_x, focus_y, steps=30)
                 cursor_pos = (focus_x, focus_y)
                 await page.wait_for_timeout(hover_pause_ms)
             except Exception as focus_exc:
@@ -6374,12 +6375,13 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
     if screen_height % 2 != 0:
         screen_height -= 1
 
-    framerate  = max(8, min(60, env_int('FFMPEG_FRAMERATE', 60)))
-    preset     = os.getenv('FFMPEG_PRESET', 'veryfast')
+    framerate_raw = env_int('FFMPEG_FRAMERATE', 30)
+    framerate  = min(30, max(24, framerate_raw))
+    preset     = 'superfast'
     crf        = env_int('FFMPEG_CRF', 24)
-    threads_raw = env_int('FFMPEG_THREADS', 0)
-    threads     = threads_raw if threads_raw == 0 else max(1, threads_raw)  # 0 = auto (все ядра)
-    nice_level = max(-20, min(19, env_int('FFMPEG_NICE_LEVEL', 10)))
+    threads_raw = env_int('FFMPEG_THREADS', 8)
+    threads     = min(8, max(1, threads_raw))
+    nice_level = max(-20, min(-5, env_int('FFMPEG_NICE_LEVEL', -5)))
     _dm_raw    = os.getenv('FFMPEG_DRAW_MOUSE', '0')
     draw_mouse = _dm_raw if _dm_raw in ('0', '1') else '0'
     display    = os.getenv('DISPLAY', ':99')
@@ -6394,15 +6396,18 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     video_file = os.path.join(output_path, f"recording_{timestamp}.mp4")
 
-    cmd: List[str] = [
-        'nice', '-n', str(nice_level),
+    cmd: List[str] = []
+    if os.name != 'nt' and shutil.which('nice'):
+        cmd.extend(['nice', '-n', str(nice_level)])
+
+    cmd.extend([
         'ffmpeg',
         '-f', 'x11grab',
         '-video_size', f'{screen_width}x{screen_height}',
         '-framerate', str(framerate),
         '-draw_mouse', draw_mouse,
         '-i', display,
-    ]
+    ])
 
     if crop_top > 0:
         crop_height = screen_height - crop_top
@@ -6427,7 +6432,7 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
     logger.info(f"   Recording to: {video_file}")
     if crop_top > 0:
         logger.info(f"   Crop top: {crop_top}px")
-    logger.info(f"   Framerate: {framerate}fps, preset={preset}, crf={crf}, nice={nice_level}")
+    logger.info(f"   Framerate: {framerate}fps, preset={preset}, crf={crf}, nice={nice_level}, threads={threads}")
 
     try:
         ffmpeg_log = open('/tmp/ffmpeg.log', 'w', encoding='utf-8', errors='replace')
@@ -6493,6 +6498,9 @@ async def _run_preload_mode() -> None:
                 '--disable-extensions', '--kiosk', '--start-fullscreen',
                 f'--window-size={viewport_width},{viewport_height}',
                 '--hide-crash-restore-bubble', '--disable-infobars',
+                '--disable-frame-rate-limit',
+                '--force-color-profile=srgb',
+                '--disable-features=IsolateOrigins,site-per-process',
             ]
             if browser_performance_mode:
                 browser_args.extend([
@@ -6648,6 +6656,9 @@ async def main():
                 f'--window-size={viewport_width},{viewport_height}',
                 '--hide-crash-restore-bubble',
                 '--disable-infobars',
+                '--disable-frame-rate-limit',
+                '--force-color-profile=srgb',
+                '--disable-features=IsolateOrigins,site-per-process',
             ]
 
             if browser_performance_mode:
@@ -6712,6 +6723,9 @@ async def main():
                                 el.style.zIndex = '2147483647';
                                 el.style.opacity = '0.98';
                                 el.style.transform = 'translate3d(-100px,-100px,0)';
+                                el.style.willChange = 'transform';
+                                el.style.backfaceVisibility = 'hidden';
+                                el.style.contain = 'layout style paint';
                                 el.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.55))';
                                 el.innerHTML = '<svg width="22" height="22" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><path d="M2 1.5L2 16.2L6.7 12.2L9.8 19.8L12.6 18.7L9.6 11.3L16.6 11.3L2 1.5Z" fill="#ffffff" stroke="#111111" stroke-width="1.2" stroke-linejoin="round"/></svg>';
                             }
@@ -6726,11 +6740,46 @@ async def main():
                             return el;
                         }
 
-                        function moveCursor(x, y) {
+                        const cursorState = {
+                            x: -100,
+                            y: -100,
+                            targetX: -100,
+                            targetY: -100,
+                            rafId: 0,
+                        };
+
+                        function paintCursor(force) {
+                            cursorState.rafId = 0;
                             const el = ensureCursor();
-                            const mx = Number.isFinite(x) ? Math.round(x) : 0;
-                            const my = Number.isFinite(y) ? Math.round(y) : 0;
+                            const mx = Number.isFinite(cursorState.targetX) ? Math.round(cursorState.targetX) : cursorState.x;
+                            const my = Number.isFinite(cursorState.targetY) ? Math.round(cursorState.targetY) : cursorState.y;
+                            if (!force && mx === cursorState.x && my === cursorState.y) {
+                                return;
+                            }
+                            cursorState.x = mx;
+                            cursorState.y = my;
                             el.style.transform = `translate3d(${mx}px, ${my}px, 0)`;
+                        }
+
+                        function scheduleCursorPaint() {
+                            if (cursorState.rafId) {
+                                return;
+                            }
+                            cursorState.rafId = window.requestAnimationFrame(() => paintCursor(false));
+                        }
+
+                        function moveCursor(x, y, immediate = false) {
+                            cursorState.targetX = Number.isFinite(x) ? x : cursorState.targetX;
+                            cursorState.targetY = Number.isFinite(y) ? y : cursorState.targetY;
+                            if (immediate) {
+                                if (cursorState.rafId) {
+                                    window.cancelAnimationFrame(cursorState.rafId);
+                                    cursorState.rafId = 0;
+                                }
+                                paintCursor(true);
+                                return;
+                            }
+                            scheduleCursorPaint();
                         }
 
                         window.__vpvoaeEnsureCursor = ensureCursor;
@@ -6739,7 +6788,7 @@ async def main():
                         const pointerHandler = (ev) => {
                             const ex = Number(ev && ev.clientX);
                             const ey = Number(ev && ev.clientY);
-                            moveCursor(Number.isFinite(ex) ? ex : 0, Number.isFinite(ey) ? ey : 0);
+                            moveCursor(Number.isFinite(ex) ? ex : 0, Number.isFinite(ey) ? ey : 0, false);
                         };
 
                         window.addEventListener('mousemove', pointerHandler, { passive: true });
