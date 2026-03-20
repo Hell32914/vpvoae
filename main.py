@@ -5283,10 +5283,12 @@ async def run_scroll_only_down_pass(
     stall_timeout_ms: int,
     cursor_pos: Tuple[float, float] = (960.0, 540.0),
 ) -> Tuple[bool, Tuple[float, float]]:
-    """CTA-Analyzer mode: visual-first walking scroll with small wheel steps."""
+    """CTA-Analyzer mode: safe-zone guided predicted scrolling for heavy sites."""
     reached_bottom = False
     seen_focus_keys: Set[str] = set()
     start_time = time.time()
+    predicted_scroll_y = 0
+    current_scroll_y = 0
 
     try:
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
@@ -5294,17 +5296,33 @@ async def run_scroll_only_down_pass(
     except Exception:
         pass
 
-    # Park cursor at the left safe zone before scrolling starts.
-    # Staying at x≈10 ensures the cursor never hovers over an interactive widget
-    # (currency calculator, Google Maps, carousel) that would intercept scroll events.
-    try:
-        await page.mouse.move(10, viewport_height * 0.5)
-        await page.wait_for_timeout(120)
-    except Exception:
-        pass
+    async def move_cursor_to_safe_zone() -> None:
+        nonlocal cursor_pos
+        logger.info("[INFO] Уводим мышь в Safe Zone (10, 10)...")
+        try:
+            await page.mouse.move(10, 10)
+            cursor_pos = (10.0, 10.0)
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+            else:
+                raise
+        await asyncio.sleep(0.2)
 
-    scroll_step = 200
-    scroll_pause_s = 1.0
+    async def scroll_to_target(target_y: int) -> None:
+        try:
+            await page.evaluate(
+                """(top) => window.scrollTo({ top, left: 0, behavior: 'smooth' })""",
+                max(0, int(target_y)),
+            )
+        except Exception as exc:
+            if _is_nav_error(exc):
+                await _recover_after_nav(page)
+            else:
+                raise
+
+    scroll_step = 500
+    scroll_pause_s = 1.5
     empty_jump_step = 800
     stubborn_push_step = 1000
     hover_pause_ms = 2000
@@ -5316,19 +5334,10 @@ async def run_scroll_only_down_pass(
     early_stall_guard_s = 20.0
 
     while True:
-        # Держим курсор в безопасной левой зоне, чтобы ховер-виджеты не перехватывали скролл.
-        try:
-            await page.mouse.move(10, viewport_height * 0.5)
-        except Exception:
-            pass
+        await move_cursor_to_safe_zone()
 
-        try:
-            await page.mouse.wheel(0, scroll_step)
-        except Exception as exc:
-            if _is_nav_error(exc):
-                await _recover_after_nav(page)
-            else:
-                raise
+        predicted_scroll_y = max(predicted_scroll_y, current_scroll_y) + scroll_step
+        await scroll_to_target(predicted_scroll_y)
 
         await asyncio.sleep(scroll_pause_s)
 
@@ -5344,14 +5353,15 @@ async def run_scroll_only_down_pass(
                     "focusTarget": None,
                     "headings": [],
                     "ctas": [],
-                    "currentScrollY": max(last_scroll_y or 0, 0),
-                    "scrollY": max(last_scroll_y or 0, 0),
+                    "currentScrollY": max(current_scroll_y, max(last_scroll_y or 0, 0)),
+                    "scrollY": max(current_scroll_y, max(last_scroll_y or 0, 0)),
                     "documentHeight": viewport_height,
+                    "bodyScrollHeight": viewport_height,
                 }
             else:
                 raise
 
-        current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", last_scroll_y or 0))))
+        current_scroll_y = max(0, int(result.get("currentScrollY", result.get("scrollY", current_scroll_y))))
         document_height = max(viewport_height, int(result.get("documentHeight", viewport_height)))
         body_scroll_height = max(viewport_height, int(result.get("bodyScrollHeight", document_height)))
         is_empty = bool(result.get("isEmpty", False))
@@ -5374,7 +5384,7 @@ async def run_scroll_only_down_pass(
             logger.info(
                 f"[Scroll-only] scrollY={current_scroll_y} | docHeight={document_height} | bodyHeight={body_scroll_height} "
                 f"| isEmpty={is_empty} | emptyStreak={empty_screens_in_row} | stagnant={stagnant_scrolls} "
-                f"| elapsed={elapsed_s:.1f}s | mathBottom={math_bottom_reached}"
+                f"| elapsed={elapsed_s:.1f}s | mathBottom={math_bottom_reached} | predictedY={predicted_scroll_y}"
             )
             last_logged_scroll_y = current_scroll_y
 
@@ -5398,13 +5408,9 @@ async def run_scroll_only_down_pass(
             logger.info("[INFO] Scroll-only: 4 пустых экрана подряд, делаем рывок на 800px.")
             empty_screens_in_row = 0
             stagnant_scrolls = 0
-            try:
-                await page.mouse.wheel(0, empty_jump_step)
-            except Exception as exc:
-                if _is_nav_error(exc):
-                    await _recover_after_nav(page)
-                else:
-                    raise
+            predicted_scroll_y = max(predicted_scroll_y, current_scroll_y) + empty_jump_step
+            await move_cursor_to_safe_zone()
+            await scroll_to_target(predicted_scroll_y)
             await asyncio.sleep(scroll_pause_s)
             try:
                 post_jump = await page.evaluate(_JS_HUNTER_ANALYZER)
@@ -5422,13 +5428,22 @@ async def run_scroll_only_down_pass(
                 )
                 stagnant_scrolls = 0
                 empty_screens_in_row = 0
-                try:
-                    await page.mouse.wheel(0, stubborn_push_step)
-                except Exception as exc:
-                    if _is_nav_error(exc):
-                        await _recover_after_nav(page)
-                    else:
-                        raise
+                predicted_scroll_y = max(predicted_scroll_y, current_scroll_y) + stubborn_push_step
+                await move_cursor_to_safe_zone()
+                await scroll_to_target(predicted_scroll_y)
+                await asyncio.sleep(scroll_pause_s)
+                last_scroll_y = None
+                continue
+
+            if current_scroll_y < 1500:
+                logger.info(
+                    "[INFO] Scroll-only: застой у самого верха (scrollY < 1500), делаем агрессивный рывок на 1000px."
+                )
+                stagnant_scrolls = 0
+                empty_screens_in_row = 0
+                predicted_scroll_y = max(predicted_scroll_y, current_scroll_y) + stubborn_push_step
+                await move_cursor_to_safe_zone()
+                await scroll_to_target(predicted_scroll_y)
                 await asyncio.sleep(scroll_pause_s)
                 last_scroll_y = None
                 continue
@@ -5443,13 +5458,9 @@ async def run_scroll_only_down_pass(
             )
             stagnant_scrolls = 0
             empty_screens_in_row = 0
-            try:
-                await page.mouse.wheel(0, stubborn_push_step)
-            except Exception as exc:
-                if _is_nav_error(exc):
-                    await _recover_after_nav(page)
-                else:
-                    raise
+            predicted_scroll_y = max(predicted_scroll_y, current_scroll_y) + stubborn_push_step
+            await move_cursor_to_safe_zone()
+            await scroll_to_target(predicted_scroll_y)
             await asyncio.sleep(scroll_pause_s)
             last_scroll_y = None
             continue
