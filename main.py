@@ -3296,6 +3296,12 @@ async def run_strict_top_to_bottom_pass(
             for (const img of document.querySelectorAll('img')) {
                 if (img.loading === 'lazy') {
                     img.loading = 'eager';
+                    // Перезапускаем загрузку: простое изменение loading не триггерит повторный fetch
+                    if (img.src && !img.complete) {
+                        const origSrc = img.src;
+                        img.src = '';
+                        img.src = origSrc;
+                    }
                     count++;
                 }
                 // data-src / data-lazy-src паттерны
@@ -3340,6 +3346,13 @@ async def run_strict_top_to_bottom_pass(
                     }
                 }
                 try { video.load(); } catch {}
+                // Автозапуск muted видео (muted autoplay разрешён браузером)
+                if (video.muted || !video.getAttribute('src')) {
+                    video.muted = true;
+                    video.autoplay = true;
+                    try { video.play(); } catch {}
+                    count++;
+                }
             }
             // Форсируем background-image из data-атрибутов
             for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
@@ -7711,7 +7724,15 @@ async def main():
                 _forced = await page.evaluate("""() => {
                     let c = 0;
                     for (const img of document.querySelectorAll('img')) {
-                        if (img.loading === 'lazy') { img.loading = 'eager'; c++; }
+                        if (img.loading === 'lazy') {
+                            img.loading = 'eager';
+                            if (img.src && !img.complete) {
+                                const s = img.src;
+                                img.src = '';
+                                img.src = s;
+                            }
+                            c++;
+                        }
                         const ds = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
                         if (ds && !img.src) { img.src = ds; c++; }
                         const dss = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
@@ -7730,6 +7751,12 @@ async def main():
                             if (sd && !s.src) { s.src = sd; c++; }
                         }
                         try { v.load(); } catch {}
+                        if (v.muted || !v.getAttribute('src')) {
+                            v.muted = true;
+                            v.autoplay = true;
+                            try { v.play(); } catch {}
+                            c++;
+                        }
                     }
                     for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
                         const bg = el.getAttribute('data-bg') || el.getAttribute('data-background');
