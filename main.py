@@ -1252,9 +1252,9 @@ async def perform_prerender_scroll(page: Any) -> None:
                 }""",
                 2000,
             )
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(500)
         await page.evaluate("""() => window.scrollTo(0, 0)""")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(150)
     except Exception as exc:
         logger.warning(f"⚠️ Pre-render scroll: {exc}")
 
@@ -3251,10 +3251,10 @@ async def run_strict_top_to_bottom_pass(
                 }""",
                 _ps_i,
             )
-            await page.wait_for_timeout(random.randint(150, 300))
+            await page.wait_for_timeout(random.randint(75, 150))
         # Возвращаемся наверх
         await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
-        await page.wait_for_timeout(random.randint(200, 400))
+        await page.wait_for_timeout(random.randint(100, 200))
         logger.info("✅ Pre-scroll завершён")
     except Exception as _prescroll_exc:
         logger.warning(f"⚠️ Pre-scroll ошибка: {_prescroll_exc}")
@@ -5398,10 +5398,10 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             seenSectionKeys: new Set(),
             rafId: 0,
             pauseUntil: 0,
-            basePxPerFrame: 4.0,
-            slowPxPerFrame: 2.9,
+            basePxPerFrame: 6.0,
+            slowPxPerFrame: 4.4,
             hydrationDistancePx: 2800,
-            hydrationPauseMs: 650,
+            hydrationPauseMs: 325,
             nextHydrationPauseAt: 0,
             focusMinGapPx: 0,
             slowdownDistancePx: 0,
@@ -5559,11 +5559,11 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.seenKeys = new Set();
                 state.seenSectionKeys = new Set();
                 state.reason = 'running';
-                state.basePxPerFrame = Math.max(2.4, Math.min(6.4, Number(config && config.pxPerFrame) || 4.0));
+                state.basePxPerFrame = Math.max(4.8, Math.min(9.0, Number(config && config.pxPerFrame) || 6.0));
                 const slowdownFactor = Math.max(0.45, Math.min(1.0, Number(config && config.slowdownFactor) || 0.74));
                 state.slowPxPerFrame = Math.max(1.1, Math.min(state.basePxPerFrame, state.basePxPerFrame * slowdownFactor));
                 state.hydrationDistancePx = Math.max(1200, Math.round(Number(config && config.hydrationDistancePx) || 2800));
-                state.hydrationPauseMs = Math.max(180, Math.round(Number(config && config.hydrationPauseMs) || 650));
+                state.hydrationPauseMs = Math.max(90, Math.round(Number(config && config.hydrationPauseMs) || 325));
                 state.focusMinGapPx = Math.max(Math.round(vh * 0.75), Math.round(Number(config && config.focusMinGapPx) || (vh * 0.95)));
                 state.slowdownDistancePx = Math.max(0, Math.round(Number(config && config.slowdownDistancePx) || (vh * 0.8)));
                 state.slowUntilScrollY = 0;
@@ -5672,13 +5672,13 @@ async def run_scroll_only_down_pass(
 ) -> Tuple[bool, Tuple[float, float]]:
     """CTA-Analyzer mode: autonomous JS smooth scroll with Python CTA hovers."""
     reached_bottom = False
-    section_pause_ms = max(450, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 1100), 4000))
+    section_pause_ms = max(225, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 550), 2000))
     section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.74), 0.45, 1.0)
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 1), 4))
     base_speed_factor = clamp(scroll_speed_factor if math.isfinite(scroll_speed_factor) else 1.0, 0.80, 2.40)
-    px_per_frame = clamp(3.4 * base_speed_factor, 2.4, 6.2)
+    px_per_frame = clamp(6.8 * base_speed_factor, 4.8, 9.0)
     hydration_distance_px = max(1600, int(viewport_height * 2.4 * clamp(base_speed_factor, 0.9, 1.7)))
-    hydration_pause_ms = max(260, min(int(640 / clamp(base_speed_factor, 0.9, 2.0)), 950))
+    hydration_pause_ms = max(130, min(int(320 / clamp(base_speed_factor, 0.9, 2.0)), 475))
     focus_min_gap_px = max(int(viewport_height * 0.90), int(viewport_height * (0.72 + 0.16 * section_slowdown_rounds)))
     slowdown_distance_px = int(viewport_height * 0.78 * section_slowdown_rounds)
     hover_pause_ms = section_pause_ms
@@ -5776,7 +5776,7 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=34)
+                    await page.mouse.move(focus_x, focus_y, steps=17)
                     cursor_pos = (focus_x, focus_y)
                     await page.wait_for_timeout(hover_pause_ms)
                 except Exception as focus_exc:
