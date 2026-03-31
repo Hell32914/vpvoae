@@ -5431,7 +5431,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             stagnantScrollRounds: 0,
             stagnantDomRounds: 0,
             lastDomHash: -1,
-            wheelFrameCounter: 0,
+            virtualScrollProgress: 0,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
@@ -5458,6 +5458,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 reason: state.reason,
                 elapsedMs: Math.max(0, Math.round(nowMs() - state.startedAt)),
                 isLoading: isPageLoading(),
+                virtualScrollProgress: state.virtualScrollProgress,
+                stagnantDomRounds: state.stagnantDomRounds,
             };
         }
 
@@ -5528,13 +5530,9 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 return;
             }
 
-            // Hybrid stagnation: pinned/GSAP sites have frozen scrollY + stable DOM
-            // Only declare bottom after 15s elapsed + 5 consecutive stagnant sensor rounds
-            const elapsed = timestamp - state.startedAt;
-            if (elapsed >= 15000 && state.stagnantScrollRounds >= 5 && state.stagnantDomRounds >= 5) {
-                finish('bottom');
-                return;
-            }
+            // Hybrid stagnation: only DOM-change check remains; scrollY-based check removed
+            // because pinned/GSAP sites always have scrollY=0.
+            // Python owns virtual-progress termination via virtualScrollProgress field.
 
             if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= state.stallTimeoutMs) {
                 finish('idle');
@@ -5566,13 +5564,14 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
 
-            // Force-wheel: kick GSAP/Lenis/Locomotive runners every 10 frames
-            state.wheelFrameCounter += 1;
-            if (state.wheelFrameCounter % 10 === 0) {
-                try {
-                    window.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true }));
-                } catch(e) {}
-            }
+            // Virtual odometer: advance virtualScrollProgress and kick GSAP/Lenis/Locomotive every frame
+            state.virtualScrollProgress += 7;
+            try {
+                const _weOpts = { deltaY: 7, bubbles: true, cancelable: true };
+                window.dispatchEvent(new WheelEvent('wheel', _weOpts));
+                document.dispatchEvent(new WheelEvent('wheel', _weOpts));
+                document.documentElement.dispatchEvent(new WheelEvent('wheel', _weOpts));
+            } catch(e) {}
 
             // Native scroll: advance when page supports it
             if (maxScrollY > 2 && currentScrollY < maxScrollY - 2) {
@@ -5776,10 +5775,10 @@ async def run_scroll_only_down_pass(
                 raise
         return result if isinstance(result, dict) else {}
 
-    # "Разморозка" страницы перед стартом скролла
+    # Принудительный старт: передаём фокус окну через клик
     try:
-        await page.mouse.move(100, 100)
-        await asyncio.sleep(1)
+        await page.mouse.click(100, 100)
+        await asyncio.sleep(0.5)
     except Exception:
         pass
 
@@ -5795,6 +5794,7 @@ async def run_scroll_only_down_pass(
 
         last_logged_scroll_y: Optional[int] = None
         last_phase = ""
+        MAX_VIRTUAL_DISTANCE = 15_000
 
         while True:
             if time.monotonic() >= hard_deadline:
@@ -5812,18 +5812,36 @@ async def run_scroll_only_down_pass(
             raw_focus_target = state.get("focusTarget")
             focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
             is_loading = bool(state.get("isLoading", False))
+            virtual_progress = int(state.get("virtualScrollProgress", 0))
+            stagnant_dom_rounds = int(state.get("stagnantDomRounds", 0))
 
             phase = "finished" if finished else "focus" if paused_for_focus else "hydration" if paused_for_hydration else "scrolling"
             if phase != last_phase or last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) >= 500:
                 logger.info(
-                    f"[Scroll-only] phase={phase} | scrollY={current_scroll_y} | bodyHeight={body_scroll_height} "
-                    f"| docHeight={document_height} | reason={reason}"
+                    f"[Scroll-only] phase={phase} | scrollY={current_scroll_y} | virtual={virtual_progress}/{MAX_VIRTUAL_DISTANCE} "
+                    f"| domStagnant={stagnant_dom_rounds} | bodyHeight={body_scroll_height} | reason={reason}"
                 )
                 last_phase = phase
                 last_logged_scroll_y = current_scroll_y
 
             if finished:
                 logger.info("[INFO] Scroll-only: JS сообщил finished=true, завершаем проход.")
+                reached_bottom = True
+                break
+
+            if virtual_progress >= MAX_VIRTUAL_DISTANCE:
+                logger.info(
+                    f"[Scroll-only] virtualScrollProgress={virtual_progress} >= {MAX_VIRTUAL_DISTANCE}px "
+                    "— виртуальный конец страницы, завершаем проход."
+                )
+                reached_bottom = True
+                break
+
+            if stagnant_dom_rounds >= 10:
+                logger.info(
+                    f"[Scroll-only] DOM не менялся {stagnant_dom_rounds} сенсорных тиков (~{stagnant_dom_rounds}с) "
+                    "— страница не реагирует, завершаем."
+                )
                 reached_bottom = True
                 break
 
@@ -5847,9 +5865,9 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=15)
+                    await page.mouse.move(focus_x, focus_y, steps=10)
                     cursor_pos = (focus_x, focus_y)
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(700)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
