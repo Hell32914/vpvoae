@@ -2301,14 +2301,14 @@ async def perform_smooth_scroll(
     scroll_pause_max_ms: int,
 ) -> None:
     """Плавный скролл небольшими шагами вместо одного резкого прыжка."""
-    total_delta = int(viewport_height * random.uniform(0.26, 0.46) * scroll_speed_factor)
-    steps = int(clamp(random.randint(4, 8), 3, 10))
-    base_step = max(20, int(total_delta / max(steps, 1)))
+    total_delta = int(viewport_height * random.uniform(0.30, 0.50) * scroll_speed_factor)
+    steps = random.randint(2, 4)
+    base_step = max(80, int(total_delta / max(steps, 1)))
 
     for _ in range(steps):
-        step_delta = max(12, int(base_step + random.uniform(-18, 22)))
+        step_delta = max(60, int(base_step + random.uniform(-25, 30)))
         await page.mouse.wheel(0, step_delta)
-        await page.wait_for_timeout(random.randint(scroll_pause_min_ms, scroll_pause_max_ms))
+        await page.wait_for_timeout(random.randint(max(80, scroll_pause_min_ms), max(200, scroll_pause_max_ms)))
 
 
 async def perform_gsap_micro_scroll(
@@ -2321,9 +2321,9 @@ async def perform_gsap_micro_scroll(
     """Микро-скролл для GSAP/ScrollTrigger сайтов: много мелких wheel-событий
     с короткими паузами вместо редких крупных прыжков.  Это заставляет GSAP
     плавно прокручивать анимации в pinned-секциях, как тачпад реального юзера."""
-    # 10-15 тиков по 150px — достаточно, чтобы пробить длинные GSAP pinned секции
-    n_ticks = random.randint(10, 15)
-    tick_size_base = 150  # px за один wheel-event (+50% vs 100 — пробивает тяжёлые GSAP слайдеры)
+    # 6-10 тиков по 120px — пробивает GSAP pinned секции с паузой на воспроизведение анимаций
+    n_ticks = random.randint(6, 10)
+    tick_size_base = 120  # px за один wheel-event — реалистичный размер колёсика мыши
 
     # При замедлении (slowdown на секциях) уменьшаем тик до ~80px, GSAP успевает сыграть сцену
     tick_size = max(60, int(tick_size_base * clamp(scroll_speed_factor, 0.40, 1.20)))
@@ -2334,9 +2334,9 @@ async def perform_gsap_micro_scroll(
             await page.mouse.wheel(0, step)
         except Exception:
             pass
-        # Фиксировано ~30мс — ровно столько нужно GSAP для обработки wheel-события
-        # без прыжков, но быстро относительно затяжных анимаций
-        await page.wait_for_timeout(random.randint(26, 34))
+        # 60-100мс — достаточно для GSAP/ScrollTrigger обработки wheel-события
+        # и воспроизведения анимации без пропусков кадров
+        await page.wait_for_timeout(random.randint(60, 100))
 
 
 async def force_scroll_progress(page: Any, viewport_height: int) -> None:
@@ -5902,9 +5902,9 @@ async def run_scroll_only_down_pass(
         loop_start_time = time.monotonic()
         START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
         wheel_iteration = 0
-        WHEEL_STEP = 12
-        WHEEL_SLEEP = 0.033  # ~30 итераций/сек ≈ 360px/сек плавный скролл без фризов
-        JS_SCAN_EVERY = 10  # опрашивать JS-радар каждые N итераций
+        WHEEL_STEP = 80  # px — реалистичный размер одного щелчка колёсика мыши
+        WHEEL_SLEEP = 0.16  # ~6 итераций/сек ≈ 480px/сек — как настоящий скролл колёсиком
+        JS_SCAN_EVERY = 5  # опрашивать JS-радар каждые N итераций (~0.8с)
         prev_scroll_y = 0
         stall_counter = 0
 
@@ -5925,7 +5925,7 @@ async def run_scroll_only_down_pass(
             await asyncio.sleep(WHEEL_SLEEP)
             wheel_iteration += 1
 
-            # Опрашиваем JS-радар каждые JS_SCAN_EVERY итераций (~0.4с)
+            # Опрашиваем JS-радар каждые JS_SCAN_EVERY итераций (~0.8с)
             if wheel_iteration % JS_SCAN_EVERY != 0:
                 continue
 
@@ -7169,8 +7169,8 @@ async def main():
         scroll_to_end = env_bool('SMART_CURSOR_SCROLL_TO_END', True)
         bottom_stable_rounds_required = int(os.getenv('SMART_CURSOR_BOTTOM_STABLE_ROUNDS', '4'))
         scroll_speed_factor = float(os.getenv('SMART_CURSOR_SCROLL_SPEED', '1.25'))
-        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '24'))
-        scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '70'))
+        scroll_pause_min_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MIN_MS', '80'))
+        scroll_pause_max_ms = int(os.getenv('SMART_CURSOR_SCROLL_PAUSE_MAX_MS', '200'))
         scroll_finish_timeout_ms = int(os.getenv('SMART_CURSOR_SCROLL_FINISH_TIMEOUT_MS', '45000'))
         nav_tabs_visit_enabled = env_bool('SMART_CURSOR_NAV_TABS_VISIT_ENABLED', True)
         nav_tabs_max_visits = int(os.getenv('SMART_CURSOR_NAV_TABS_MAX_VISITS', '10'))
