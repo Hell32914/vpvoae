@@ -5019,6 +5019,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
         'contact', 'talk', 'demo', 'quote', 'request', 'join', 'subscribe',
         'sign up', 'apply', 'buy', 'shop', 'download', 'try', 'order',
         'view', 'projects', 'services', 'send', 'money', 'our work',
+        'open an account', 'open account', 'get account', 'create account',
         'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
         'записаться', 'связаться', 'заказать', 'бронировать',
     ];
@@ -5601,10 +5602,18 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 
             // Virtual odometer: advance virtualScrollProgress every frame
             state.virtualScrollProgress += 6;
-            // Stable scroll: constant 6px/frame via scrollBy + WheelEvents for GSAP/Lenis
+            // Universal scroll: try window, html, body, and common SPA wrappers
             try {
-                window.scrollBy(0, 6);
-                const _step = state.basePxPerFrame;
+                const _step = 6;
+                window.scrollBy(0, _step);
+                document.documentElement.scrollTop += _step;
+                document.body.scrollTop += _step;
+                for (const sel of ['#__next', '#root', '#app', 'main', '[data-scroll-container]']) {
+                    try {
+                        const _el = document.querySelector(sel);
+                        if (_el && _el.scrollHeight > _el.clientHeight + 10) _el.scrollTop += _step;
+                    } catch(e) {}
+                }
                 const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
                 window.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.dispatchEvent(new WheelEvent('wheel', _weOpts));
@@ -5858,6 +5867,8 @@ async def run_scroll_only_down_pass(
         last_logged_scroll_y: Optional[int] = None
         last_phase = ""
         MAX_VIRTUAL_DISTANCE = 15_000
+        loop_start_time = time.monotonic()
+        START_IMMUNITY_SEC = 15.0  # ignore stagnation for the first N seconds
 
         while True:
             if time.monotonic() >= hard_deadline:
@@ -5903,13 +5914,18 @@ async def run_scroll_only_down_pass(
                 reached_bottom = True
                 break
 
-            if stagnant_dom_rounds >= 10:
+            _elapsed_since_start = time.monotonic() - loop_start_time
+            if stagnant_dom_rounds >= 10 and _elapsed_since_start >= START_IMMUNITY_SEC:
                 logger.info(
                     f"[Scroll-only] DOM не менялся {stagnant_dom_rounds} сенсорных тиков (~{stagnant_dom_rounds}с) "
                     "— страница не реагирует, завершаем."
                 )
                 reached_bottom = True
                 break
+            elif stagnant_dom_rounds >= 10:
+                logger.info(
+                    f"[Scroll-only] DOM stagnant={stagnant_dom_rounds} но иммунитет старта ({_elapsed_since_start:.1f}s < {START_IMMUNITY_SEC}s), ждём."
+                )
 
             if paused_for_focus:
                 if not focus_target:
