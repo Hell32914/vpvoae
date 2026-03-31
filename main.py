@@ -2300,15 +2300,19 @@ async def perform_smooth_scroll(
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
 ) -> None:
-    """Плавный скролл небольшими шагами вместо одного резкого прыжка."""
+    """Плавный скролл через JS requestAnimationFrame — каждый кадр браузера
+    получает уникальную позицию скролла, что даёт идеально гладкое видео."""
     total_delta = int(viewport_height * random.uniform(0.30, 0.50) * scroll_speed_factor)
-    steps = random.randint(5, 9)
-    base_step = max(30, int(total_delta / max(steps, 1)))
-
-    for _ in range(steps):
-        step_delta = max(24, int(base_step + random.uniform(-8, 12)))
-        await page.mouse.wheel(0, step_delta)
-        await page.wait_for_timeout(random.randint(max(35, scroll_pause_min_ms), max(55, scroll_pause_max_ms)))
+    duration_ms = random.randint(400, 700)
+    try:
+        moved = await page.evaluate(
+            _JS_RAF_SMOOTH_SCROLL, [total_delta, duration_ms]
+        )
+        if not moved:
+            # scrollBy не сработал (overflow:hidden контейнер?) — fallback на wheel
+            await page.mouse.wheel(0, total_delta)
+    except Exception:
+        await page.mouse.wheel(0, total_delta)
 
 
 async def perform_gsap_micro_scroll(
@@ -2318,32 +2322,35 @@ async def perform_gsap_micro_scroll(
     scroll_pause_min_ms: int,
     scroll_pause_max_ms: int,
 ) -> None:
-    """Микро-скролл для GSAP/ScrollTrigger сайтов: много мелких wheel-событий
-    с короткими паузами вместо редких крупных прыжков.  Это заставляет GSAP
-    плавно прокручивать анимации в pinned-секциях, как тачпад реального юзера."""
-    # 12-20 тиков по 30px — плавный тачпад-скролл, GSAP обрабатывает каждое событие
-    n_ticks = random.randint(12, 20)
-    tick_size_base = 30  # px за один wheel-event — имитация тачпада
-
-    # При замедлении (slowdown на секциях) уменьшаем тик до ~20px, GSAP успевает сыграть сцену
-    tick_size = max(18, int(tick_size_base * clamp(scroll_speed_factor, 0.40, 1.20)))
-
-    for i in range(n_ticks):
-        step = max(16, int(tick_size + random.uniform(-6, 8)))
-        try:
-            await page.mouse.wheel(0, step)
-        except Exception:
-            pass
-        # 40-55мс — 1-2 кадра видео между событиями, GSAP успевает отрисовать
-        await page.wait_for_timeout(random.randint(40, 55))
+    """Микро-скролл для GSAP/ScrollTrigger сайтов через JS rAF.
+    Более длительная анимация даёт GSAP время воспроизвести pinned-секции."""
+    total_delta = int(viewport_height * random.uniform(0.25, 0.40) * clamp(scroll_speed_factor, 0.40, 1.20))
+    duration_ms = random.randint(700, 1200)
+    try:
+        moved = await page.evaluate(
+            _JS_RAF_SMOOTH_SCROLL, [total_delta, duration_ms]
+        )
+        if not moved:
+            # GSAP сайт с кастомным контейнером — fallback на wheel
+            steps = random.randint(8, 12)
+            step_size = max(16, total_delta // steps)
+            for _ in range(steps):
+                await page.mouse.wheel(0, step_size)
+                await page.wait_for_timeout(random.randint(45, 65))
+    except Exception:
+        await page.mouse.wheel(0, total_delta)
 
 
 async def force_scroll_progress(page: Any, viewport_height: int) -> None:
     """Форсирует продвижение скролла на сайтах с нестандартным smooth-scroll."""
     delta = max(80, int(viewport_height * 0.9))
     try:
-        await page.mouse.wheel(0, delta)
-        await page.wait_for_timeout(random.randint(45, 110))
+        moved = await page.evaluate(
+            _JS_RAF_SMOOTH_SCROLL, [delta, 300]
+        )
+        if not moved:
+            await page.mouse.wheel(0, delta)
+            await page.wait_for_timeout(random.randint(45, 110))
     except Exception:
         pass
 
@@ -3583,13 +3590,13 @@ async def run_strict_top_to_bottom_pass(
                     scroll_delta = desired_scroll - scroll_y
                     if abs(scroll_delta) > 30:
                         try:
-                            _steps = random.randint(3, 5)
-                            _step_size = int(scroll_delta / _steps)
-                            for _si in range(_steps):
-                                _d = _step_size + random.randint(-8, 8)
-                                await page.mouse.wheel(0, _d)
-                                await page.wait_for_timeout(random.randint(18, 45))
-                            await page.wait_for_timeout(random.randint(40, 100))
+                            _dur = random.randint(200, 400)
+                            _moved = await page.evaluate(
+                                _JS_RAF_SMOOTH_SCROLL, [scroll_delta, _dur]
+                            )
+                            if not _moved:
+                                await page.mouse.wheel(0, scroll_delta)
+                                await page.wait_for_timeout(random.randint(40, 100))
                             _new_metrics = await get_scroll_metrics(page)
                             scroll_y = max(scroll_y, int(_new_metrics.get("scrollY", scroll_y)))
                         except Exception as _exc:
@@ -5000,6 +5007,75 @@ def build_scroll_only_section_landmarks(
     return deduped
 
 
+# ── JS rAF smooth scroll primitives ───────────────────────────────────────────
+# Используются Python-функциями perform_smooth_scroll / force_scroll_progress
+# для рендеринга плавного скролла через requestAnimationFrame.
+# Каждый кадр браузера получает уникальную позицию → идеально гладкое видео.
+_JS_RAF_SMOOTH_SCROLL = """
+([delta, durMs]) => new Promise(resolve => {
+    if (Math.abs(delta) < 1) { resolve(false); return; }
+    const startY = window.scrollY || window.pageYOffset || 0;
+    const startTime = performance.now();
+    let acc = 0;
+    function ease(t) { return t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2; }
+    function step(now) {
+        const t = Math.min((now - startTime) / durMs, 1);
+        const progress = delta * ease(t);
+        const dy = progress - acc;
+        if (Math.abs(dy) >= 0.5) {
+            window.scrollBy(0, dy);
+            acc = progress;
+        }
+        if (t < 1) {
+            requestAnimationFrame(step);
+        } else {
+            const endY = window.scrollY || window.pageYOffset || 0;
+            resolve(Math.abs(endY - startY) > 2);
+        }
+    }
+    requestAnimationFrame(step);
+})
+"""
+
+# Непрерывный JS rAF-скролл — стартует и крутит страницу с постоянной скоростью
+# px/sec, пока Python не вызовет _JS_CONTINUOUS_SCROLL_STOP.
+_JS_CONTINUOUS_SCROLL_START = """
+(pxPerSec) => {
+    if (window.__vpvoaeCScroll) {
+        window.__vpvoaeCScroll.speed = pxPerSec;
+        return;
+    }
+    window.__vpvoaeCScroll = { speed: pxPerSec, active: true };
+    let last = performance.now();
+    function tick(now) {
+        const s = window.__vpvoaeCScroll;
+        if (!s || !s.active) return;
+        const dt = Math.min((now - last) / 1000, 0.05);
+        last = now;
+        const dy = s.speed * dt;
+        if (dy > 0.3) window.scrollBy(0, dy);
+        requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+}
+"""
+
+_JS_CONTINUOUS_SCROLL_STOP = """
+() => {
+    if (window.__vpvoaeCScroll) window.__vpvoaeCScroll.active = false;
+    window.__vpvoaeCScroll = null;
+}
+"""
+
+_JS_CONTINUOUS_SCROLL_PAUSE = """
+() => { if (window.__vpvoaeCScroll) window.__vpvoaeCScroll.speed = 0; }
+"""
+
+_JS_CONTINUOUS_SCROLL_RESUME = """
+(pxPerSec) => { if (window.__vpvoaeCScroll) window.__vpvoaeCScroll.speed = pxPerSec; }
+"""
+
+
 # ── JS Hunter smooth scroll controller for Mode 2 ─────────────────────────────
 # JS owns linear scrolling and hydration pauses. Python only polls state,
 # hovers the returned CTA/heading, and resumes the controller.
@@ -5892,7 +5968,7 @@ async def run_scroll_only_down_pass(
         await controller_call("start", scroll_config)
         controller_started = True
         logger.info(
-            f"[INFO] Scroll-only: Native Wheel Engine запущен (mouse.wheel driven, JS radar only)."
+            f"[INFO] Scroll-only: JS rAF Smooth Engine запущен (requestAnimationFrame driven)."
         )
 
         last_logged_scroll_y: Optional[int] = None
@@ -5901,11 +5977,17 @@ async def run_scroll_only_down_pass(
         loop_start_time = time.monotonic()
         START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
         wheel_iteration = 0
-        WHEEL_STEP = 32  # px — между тачпадом и колёсиком, достаточно для scroll-snap порогов
-        WHEEL_SLEEP = 0.050  # ~20 итераций/сек ≈ 640px/сек — плавно на 30fps видео
-        JS_SCAN_EVERY = 15  # опрашивать JS-радар каждые N итераций (~0.75с)
+        SCROLL_SPEED_PPS = 500  # px/sec — скорость непрерывного JS-скролла
+        POLL_INTERVAL = 0.75  # секунды между опросами JS-радара
         prev_scroll_y = 0
         stall_counter = 0
+
+        # Запускаем непрерывный JS rAF-скролл — каждый кадр браузера
+        # получает уникальную позицию, что даёт идеально гладкое видео.
+        try:
+            await page.evaluate(_JS_CONTINUOUS_SCROLL_START, SCROLL_SPEED_PPS)
+        except Exception:
+            pass
 
         while True:
             now = time.monotonic()
@@ -5916,17 +5998,9 @@ async def run_scroll_only_down_pass(
                 logger.warning("[WARN] Scroll-only: превышен общий таймаут.")
                 break
 
-            # Нативный скролл через колёсико мыши (мышь уже в центре)
-            try:
-                await page.mouse.wheel(0, WHEEL_STEP)
-            except Exception:
-                pass
-            await asyncio.sleep(WHEEL_SLEEP)
+            # Даём JS-скроллеру работать, потом проверяем состояние
+            await asyncio.sleep(POLL_INTERVAL)
             wheel_iteration += 1
-
-            # Опрашиваем JS-радар каждые JS_SCAN_EVERY итераций (~0.75с)
-            if wheel_iteration % JS_SCAN_EVERY != 0:
-                continue
 
             state = await controller_call("state")
             current_scroll_y = max(0, int(state.get("currentScrollY", state.get("scrollY", 0))))
@@ -5972,16 +6046,26 @@ async def run_scroll_only_down_pass(
                 reached_bottom = True
                 break
 
-            # Застой: 25 опросов без движения (×10 итераций × 0.04с = ~10с)
-            if stall_counter >= 25 and not is_immune:
-                logger.info(
-                    f"[Wheel] scrollY не менялся {stall_counter} раундов, завершаем."
-                )
-                reached_bottom = True
-                break
+            # Застой: 4 опроса без движения (~3с) — JS scrollBy не работает, пробуем wheel
+            if stall_counter >= 4 and not is_immune:
+                try:
+                    await page.mouse.wheel(0, 80)
+                except Exception:
+                    pass
+                if stall_counter >= 25:
+                    logger.info(
+                        f"[Scroll-only] scrollY не менялся {stall_counter} раундов, завершаем."
+                    )
+                    reached_bottom = True
+                    break
 
             # CTA найден — пауза + hover
             if paused_for_focus:
+                # Пауза непрерывного JS-скролла на время фокуса
+                try:
+                    await page.evaluate(_JS_CONTINUOUS_SCROLL_PAUSE)
+                except Exception:
+                    pass
                 if not focus_target:
                     logger.warning("[WARN] JS пауза без focusTarget, продолжаем.")
                     await controller_call("resume", {})
@@ -6023,10 +6107,20 @@ async def run_scroll_only_down_pass(
                     },
                 )
                 logger.info("[INFO] Wheel: скролл возобновлен после hover.")
+                # Возобновление непрерывного JS-скролла
+                try:
+                    await page.evaluate(_JS_CONTINUOUS_SCROLL_RESUME, SCROLL_SPEED_PPS)
+                except Exception:
+                    pass
                 continue
 
             # Никаких пауз.  Продолжаем крутить.
     finally:
+        # Останавливаем непрерывный JS-скролл
+        try:
+            await page.evaluate(_JS_CONTINUOUS_SCROLL_STOP)
+        except Exception:
+            pass
         if controller_started:
             try:
                 await controller_call("stop")
