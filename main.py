@@ -5008,18 +5008,51 @@ def build_scroll_only_section_landmarks(
 # ── JS Hunter smooth scroll controller for Mode 2 ─────────────────────────────
 # JS owns linear scrolling and hydration pauses. Python only polls state,
 # hovers the returned CTA/heading, and resumes the controller.
-_JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
+_JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 ([action, payload]) => {
     const controllerKey = '__vpvoaeHunterSmoothScrollController';
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.35;
-    const focusTopMax = vh * 0.65;
-    const focusCenterY = vh * 0.50;
-    const CTA_WORDS = ['invest', 'learn', 'get started', 'sign up', 'trade'];
+    const focusTopMin = vh * 0.32;
+    const focusTopMax = vh * 0.74;
+    const focusCenterY = vh * 0.56;
+    const CTA_WORDS = [
+        'get started', 'start free', 'start now', 'free trial', 'trial',
+        'book a demo', 'request demo', 'schedule demo', 'contact sales',
+        'learn more', 'discover', 'explore', 'pricing', 'book', 'schedule',
+        'contact', 'talk', 'demo', 'quote', 'request', 'join', 'subscribe',
+        'sign up', 'apply', 'buy', 'shop', 'download', 'try', 'order',
+        'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
+        'записаться', 'связаться', 'заказать', 'бронировать',
+    ];
+    const CTA_SKIP_WORDS = [
+        'close', 'dismiss', 'cookie', 'accept cookies', 'decline', 'menu',
+        'open menu', 'back', 'previous', 'prev', 'next', 'search', 'filter',
+        'sort', 'skip to content', 'home', 'language', 'share',
+        'закрыть', 'назад', 'меню', 'поиск', 'фильтр',
+    ];
+    const SECTION_HINT_RE = /hero|cta|pricing|plan|offer|trial|feature|benefit|showcase|product|demo|contact|signup|footer|banner|call[-_ ]?to[-_ ]?action/;
 
     function normalizeText(text, maxLen) {
         return (text || '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+    }
+
+    function hasKeyword(text, words) {
+        const normalized = normalizeText(text, 220).toLowerCase();
+        if (!normalized) return false;
+        return words.some((word) => normalized.includes(word));
+    }
+
+    function longestKeyword(text, words) {
+        const normalized = normalizeText(text, 220).toLowerCase();
+        if (!normalized) return '';
+        let best = '';
+        for (const word of words) {
+            if (normalized.includes(word) && word.length > best.length) {
+                best = word;
+            }
+        }
+        return best;
     }
 
     function domSignature(el) {
@@ -5082,7 +5115,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
     }
 
     function isInFocusBand(rect) {
-        return Number.isFinite(rect.top) && rect.top >= focusTopMin && rect.top <= focusTopMax;
+        const centerY = rect.top + rect.height / 2;
+        return Number.isFinite(centerY) && centerY >= focusTopMin && centerY <= focusTopMax;
     }
 
     function centerPoint(rect) {
@@ -5094,13 +5128,122 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
 
     function scoreByCenter(rect) {
         const center = centerPoint(rect);
-        return Math.max(0, 180 - Math.abs(center.y - focusCenterY) * 1.4);
+        return Math.max(0, 220 - Math.abs(center.y - focusCenterY) * 1.15);
     }
 
-    function buildStableKey(el, kind, text, rect) {
+    function parseRgb(raw) {
+        const match = (raw || '').match(/\d+(?:\.\d+)?/g);
+        if (!match || match.length < 3) return null;
+        return match.slice(0, 3).map((value) => Number(value));
+    }
+
+    function getLuminance(raw) {
+        const channels = parseRgb(raw);
+        if (!channels) return null;
+        const [r, g, b] = channels.map((channel) => {
+            const normalized = channel / 255;
+            return normalized <= 0.03928
+                ? normalized / 12.92
+                : Math.pow((normalized + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function contrastRatio(colorA, colorB) {
+        const lumA = getLuminance(colorA);
+        const lumB = getLuminance(colorB);
+        if (lumA === null || lumB === null) return 1.0;
+        const bright = Math.max(lumA, lumB);
+        const dark = Math.min(lumA, lumB);
+        return (bright + 0.05) / (dark + 0.05);
+    }
+
+    function firstSolidBackground(node) {
+        let cur = node;
+        let depth = 0;
+        while (cur && cur instanceof HTMLElement && depth < 8) {
+            const bg = (window.getComputedStyle(cur).backgroundColor || '').toLowerCase();
+            if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+                return bg;
+            }
+            cur = cur.parentElement;
+            depth += 1;
+        }
+        return 'rgb(255, 255, 255)';
+    }
+
+    function hasVisibleFill(style) {
+        const bg = (style.backgroundColor || '').toLowerCase();
+        const borderWidth = Number.parseFloat(style.borderTopWidth || '0') || 0;
+        return (
+            (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)')
+            || borderWidth >= 1.0
+        );
+    }
+
+    function findSectionContainer(el) {
+        let best = null;
+        let node = el;
+        let depth = 0;
+        while (node && node instanceof HTMLElement && depth < 8) {
+            const style = window.getComputedStyle(node);
+            if (style.position !== 'fixed' && style.position !== 'sticky') {
+                const rect = node.getBoundingClientRect();
+                const tag = node.tagName.toLowerCase();
+                const hint = `${tag} ${(node.id || '').toString().toLowerCase()} ${(node.className || '').toString().toLowerCase()}`;
+                const semantic = ['section', 'article', 'main', 'aside', 'form', 'footer'].includes(tag);
+                const hinted = SECTION_HINT_RE.test(hint);
+                const largeBlock = rect.width >= vw * 0.48 && rect.height >= Math.max(140, vh * 0.24);
+                if ((semantic || hinted || largeBlock) && rect.width >= 120 && rect.height >= 80) {
+                    best = node;
+                    if (semantic || hinted) break;
+                }
+            }
+            node = node.parentElement;
+            depth += 1;
+        }
+        return best;
+    }
+
+    function sectionSignature(sectionEl) {
+        if (!(sectionEl instanceof HTMLElement)) return '';
+        const rect = sectionEl.getBoundingClientRect();
+        const top = Math.round(rect.top + getScrollY());
+        const height = Math.round(rect.height);
+        const label = normalizeText(textBundle(sectionEl, 48), 48);
+        return ['section', domSignature(sectionEl), top, height, label].join('|');
+    }
+
+    function findSectionHeading(sectionEl, anchorRect) {
+        if (!(sectionEl instanceof HTMLElement)) return '';
+        let bestText = '';
+        let bestScore = -Infinity;
+        for (const node of sectionEl.querySelectorAll('h1,h2,h3,h4')) {
+            if (!(node instanceof HTMLElement)) continue;
+            const style = window.getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            if (!hasRenderableBox(node, rect, style)) continue;
+            if (rect.bottom < -40 || rect.top > vh * 0.78) continue;
+            const text = normalizeText(node.innerText || node.textContent || '', 120);
+            if (!text) continue;
+            const verticalDelta = anchorRect.top - rect.top;
+            if (verticalDelta < -140 || verticalDelta > vh * 0.72) continue;
+            const horizontalDelta = Math.abs(
+                (rect.left + rect.width / 2) - (anchorRect.left + anchorRect.width / 2)
+            );
+            const score = 260 - Math.abs(verticalDelta - Math.min(140, vh * 0.16)) - horizontalDelta * 0.18;
+            if (score > bestScore) {
+                bestScore = score;
+                bestText = text;
+            }
+        }
+        return bestText;
+    }
+
+    function buildStableKey(el, kind, text, rect, sectionKey = '') {
         return [
             kind,
-            domSignature(el),
+            sectionKey || domSignature(el),
             normalizeText(text, 36),
             Math.round(rect.left + rect.width / 2),
             Math.round(rect.top + rect.height / 2),
@@ -5140,7 +5283,9 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
         return {
             kind,
             text: candidate.text,
-            dedupKey: buildStableKey(candidate.el, kind, candidate.text, candidate.rect),
+            dedupKey: buildStableKey(candidate.el, kind, candidate.text, candidate.rect, candidate.sectionKey || ''),
+            sectionKey: candidate.sectionKey || '',
+            headingText: candidate.headingText || '',
             x: Math.round(Math.max(2, Math.min(vw - 2, center.x))),
             y: Math.round(Math.max(2, Math.min(vh - 2, center.y))),
             top: Math.round(candidate.rect.top),
@@ -5148,24 +5293,12 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
         };
     }
 
-    function findBestTarget(seenKeys) {
-        let bestHeading = null;
-        for (const el of document.querySelectorAll('h1,h2,h3')) {
-            if (!(el instanceof HTMLElement)) continue;
-            if (!isViewportContent(el)) continue;
-            const rect = el.getBoundingClientRect();
-            if (!isInFocusBand(rect)) continue;
-            const text = normalizeText(el.textContent || el.innerText || '', 120);
-            if (!text) continue;
-            const dedupKey = buildStableKey(el, 'heading', text, rect);
-            if (seenKeys.has(dedupKey)) continue;
-            const score = scoreByCenter(rect) + Math.min(text.length, 80) * 0.8;
-            if (!bestHeading || score > bestHeading.score) {
-                bestHeading = { el, rect, text, score };
-            }
+    function findBestTarget(seenKeys, seenSectionKeys, currentScrollY, lastFocusScrollY, focusMinGapPx) {
+        if (currentScrollY < (lastFocusScrollY + focusMinGapPx)) {
+            return null;
         }
 
-        const ctaSelectors = ['button', 'a[href]', '[role="button"]', '[class*="btn"]', '[class*="cta"]', '[class*="action"]'];
+        const ctaSelectors = ['button', 'a[href]', '[role="button"]', '[class*="btn"]', '[class*="cta"]', '[class*="action"]', '[data-cta]'];
         const ctaPool = new Set();
         for (const selector of ctaSelectors) {
             try {
@@ -5178,39 +5311,72 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
         let bestCta = null;
         for (const el of ctaPool) {
             if (!(el instanceof HTMLElement)) continue;
-            if (!isViewportContent(el)) continue;
+            const style = window.getComputedStyle(el);
+            if (style.position === 'fixed' || style.position === 'sticky') continue;
+            if (hasFixedOrStickyAncestor(el.parentElement)) continue;
             const rect = el.getBoundingClientRect();
+            if (!hasRenderableBox(el, rect, style)) continue;
             if (!isInFocusBand(rect)) continue;
-            if (rect.width < 28 || rect.height < 14) continue;
+            if (rect.width < 72 || rect.height < 26) continue;
 
             const text = textBundle(el, 84);
+            if (!text) continue;
             const textLow = text.toLowerCase();
-            const keywordMatches = CTA_WORDS.filter((word) => textLow.includes(word));
-            if (!keywordMatches.length) continue;
+            if (hasKeyword(textLow, CTA_SKIP_WORDS)) continue;
 
-            const dedupKey = buildStableKey(el, 'cta', text, rect);
-            if (seenKeys.has(dedupKey)) continue;
+            const hrefLow = (el.getAttribute('href') || '').toLowerCase();
+            const keyword = longestKeyword(`${textLow} ${hrefLow}`, CTA_WORDS);
+            if (!keyword) continue;
 
             const area = rect.width * rect.height;
-            const keywordBoost = 220 + keywordMatches[0].length * 4;
-            const areaBoost = Math.min(area, 48000) * 0.0025;
-            const textBoost = text ? Math.min(text.length, 40) * 1.0 : 0;
-            const score = keywordBoost + areaBoost + textBoost + scoreByCenter(rect);
+            const hasFill = hasVisibleFill(style);
+            if (area < 2400 && !hasFill) continue;
+
+            const sectionEl = findSectionContainer(el);
+            const sectionKey = sectionEl ? sectionSignature(sectionEl) : '';
+            if (sectionKey && seenSectionKeys.has(sectionKey)) continue;
+
+            const dedupKey = buildStableKey(el, 'cta', text, rect, sectionKey);
+            if (seenKeys.has(dedupKey)) continue;
+
+            const headingScope = (sectionEl instanceof HTMLElement) ? sectionEl : el.parentElement;
+            const headingText = findSectionHeading(headingScope, rect);
+            const contrast = contrastRatio(
+                style.backgroundColor || '',
+                firstSolidBackground((sectionEl && sectionEl !== el) ? sectionEl : el.parentElement),
+            );
+            const sectionRect = sectionEl instanceof HTMLElement ? sectionEl.getBoundingClientRect() : rect;
+            const keywordBoost = 190 + keyword.length * 6;
+            const areaBoost = Math.min(area, 64000) * 0.0022;
+            const fillBoost = hasFill ? 75 : 0;
+            const contrastBoost = contrast >= 2.4 ? 120 : contrast >= 1.8 ? 65 : contrast >= 1.4 ? 20 : -55;
+            const headingBoost = headingText ? 110 + Math.min(headingText.length, 64) * 0.65 : 0;
+            const sectionBoost = Math.min(Math.max(sectionRect.height, rect.height), vh * 1.4) * 0.05;
+            const shapeBoost = rect.width >= 132 ? 38 : 0;
+            const edgePenalty = (rect.left <= 18 || rect.right >= vw - 18) ? 35 : 0;
+            const inlinePenalty = (!hasFill && rect.height < 34) ? 90 : 0;
+            const score = (
+                keywordBoost
+                + areaBoost
+                + fillBoost
+                + contrastBoost
+                + headingBoost
+                + sectionBoost
+                + shapeBoost
+                + scoreByCenter(rect)
+                - edgePenalty
+                - inlinePenalty
+            );
+
+            if (score < 340) continue;
 
             if (!bestCta || score > bestCta.score) {
-                bestCta = { el, rect, text, score };
+                bestCta = { el, rect, text, score, sectionKey, headingText };
             }
         }
 
-        const headingPayload = buildPayload(bestHeading, 'heading');
         const ctaPayload = buildPayload(bestCta, 'cta');
-        if (headingPayload && ctaPayload) {
-            return ctaPayload.score >= headingPayload.score
-                ? { payload: ctaPayload, element: bestCta.el }
-                : { payload: headingPayload, element: bestHeading.el };
-        }
         if (ctaPayload) return { payload: ctaPayload, element: bestCta.el };
-        if (headingPayload) return { payload: headingPayload, element: bestHeading.el };
         return null;
     }
 
@@ -5229,18 +5395,25 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
             focusTarget: null,
             focusElement: null,
             seenKeys: new Set(),
+            seenSectionKeys: new Set(),
             rafId: 0,
             pauseUntil: 0,
-            pxPerFrame: 2.5,
-            hydrationDistancePx: 2000,
-            hydrationPauseMs: 1500,
+            basePxPerFrame: 4.0,
+            slowPxPerFrame: 2.9,
+            hydrationDistancePx: 2800,
+            hydrationPauseMs: 650,
             nextHydrationPauseAt: 0,
+            focusMinGapPx: 0,
+            slowdownDistancePx: 0,
+            slowUntilScrollY: 0,
+            lastFocusScrollY: -100000,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
             lastScrollHeight: 0,
             lastObservedScrollY: 0,
             startedAt: 0,
+            stallTimeoutMs: 5000,
             reason: 'idle',
         };
 
@@ -5300,7 +5473,13 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                 state.lastProgressAt = timestamp;
             }
 
-            const candidate = findBestTarget(state.seenKeys);
+            const candidate = findBestTarget(
+                state.seenKeys,
+                state.seenSectionKeys,
+                currentScrollY,
+                state.lastFocusScrollY,
+                state.focusMinGapPx,
+            );
             if (candidate && candidate.payload) {
                 state.focusTarget = candidate.payload;
                 state.focusElement = candidate.element || null;
@@ -5312,7 +5491,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                 return;
             }
 
-            if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= 5000) {
+            if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= state.stallTimeoutMs) {
                 finish('idle');
             }
         }
@@ -5341,8 +5520,22 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
             const currentScrollY = getScrollY();
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
-            const nextScrollY = Math.min(maxScrollY, currentScrollY + state.pxPerFrame);
+            if (maxScrollY <= 2 || currentScrollY >= (maxScrollY - 2)) {
+                finish('bottom');
+                return;
+            }
+
+            const pxPerFrame = currentScrollY < state.slowUntilScrollY
+                ? state.slowPxPerFrame
+                : state.basePxPerFrame;
+            const nextScrollY = Math.min(maxScrollY, currentScrollY + pxPerFrame);
             window.scrollTo(0, nextScrollY);
+
+            if (nextScrollY >= (maxScrollY - 2)) {
+                window.scrollTo(0, maxScrollY);
+                finish('bottom');
+                return;
+            }
 
             if (nextScrollY >= state.nextHydrationPauseAt) {
                 state.pauseUntil = timestamp + state.hydrationPauseMs;
@@ -5364,10 +5557,17 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                 state.focusTarget = null;
                 state.focusElement = null;
                 state.seenKeys = new Set();
+                state.seenSectionKeys = new Set();
                 state.reason = 'running';
-                state.pxPerFrame = Math.max(1.0, Math.min(4.0, Number(config && config.pxPerFrame) || 2.5));
-                state.hydrationDistancePx = Math.max(800, Math.round(Number(config && config.hydrationDistancePx) || 2000));
-                state.hydrationPauseMs = Math.max(250, Math.round(Number(config && config.hydrationPauseMs) || 1500));
+                state.basePxPerFrame = Math.max(2.4, Math.min(6.4, Number(config && config.pxPerFrame) || 4.0));
+                const slowdownFactor = Math.max(0.45, Math.min(1.0, Number(config && config.slowdownFactor) || 0.74));
+                state.slowPxPerFrame = Math.max(1.1, Math.min(state.basePxPerFrame, state.basePxPerFrame * slowdownFactor));
+                state.hydrationDistancePx = Math.max(1200, Math.round(Number(config && config.hydrationDistancePx) || 2800));
+                state.hydrationPauseMs = Math.max(180, Math.round(Number(config && config.hydrationPauseMs) || 650));
+                state.focusMinGapPx = Math.max(Math.round(vh * 0.75), Math.round(Number(config && config.focusMinGapPx) || (vh * 0.95)));
+                state.slowdownDistancePx = Math.max(0, Math.round(Number(config && config.slowdownDistancePx) || (vh * 0.8)));
+                state.slowUntilScrollY = 0;
+                state.lastFocusScrollY = -state.focusMinGapPx;
                 state.pauseUntil = 0;
                 state.lastSensorAt = 0;
                 state.lastLifeAt = timestamp;
@@ -5375,6 +5575,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                 state.startedAt = timestamp;
                 state.lastScrollHeight = getDocumentHeight();
                 state.lastObservedScrollY = getScrollY();
+                state.stallTimeoutMs = Math.max(2200, Math.round(Number(config && config.stallTimeoutMs) || 5000));
                 state.nextHydrationPauseAt = getScrollY() + state.hydrationDistancePx;
                 schedule();
                 return snapshot();
@@ -5391,11 +5592,19 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                     (state.focusTarget && state.focusTarget.dedupKey) ||
                     ''
                 );
+                const sectionKey = String(
+                    (resumePayload && resumePayload.sectionKey) ||
+                    (state.focusTarget && state.focusTarget.sectionKey) ||
+                    ''
+                );
                 if (focusKey) {
                     state.seenKeys.add(focusKey);
                     if (state.focusElement instanceof HTMLElement) {
                         markSeenElement(state.focusElement, focusKey);
                     }
+                }
+                if (sectionKey) {
+                    state.seenSectionKeys.add(sectionKey);
                 }
                 state.focusTarget = null;
                 state.focusElement = null;
@@ -5407,6 +5616,13 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
                 state.lastProgressAt = timestamp;
                 state.lastSensorAt = 0;
                 state.lastObservedScrollY = getScrollY();
+                state.lastFocusScrollY = state.lastObservedScrollY;
+                if (state.slowdownDistancePx > 0 && state.slowPxPerFrame < state.basePxPerFrame) {
+                    state.slowUntilScrollY = Math.max(
+                        state.slowUntilScrollY,
+                        state.lastFocusScrollY + state.slowdownDistancePx,
+                    );
+                }
                 schedule();
                 return snapshot();
             },
@@ -5433,6 +5649,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = """
     if (action === 'start') return controller.startSmoothScroll(payload || {});
     if (action === 'resume') return controller.resumeAfterFocus(payload || {});
     if (action === 'stop') return controller.stopSmoothScroll();
+    if (action === 'state') return controller.readState();
     return controller.readState();
 }"""
 
@@ -5455,12 +5672,25 @@ async def run_scroll_only_down_pass(
 ) -> Tuple[bool, Tuple[float, float]]:
     """CTA-Analyzer mode: autonomous JS smooth scroll with Python CTA hovers."""
     reached_bottom = False
-    hover_pause_ms = 2000
-    poll_interval_s = 0.35
+    section_pause_ms = max(450, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 1100), 4000))
+    section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.74), 0.45, 1.0)
+    section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 1), 4))
+    base_speed_factor = clamp(scroll_speed_factor if math.isfinite(scroll_speed_factor) else 1.0, 0.80, 2.40)
+    px_per_frame = clamp(3.4 * base_speed_factor, 2.4, 6.2)
+    hydration_distance_px = max(1600, int(viewport_height * 2.4 * clamp(base_speed_factor, 0.9, 1.7)))
+    hydration_pause_ms = max(260, min(int(640 / clamp(base_speed_factor, 0.9, 2.0)), 950))
+    focus_min_gap_px = max(int(viewport_height * 0.90), int(viewport_height * (0.72 + 0.16 * section_slowdown_rounds)))
+    slowdown_distance_px = int(viewport_height * 0.78 * section_slowdown_rounds)
+    hover_pause_ms = section_pause_ms
+    poll_interval_s = 0.22
     scroll_config = {
-        "pxPerFrame": 2.5,
-        "hydrationDistancePx": 2000,
-        "hydrationPauseMs": 1500,
+        "pxPerFrame": px_per_frame,
+        "hydrationDistancePx": hydration_distance_px,
+        "hydrationPauseMs": hydration_pause_ms,
+        "slowdownFactor": section_slowdown_factor,
+        "focusMinGapPx": focus_min_gap_px,
+        "slowdownDistancePx": slowdown_distance_px,
+        "stallTimeoutMs": max(2600, stall_timeout_ms),
     }
     started_at = time.monotonic()
     hard_deadline = started_at + ((total_time_ms / 1000.0) if total_time_ms > 0 else 300.0)
@@ -5488,7 +5718,9 @@ async def run_scroll_only_down_pass(
         controller_started = True
         logger.info(
             "[INFO] Scroll-only: startSmoothScroll() запущен "
-            "(requestAnimationFrame, 2.5px/frame, hydration pause 1500ms every 2000px)."
+            f"(requestAnimationFrame, {px_per_frame:.2f}px/frame, hydration pause {hydration_pause_ms}ms "
+            f"every {hydration_distance_px}px, focus gap {focus_min_gap_px}px, slowdown x{section_slowdown_factor:.2f} "
+            f"for {slowdown_distance_px}px)."
         )
 
         last_logged_scroll_y: Optional[int] = None
@@ -5536,9 +5768,15 @@ async def run_scroll_only_down_pass(
                 focus_text = str(focus_target.get("text", "")).strip()
                 focus_kind = str(focus_target.get("kind", "object")).strip() or "object"
                 focus_key = str(focus_target.get("dedupKey", "")).strip()
-                logger.info(f"🎯 Scroll-only: JS нашел {focus_kind} '{focus_text[:30]}', выполняем hover.")
+                focus_heading = str(focus_target.get("headingText", "")).strip()
+                if focus_heading:
+                    logger.info(
+                        f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}' в секции '{focus_heading[:36]}', выполняем hover."
+                    )
+                else:
+                    logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=50)
+                    await page.mouse.move(focus_x, focus_y, steps=34)
                     cursor_pos = (focus_x, focus_y)
                     await page.wait_for_timeout(hover_pause_ms)
                 except Exception as focus_exc:
@@ -5547,7 +5785,13 @@ async def run_scroll_only_down_pass(
                     else:
                         raise
 
-                await controller_call("resume", {"dedupKey": focus_key})
+                await controller_call(
+                    "resume",
+                    {
+                        "dedupKey": focus_key,
+                        "sectionKey": str(focus_target.get("sectionKey", "")).strip(),
+                    },
+                )
                 logger.info("[INFO] Scroll-only: JS-скролл возобновлен после hover.")
                 await asyncio.sleep(0.1)
                 continue
