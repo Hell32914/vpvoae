@@ -77,6 +77,9 @@ services:
         max-file: "3"
     networks:
       - shared-network
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     healthcheck:
       test: ["CMD", "test", "-d", "/app/output"]
       interval: 30s

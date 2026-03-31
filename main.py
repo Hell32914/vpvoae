@@ -13,6 +13,19 @@ import subprocess
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 
+try:
+    from playwright_stealth import stealth_async as _stealth_async
+    _STEALTH_AVAILABLE = True
+except ImportError:
+    _STEALTH_AVAILABLE = False
+
+# Realistic modern Chrome UA on Windows 11 — masks Playwright automation fingerprint
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 # Конфигурация логирования для продакшена
 logging.basicConfig(
     level=logging.INFO,
@@ -5013,11 +5026,11 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
     const controllerKey = '__vpvoaeHunterSmoothScrollController';
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.32;
-    const focusTopMax = vh * 0.74;
-    const focusCenterY = vh * 0.56;
+    const focusTopMin = vh * 0.50;
+    const focusTopMax = vh * 0.90;
+    const focusCenterY = vh * 0.70;
     const CTA_WORDS = [
-        'get started', 'start free', 'start now', 'free trial', 'trial',
+        'invest', 'get started', 'start free', 'start now', 'free trial', 'trial',
         'book a demo', 'request demo', 'schedule demo', 'contact sales',
         'learn more', 'discover', 'explore', 'pricing', 'book', 'schedule',
         'contact', 'talk', 'demo', 'quote', 'request', 'join', 'subscribe',
@@ -5298,7 +5311,11 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             return null;
         }
 
-        const ctaSelectors = ['button', 'a[href]', '[role="button"]', '[class*="btn"]', '[class*="cta"]', '[class*="action"]', '[data-cta]'];
+        const ctaSelectors = [
+            'button', 'a[href]', '[role="button"]',
+            '[class*="btn"]', '[class*="cta"]', '[class*="action"]',
+            '[data-cta]', '.btn', '.button', '[type="submit"]',
+        ];
         const ctaPool = new Set();
         for (const selector of ctaSelectors) {
             try {
@@ -5315,7 +5332,10 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             if (style.position === 'fixed' || style.position === 'sticky') continue;
             if (hasFixedOrStickyAncestor(el.parentElement)) continue;
             const rect = el.getBoundingClientRect();
-            if (!hasRenderableBox(el, rect, style)) continue;
+            // Relaxed visibility: only require a rendered box (height > 0), skip opacity check
+            if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            if (style.pointerEvents === 'none') continue;
             if (!isInFocusBand(rect)) continue;
             if (rect.width < 72 || rect.height < 26) continue;
 
@@ -5330,6 +5350,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 
             const area = rect.width * rect.height;
             const hasFill = hasVisibleFill(style);
+            if (area < 500) continue;  // ignore tiny icons
             if (area < 2400 && !hasFill) continue;
 
             const sectionEl = findSectionContainer(el);
@@ -5419,8 +5440,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             seenSectionKeys: new Set(),
             rafId: 0,
             pauseUntil: 0,
-            basePxPerFrame: 7.0,
-            slowPxPerFrame: 5.2,
+            basePxPerFrame: 8.0,
+            slowPxPerFrame: 5.6,
             hydrationDistancePx: 2800,
             hydrationPauseMs: 325,
             nextHydrationPauseAt: 0,
@@ -5432,6 +5453,9 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             stagnantDomRounds: 0,
             lastDomHash: -1,
             virtualScrollProgress: 0,
+            lockedTarget: null,
+            lockedElement: null,
+            noContentSinceScrollY: 0,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
@@ -5460,6 +5484,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 isLoading: isPageLoading(),
                 virtualScrollProgress: state.virtualScrollProgress,
                 stagnantDomRounds: state.stagnantDomRounds,
+                noContentSinceScrollY: state.noContentSinceScrollY,
             };
         }
 
@@ -5489,6 +5514,17 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             state.rafId = window.requestAnimationFrame(tick);
         }
 
+        function hasContentHeadingInView() {
+            try {
+                for (const el of document.querySelectorAll('h1,h2')) {
+                    if (!(el instanceof HTMLElement)) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.top >= vh * 0.1 && r.bottom <= vh * 0.95 && r.width > 40 && r.height > 10) return true;
+                }
+            } catch(e) {}
+            return false;
+        }
+
         function scanForLife(timestamp) {
             const currentHeight = getDocumentHeight();
             const currentScrollY = getScrollY();
@@ -5503,6 +5539,11 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             } else {
                 state.stagnantScrollRounds += 1;
             }
+
+            // Content stall: if no CTA/h1-h2 in last 3000px of virtual scroll, finish early
+            const distSinceContent = state.virtualScrollProgress - state.noContentSinceScrollY;
+            const hasHeading = hasContentHeadingInView();
+            // We check findBestTarget below — update noContentSinceScrollY if something found
 
             const currentDomHash = getDomHash();
             if (currentDomHash === state.lastDomHash) {
@@ -5520,18 +5561,23 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.focusMinGapPx,
             );
             if (candidate && candidate.payload) {
-                state.focusTarget = candidate.payload;
-                state.focusElement = candidate.element || null;
-                state.pausedForFocus = true;
-                state.running = false;
-                state.reason = 'focus';
+                state.noContentSinceScrollY = state.virtualScrollProgress;
+                // Don't pause immediately — lock and let tick() centre the element first
+                state.lockedTarget = candidate.payload;
+                state.lockedElement = candidate.element || null;
                 state.lastLifeAt = timestamp;
-                clearFrame();
                 return;
             }
 
-            // Hybrid stagnation: only DOM-change check remains; scrollY-based check removed
-            // because pinned/GSAP sites always have scrollY=0.
+            if (hasHeading) {
+                state.noContentSinceScrollY = state.virtualScrollProgress;
+                state.lastLifeAt = timestamp;
+            } else if (distSinceContent > 12000) {
+                // 12000px of virtual scroll with no CTA or h1/h2 = deep footer zone, stop early
+                finish('bottom');
+                return;
+            }
+
             // Python owns virtual-progress termination via virtualScrollProgress field.
 
             if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= state.stallTimeoutMs) {
@@ -5566,12 +5612,38 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 
             // Virtual odometer: advance virtualScrollProgress and kick GSAP/Lenis/Locomotive every frame
             state.virtualScrollProgress += 7;
+            // Hybrid drive: scrollBy for normal sites + WheelEvent for GSAP/Lenis pinned sites
             try {
-                const _weOpts = { deltaY: 7, bubbles: true, cancelable: true };
+                const _step = state.basePxPerFrame;
+                window.scrollBy(0, _step);
+                const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
                 window.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.documentElement.dispatchEvent(new WheelEvent('wheel', _weOpts));
             } catch(e) {}
+
+            // Target locking: if we have a locked CTA, centre it before pausing
+            if (state.lockedTarget && state.lockedElement instanceof HTMLElement) {
+                const lockedRect = state.lockedElement.getBoundingClientRect();
+                const lockedCenterY = lockedRect.top + lockedRect.height / 2;
+                const targetCenterY = vh / 2;
+                if (
+                    lockedRect.width > 0 && lockedRect.height > 0 &&
+                    lockedCenterY <= targetCenterY + 20
+                ) {
+                    // Element is centred — trigger focus pause
+                    state.focusTarget = state.lockedTarget;
+                    state.focusElement = state.lockedElement;
+                    state.lockedTarget = null;
+                    state.lockedElement = null;
+                    state.pausedForFocus = true;
+                    state.running = false;
+                    state.reason = 'focus';
+                    clearFrame();
+                    return;
+                }
+                // Not yet centred: keep scrolling to pull element into center
+            }
 
             // Native scroll: advance when page supports it
             if (maxScrollY > 2 && currentScrollY < maxScrollY - 2) {
@@ -5615,7 +5687,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.seenKeys = new Set();
                 state.seenSectionKeys = new Set();
                 state.reason = 'running';
-                state.basePxPerFrame = Math.max(5.6, Math.min(9.5, Number(config && config.pxPerFrame) || 7.0));
+                state.basePxPerFrame = Math.max(6.0, Math.min(10.0, Number(config && config.pxPerFrame) || 8.0));
                 const slowdownFactor = Math.max(0.45, Math.min(1.0, Number(config && config.slowdownFactor) || 0.74));
                 state.slowPxPerFrame = Math.max(1.1, Math.min(state.basePxPerFrame, state.basePxPerFrame * slowdownFactor));
                 state.hydrationDistancePx = Math.max(1200, Math.round(Number(config && config.hydrationDistancePx) || 2800));
@@ -5677,6 +5749,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.lastSensorAt = 0;
                 state.lastObservedScrollY = getScrollY();
                 state.lastFocusScrollY = state.lastObservedScrollY;
+                state.lockedTarget = null;
+                state.lockedElement = null;
                 state.stagnantScrollRounds = 0;
                 state.stagnantDomRounds = 0;
                 if (state.slowdownDistancePx > 0 && state.slowPxPerFrame < state.basePxPerFrame) {
@@ -5738,7 +5812,7 @@ async def run_scroll_only_down_pass(
     section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.74), 0.45, 1.0)
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 1), 4))
     base_speed_factor = clamp(scroll_speed_factor if math.isfinite(scroll_speed_factor) else 1.0, 0.80, 2.40)
-    px_per_frame = clamp(7.0 * base_speed_factor, 5.6, 9.5)
+    px_per_frame = clamp(8.0 * base_speed_factor, 6.0, 10.0)
     hydration_distance_px = max(1600, int(viewport_height * 2.4 * clamp(base_speed_factor, 0.9, 1.7)))
     hydration_pause_ms = max(130, min(int(320 / clamp(base_speed_factor, 0.9, 2.0)), 475))
     focus_min_gap_px = max(int(viewport_height * 0.90), int(viewport_height * (0.72 + 0.16 * section_slowdown_rounds)))
@@ -5777,7 +5851,7 @@ async def run_scroll_only_down_pass(
 
     # Принудительный старт: передаём фокус окну через клик
     try:
-        await page.mouse.click(100, 100)
+        await page.mouse.click(50, 50)
         await asyncio.sleep(0.5)
     except Exception:
         pass
@@ -5814,11 +5888,14 @@ async def run_scroll_only_down_pass(
             is_loading = bool(state.get("isLoading", False))
             virtual_progress = int(state.get("virtualScrollProgress", 0))
             stagnant_dom_rounds = int(state.get("stagnantDomRounds", 0))
+            no_content_since = int(state.get("noContentSinceScrollY", 0))
+            dist_since_content = virtual_progress - no_content_since
 
             phase = "finished" if finished else "focus" if paused_for_focus else "hydration" if paused_for_hydration else "scrolling"
             if phase != last_phase or last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) >= 500:
                 logger.info(
                     f"[Scroll-only] phase={phase} | scrollY={current_scroll_y} | virtual={virtual_progress}/{MAX_VIRTUAL_DISTANCE} "
+                    f"| Пробег: {virtual_progress}px | CTA последний раз на {no_content_since}px (дельта {dist_since_content}px) "
                     f"| domStagnant={stagnant_dom_rounds} | bodyHeight={body_scroll_height} | reason={reason}"
                 )
                 last_phase = phase
@@ -5865,9 +5942,9 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=10)
+                    await page.mouse.move(focus_x, focus_y, steps=15)
                     cursor_pos = (focus_x, focus_y)
-                    await page.wait_for_timeout(700)
+                    await page.wait_for_timeout(1000)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
@@ -6957,8 +7034,16 @@ async def _run_preload_mode() -> None:
             context = await browser.new_context(
                 viewport={'width': viewport_width, 'height': viewport_height},
                 device_scale_factor=1,
+                user_agent=_STEALTH_UA,
+                locale='en-US',
+                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
             )
             page = await context.new_page()
+            if _STEALTH_AVAILABLE:
+                try:
+                    await _stealth_async(page)
+                except Exception:
+                    pass
             page_opened_at = time.monotonic()
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=load_timeout)
@@ -7128,7 +7213,10 @@ async def main():
             
             context = await browser.new_context(
                 viewport={'width': viewport_width, 'height': viewport_height},
-                device_scale_factor=1
+                device_scale_factor=1,
+                user_agent=_STEALTH_UA,
+                locale='en-US',
+                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
             )
 
             async def route_main_document(route, request) -> None:
@@ -7248,6 +7336,13 @@ async def main():
 
             page = await context.new_page()
 
+            if _STEALTH_AVAILABLE:
+                try:
+                    await _stealth_async(page)
+                    logger.info("🕵️ playwright-stealth применён, fingerprint замаскирован")
+                except Exception as _se:
+                    logger.warning(f"⚠️ playwright-stealth не удалось применить: {_se}")
+
             if visible_cursor_enabled:
                 try:
                     await page.evaluate("""() => { if (window.__vpvoaeEnsureCursor) window.__vpvoaeEnsureCursor(); }""")
@@ -7257,20 +7352,43 @@ async def main():
             logger.info(f"📄 Открываем целевой сайт: {target_url}")
             # Загружаем до DOM-ready. Глубокий networkidle-check выполняется позже,
             # непосредственно перед стартом FFmpeg.
+
+            # —— Прогрев мыши перед навигацией (обман поведенческого анализа) ——
             try:
-                await page.goto(
-                    target_url,
-                    wait_until="domcontentloaded",
-                    timeout=load_timeout
-                )
+                for _wx, _wy in [
+                    (random.randint(200, 600), random.randint(200, 500)),
+                    (random.randint(700, 1200), random.randint(300, 700)),
+                    (random.randint(400, 900), random.randint(400, 600)),
+                ]:
+                    await page.mouse.move(_wx, _wy, steps=random.randint(6, 12))
+                    await asyncio.sleep(random.uniform(0.05, 0.13))
+            except Exception:
+                pass
+
+            # —— goto с повторными попытками (3 попытки, пауза 5с) ——
+            _goto_ok = False
+            for _attempt in range(1, 4):
+                try:
+                    await page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=load_timeout,
+                    )
+                    _goto_ok = True
+                    break
+                except Exception as _ge:
+                    logger.warning(f"⚠️ goto попытка {_attempt}/3: {_ge}")
+                    if _attempt < 3:
+                        await asyncio.sleep(5)
+            if not _goto_ok:
+                logger.warning("⚠️ Все 3 попытки goto не удались — продолжаем без загрузки..."
+            else:
                 if visible_cursor_enabled:
                     try:
                         await page.evaluate("""() => { if (window.__vpvoaeEnsureCursor) window.__vpvoaeEnsureCursor(); }""")
                     except Exception:
                         pass
                 logger.info("✅ Сайт загружен успешно")
-            except asyncio.TimeoutError:
-                logger.warning(f"⏱️  Таймаут при загрузке ({load_timeout}ms), продолжаем...")
 
             # ── Курсор появляется сразу после загрузки страницы ──
             # Позиционируем его заранее, чтобы он был виден с первых секунд записи.
