@@ -5010,8 +5010,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
     const focusTopMin = vh * 0.30;
-    const focusTopMax = vh * 0.90;
-    const focusCenterY = vh * 0.60;
+    const focusTopMax = vh * 1.00;
+    const focusCenterY = vh * 0.65;
     const CTA_WORDS = [
         'invest', 'get started', 'start free', 'start now', 'free trial', 'trial',
         'book a demo', 'request demo', 'schedule demo', 'contact sales',
@@ -5021,6 +5021,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
         'view', 'projects', 'services', 'send', 'money', 'our work',
         'open an account', 'open account', 'get account', 'create account',
         'send money', 'receive money', 'transfer money',
+        'view case', 'read more', 'case study',
         'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
         'записаться', 'связаться', 'заказать', 'бронировать',
     ];
@@ -5899,8 +5900,8 @@ async def run_scroll_only_down_pass(
         loop_start_time = time.monotonic()
         START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
         wheel_iteration = 0
-        WHEEL_STEP = 15
-        WHEEL_SLEEP = 0.04  # 25 итераций/сек ≈ 375px/сек плавный скролл
+        WHEEL_STEP = 20
+        WHEEL_SLEEP = 0.05  # 20 итераций/сек ≈ 400px/сек плавный скролл
         JS_SCAN_EVERY = 10  # опрашивать JS-радар каждые N итераций
         prev_scroll_y = 0
         stall_counter = 0
@@ -5914,8 +5915,9 @@ async def run_scroll_only_down_pass(
                 logger.warning("[WARN] Scroll-only: превышен общий таймаут.")
                 break
 
-            # Нативный скролл через колёсико мыши
+            # Нативный скролл: мышь в центре + wheel
             try:
+                await page.mouse.move(viewport_width // 2, viewport_height // 2)
                 await page.mouse.wheel(0, WHEEL_STEP)
             except Exception:
                 pass
@@ -5998,7 +6000,7 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 CTA '{focus_text[:30]}', hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=25)
+                    await page.mouse.move(focus_x, focus_y, steps=20)
                     cursor_pos = (focus_x, focus_y)
                     await asyncio.sleep(1.2)
                 except Exception as focus_exc:
@@ -7494,6 +7496,29 @@ async def main():
                     pass
 
             # ── Запуск FFmpeg прямо из Python ────────────────────────────────────
+            # Deep Hydration: ждём появления контента перед записью
+            try:
+                for _hydration_check in range(15):  # макс ~7.5с
+                    _hydrated = await page.evaluate("""() => {
+                        const body = document.body;
+                        if (!body) return false;
+                        const style = window.getComputedStyle(body);
+                        if (parseFloat(style.opacity || '1') < 0.1) return false;
+                        if (document.querySelector('h1') || document.querySelector('img')) return true;
+                        if (body.innerText && body.innerText.trim().length > 50) return true;
+                        return false;
+                    }""")
+                    if _hydrated:
+                        logger.info(f"✅ Deep Hydration: контент обнаружен за {(_hydration_check + 1) * 0.5:.1f}с")
+                        break
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.warning("⚠️ Deep Hydration: контент не обнаружен, продолжаем всё равно")
+            except Exception as _he:
+                logger.warning(f"⚠️ Deep Hydration ошибка: {_he}")
+            logger.info("⏳ Дополнительные 4с на догрузку анимаций...")
+            await asyncio.sleep(4)
+
             logger.info("🎥 Запуск FFmpeg записи...")
             ffmpeg_proc = _spawn_ffmpeg()
             if ffmpeg_proc is None:
