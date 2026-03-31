@@ -5386,6 +5386,22 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             : Date.now();
     }
 
+    function findMainScrollContainer() {
+        // Returns the largest visible child container (for GSAP/Lenis/transform-based scroll sites
+        // where native window.scrollY stays near 0 because body/html is overflow:hidden).
+        let best = null;
+        let bestH = 0;
+        const pool = Array.from(document.body.children)
+            .concat(Array.from(document.body.children).flatMap(c => Array.from(c.children)));
+        for (const el of pool) {
+            if (!(el instanceof HTMLElement)) continue;
+            const h = Math.max(el.scrollHeight || 0, el.offsetHeight || 0);
+            if (h < vh * 1.5) continue;
+            if (h > bestH) { bestH = h; best = el; }
+        }
+        return best;
+    }
+
     function createController() {
         const state = {
             running: false,
@@ -5407,6 +5423,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             slowdownDistancePx: 0,
             slowUntilScrollY: 0,
             lastFocusScrollY: -100000,
+            noProgressFrames: 0,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
@@ -5492,6 +5509,15 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             }
 
             if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= state.stallTimeoutMs) {
+                // Before declaring idle, check if a container's bottom is in view
+                const container = findMainScrollContainer();
+                if (container) {
+                    const rect = container.getBoundingClientRect();
+                    if (rect.bottom <= window.innerHeight + 10) {
+                        finish('bottom');
+                        return;
+                    }
+                }
                 finish('idle');
             }
         }
@@ -5520,7 +5546,25 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             const currentScrollY = getScrollY();
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
-            if (maxScrollY <= 2 || currentScrollY >= (maxScrollY - 2)) {
+
+            if (maxScrollY <= 2) {
+                // Native scroll exhausted — check for GSAP/Lenis transform container
+                const container = findMainScrollContainer();
+                if (container) {
+                    const rect = container.getBoundingClientRect();
+                    if (rect.bottom <= window.innerHeight + 10) {
+                        finish('bottom');
+                        return;
+                    }
+                    // Container still scrolling via transform — keep polling
+                    schedule();
+                    return;
+                }
+                finish('bottom');
+                return;
+            }
+
+            if (currentScrollY >= (maxScrollY - 2)) {
                 finish('bottom');
                 return;
             }
@@ -5530,6 +5574,28 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 : state.basePxPerFrame;
             const nextScrollY = Math.min(maxScrollY, currentScrollY + pxPerFrame);
             window.scrollTo(0, nextScrollY);
+
+            // Detect when window.scrollTo is overridden by GSAP/Lenis (page doesn't actually move)
+            const actualScrollY = getScrollY();
+            if (actualScrollY < currentScrollY + 1 && nextScrollY > currentScrollY + 1) {
+                state.noProgressFrames += 1;
+                if (state.noProgressFrames >= 30) {
+                    const container = findMainScrollContainer();
+                    if (container) {
+                        const rect = container.getBoundingClientRect();
+                        if (rect.bottom <= window.innerHeight + 10) {
+                            finish('bottom');
+                            return;
+                        }
+                    }
+                    if (state.noProgressFrames >= 60) {
+                        finish('bottom');
+                        return;
+                    }
+                }
+            } else {
+                state.noProgressFrames = 0;
+            }
 
             if (nextScrollY >= (maxScrollY - 2)) {
                 window.scrollTo(0, maxScrollY);
@@ -5575,6 +5641,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.startedAt = timestamp;
                 state.lastScrollHeight = getDocumentHeight();
                 state.lastObservedScrollY = getScrollY();
+                state.noProgressFrames = 0;
                 state.stallTimeoutMs = Math.max(2200, Math.round(Number(config && config.stallTimeoutMs) || 5000));
                 state.nextHydrationPauseAt = getScrollY() + state.hydrationDistancePx;
                 schedule();
@@ -5713,6 +5780,13 @@ async def run_scroll_only_down_pass(
                 raise
         return result if isinstance(result, dict) else {}
 
+    # "Разморозка" страницы перед стартом скролла
+    try:
+        await page.mouse.move(100, 100)
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
     try:
         await controller_call("start", scroll_config)
         controller_started = True
@@ -5776,9 +5850,9 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=17)
+                    await page.mouse.move(focus_x, focus_y, steps=30)
                     cursor_pos = (focus_x, focus_y)
-                    await page.wait_for_timeout(hover_pause_ms)
+                    await page.wait_for_timeout(1100)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
