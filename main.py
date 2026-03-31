@@ -3227,23 +3227,58 @@ async def run_strict_top_to_bottom_pass(
         pass
 
     # ── Pre-scroll для прогрева lazy-load контента ──
-    # Быстро прокручиваем страницу вниз/вверх программно (без курсора),
-    # чтобы все ленивые изображения, видео и анимации загрузились до начала записи.
+    # Прокручиваем страницу вниз/вверх с mouse.wheel() (работает и на Lenis/GSAP),
+    # затем форсируем загрузку всех lazy- изображений и видео.
     logger.info("🔄 Pre-scroll: прогреваем lazy-load контент...")
     try:
-        _prescroll_steps = 8
+        # Определяем высоту документа для расчёта количества шагов
+        _doc_height = await page.evaluate("""() => {
+            return Math.max(
+                document.documentElement.scrollHeight || 0,
+                document.body.scrollHeight || 0,
+                document.documentElement.offsetHeight || 0
+            );
+        }""")
+        _vh = await page.evaluate("() => window.innerHeight || 800")
+        # Покрываем весь документ: шагами по ~0.8vh
+        _prescroll_step_px = int(_vh * 0.8)
+        _prescroll_steps = max(10, min(60, (_doc_height // _prescroll_step_px) + 2))
+        logger.info(f"🔄 Pre-scroll: docHeight={_doc_height}, vh={_vh}, steps={_prescroll_steps}")
+        # mouse.wheel() — работает на Lenis/GSAP/кастомных контейнерах
         for _ps_i in range(_prescroll_steps):
-            await page.evaluate(
-                """(step) => {
-                    const vh = window.innerHeight || 800;
-                    window.scrollBy({ top: vh * 0.85, left: 0, behavior: 'auto' });
-                }""",
-                _ps_i,
-            )
-            await page.wait_for_timeout(random.randint(75, 150))
-        # Возвращаемся наверх
-        await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
-        await page.wait_for_timeout(random.randint(100, 200))
+            try:
+                await page.mouse.wheel(0, _prescroll_step_px)
+            except Exception:
+                break
+            await page.wait_for_timeout(random.randint(60, 120))
+        # Ждём подгрузку ленивого контента
+        await page.wait_for_timeout(800)
+        # Возвращаемся наверх — пробуем все способы
+        try:
+            await page.evaluate("""() => {
+                window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+                document.documentElement.scrollTop = 0;
+                document.body.scrollTop = 0;
+                const containers = document.querySelectorAll(
+                    '[data-scroll-container], .lenis, .lenis-root, .smooth-scroll, .scroll-container, main'
+                );
+                for (const el of containers) {
+                    if (el instanceof HTMLElement) {
+                        el.scrollTop = 0;
+                        try { el.scrollTo({ top: 0, behavior: 'auto' }); } catch {}
+                    }
+                }
+            }""")
+        except Exception:
+            pass
+        # Отправляем wheel вверх чтобы Lenis тоже вернулся
+        for _ in range(min(20, _prescroll_steps)):
+            try:
+                await page.mouse.wheel(0, -_prescroll_step_px)
+            except Exception:
+                break
+            await page.wait_for_timeout(30)
+        await page.wait_for_timeout(random.randint(200, 400))
         logger.info("✅ Pre-scroll завершён")
     except Exception as _prescroll_exc:
         logger.warning(f"⚠️ Pre-scroll ошибка: {_prescroll_exc}")
@@ -3251,6 +3286,76 @@ async def run_strict_top_to_bottom_pass(
             await page.evaluate("""() => window.scrollTo({ top: 0, left: 0, behavior: 'auto' })""")
         except Exception:
             pass
+
+    # ── Форсированная загрузка lazy-контента ──
+    # Переключаем loading="lazy" → "eager", data-src → src, preload видео.
+    try:
+        _forced_count = await page.evaluate("""() => {
+            let count = 0;
+            // Форсируем lazy images
+            for (const img of document.querySelectorAll('img')) {
+                if (img.loading === 'lazy') {
+                    img.loading = 'eager';
+                    count++;
+                }
+                // data-src / data-lazy-src паттерны
+                const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src')
+                    || img.getAttribute('data-original');
+                if (dataSrc && !img.src) {
+                    img.src = dataSrc;
+                    count++;
+                }
+                // srcset
+                const dataSrcset = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
+                if (dataSrcset && !img.srcset) {
+                    img.srcset = dataSrcset;
+                    count++;
+                }
+            }
+            // Форсируем lazy <source> в <picture>
+            for (const source of document.querySelectorAll('picture source')) {
+                const dataSrcset = source.getAttribute('data-srcset');
+                if (dataSrcset && !source.srcset) {
+                    source.srcset = dataSrcset;
+                    count++;
+                }
+            }
+            // Форсируем видео
+            for (const video of document.querySelectorAll('video')) {
+                if (video.preload !== 'auto') {
+                    video.preload = 'auto';
+                }
+                // data-src на video
+                const dataSrc = video.getAttribute('data-src');
+                if (dataSrc && !video.src) {
+                    video.src = dataSrc;
+                    count++;
+                }
+                // data-src на <source> внутри видео
+                for (const source of video.querySelectorAll('source')) {
+                    const sd = source.getAttribute('data-src');
+                    if (sd && !source.src) {
+                        source.src = sd;
+                        count++;
+                    }
+                }
+                try { video.load(); } catch {}
+            }
+            // Форсируем background-image из data-атрибутов
+            for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
+                const bg = el.getAttribute('data-bg') || el.getAttribute('data-background');
+                if (bg && el instanceof HTMLElement && !el.style.backgroundImage) {
+                    el.style.backgroundImage = 'url(' + bg + ')';
+                    count++;
+                }
+            }
+            return count;
+        }""")
+        if _forced_count > 0:
+            logger.info(f"🖼️ Lazy-load forcer: принудительно загружено {_forced_count} медиа-элементов")
+            await page.wait_for_timeout(1500)  # Даём время на загрузку
+    except Exception as _lazy_exc:
+        logger.warning(f"⚠️ Lazy-load forcer ошибка: {_lazy_exc}")
 
     # ── CSS pre-scan: строим полную карту hover/pointer элементов до начала движения ──
     # Это позволяет курсору знать заранее куда двигаться, не теряя время на «разведку».
@@ -7152,6 +7257,7 @@ async def _run_preload_mode() -> None:
                 '--disable-frame-rate-limit',
                 '--force-color-profile=srgb',
                 '--disable-features=IsolateOrigins,site-per-process',
+                '--autoplay-policy=no-user-gesture-required',
             ]
             if browser_performance_mode:
                 browser_args.extend([
@@ -7318,6 +7424,7 @@ async def main():
                 '--disable-frame-rate-limit',
                 '--force-color-profile=srgb',
                 '--disable-features=IsolateOrigins,site-per-process',
+                '--autoplay-policy=no-user-gesture-required',
             ]
 
             if browser_performance_mode:
@@ -7558,6 +7665,86 @@ async def main():
                 pass
             logger.info("⏳ Прогрев страницы: 30 секунд после пробуждения скриптов...")
             await page.wait_for_timeout(30000)
+
+            # ── Pre-scroll для загрузки lazy-контента (mouse.wheel → работает на Lenis/GSAP) ──
+            logger.info("🔄 Pre-scroll: прогреваем lazy-load контент перед записью...")
+            try:
+                _doc_h = await page.evaluate("""() => Math.max(
+                    document.documentElement.scrollHeight || 0,
+                    document.body.scrollHeight || 0
+                )""")
+                _vh_pre = await page.evaluate("() => window.innerHeight || 800")
+                _step_px = int(_vh_pre * 0.8)
+                _n_steps = max(10, min(60, (_doc_h // _step_px) + 2))
+                for _ in range(_n_steps):
+                    try:
+                        await page.mouse.wheel(0, _step_px)
+                    except Exception:
+                        break
+                    await page.wait_for_timeout(random.randint(50, 100))
+                await page.wait_for_timeout(800)
+                # Возвращаемся наверх
+                try:
+                    await page.evaluate("""() => {
+                        window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+                        document.documentElement.scrollTop = 0;
+                        document.body.scrollTop = 0;
+                        for (const el of document.querySelectorAll(
+                            '[data-scroll-container], .lenis, .lenis-root, .smooth-scroll, main'
+                        )) { if (el instanceof HTMLElement) { el.scrollTop = 0; } }
+                    }""")
+                except Exception:
+                    pass
+                for _ in range(min(20, _n_steps)):
+                    try:
+                        await page.mouse.wheel(0, -_step_px)
+                    except Exception:
+                        break
+                    await page.wait_for_timeout(25)
+                await page.wait_for_timeout(300)
+                logger.info(f"✅ Pre-scroll: {_n_steps} шагов завершено, docHeight={_doc_h}")
+            except Exception as _ps_e:
+                logger.warning(f"⚠️ Pre-scroll ошибка: {_ps_e}")
+
+            # ── Форсированная загрузка lazy-контента ──
+            try:
+                _forced = await page.evaluate("""() => {
+                    let c = 0;
+                    for (const img of document.querySelectorAll('img')) {
+                        if (img.loading === 'lazy') { img.loading = 'eager'; c++; }
+                        const ds = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
+                        if (ds && !img.src) { img.src = ds; c++; }
+                        const dss = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
+                        if (dss && !img.srcset) { img.srcset = dss; c++; }
+                    }
+                    for (const s of document.querySelectorAll('picture source')) {
+                        const dss = s.getAttribute('data-srcset');
+                        if (dss && !s.srcset) { s.srcset = dss; c++; }
+                    }
+                    for (const v of document.querySelectorAll('video')) {
+                        if (v.preload !== 'auto') v.preload = 'auto';
+                        const ds = v.getAttribute('data-src');
+                        if (ds && !v.src) { v.src = ds; c++; }
+                        for (const s of v.querySelectorAll('source')) {
+                            const sd = s.getAttribute('data-src');
+                            if (sd && !s.src) { s.src = sd; c++; }
+                        }
+                        try { v.load(); } catch {}
+                    }
+                    for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
+                        const bg = el.getAttribute('data-bg') || el.getAttribute('data-background');
+                        if (bg && el instanceof HTMLElement && !el.style.backgroundImage) {
+                            el.style.backgroundImage = 'url(' + bg + ')';
+                            c++;
+                        }
+                    }
+                    return c;
+                }""")
+                if _forced > 0:
+                    logger.info(f"🖼️ Lazy-load forcer: {_forced} медиа-элементов принудительно загружено")
+                    await page.wait_for_timeout(2000)
+            except Exception as _lf_e:
+                logger.warning(f"⚠️ Lazy-load forcer: {_lf_e}")
 
             if visible_cursor_enabled:
                 try:
