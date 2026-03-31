@@ -3288,37 +3288,43 @@ async def run_strict_top_to_bottom_pass(
             pass
 
     # ── Форсированная загрузка lazy-контента ──
-    # Переключаем loading="lazy" → "eager", data-src → src, preload видео.
+    # Chromium не переоценивает loading="lazy" после изменения атрибута через JS.
+    # Единственный надёжный способ — удалить элемент из DOM и вставить обратно
+    # без lazy-атрибута, что заставляет браузер обработать его как новый.
     try:
         _forced_count = await page.evaluate("""() => {
             let count = 0;
-            // Форсируем lazy images
+
+            // ── Изображения ──
+            const lazyImgs = Array.from(document.querySelectorAll('img[loading="lazy"]'));
+            for (const img of lazyImgs) {
+                const parent = img.parentNode;
+                if (!parent) continue;
+                const ref = img.nextSibling;
+                img.removeAttribute('loading');
+                // Удаляем из DOM и вставляем обратно — браузер пересканирует элемент
+                parent.removeChild(img);
+                parent.insertBefore(img, ref);
+                count++;
+            }
+
+            // data-src / data-lazy-src / data-original → src
             for (const img of document.querySelectorAll('img')) {
-                if (img.loading === 'lazy') {
-                    img.loading = 'eager';
-                    // Перезапускаем загрузку: простое изменение loading не триггерит повторный fetch
-                    if (img.src && !img.complete) {
-                        const origSrc = img.src;
-                        img.src = '';
-                        img.src = origSrc;
-                    }
-                    count++;
-                }
-                // data-src / data-lazy-src паттерны
                 const dataSrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src')
                     || img.getAttribute('data-original');
-                if (dataSrc && !img.src) {
+                if (dataSrc && (!img.src || img.src === window.location.href)) {
+                    img.removeAttribute('loading');
                     img.src = dataSrc;
                     count++;
                 }
-                // srcset
                 const dataSrcset = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
                 if (dataSrcset && !img.srcset) {
                     img.srcset = dataSrcset;
                     count++;
                 }
             }
-            // Форсируем lazy <source> в <picture>
+
+            // ── <picture> <source> ──
             for (const source of document.querySelectorAll('picture source')) {
                 const dataSrcset = source.getAttribute('data-srcset');
                 if (dataSrcset && !source.srcset) {
@@ -3326,18 +3332,18 @@ async def run_strict_top_to_bottom_pass(
                     count++;
                 }
             }
-            // Форсируем видео
+
+            // ── Видео ──
             for (const video of document.querySelectorAll('video')) {
-                if (video.preload !== 'auto') {
-                    video.preload = 'auto';
-                }
-                // data-src на video
+                // Форсируем preload
+                video.preload = 'auto';
+
+                // data-src на video и source
                 const dataSrc = video.getAttribute('data-src');
                 if (dataSrc && !video.src) {
                     video.src = dataSrc;
                     count++;
                 }
-                // data-src на <source> внутри видео
                 for (const source of video.querySelectorAll('source')) {
                     const sd = source.getAttribute('data-src');
                     if (sd && !source.src) {
@@ -3346,15 +3352,17 @@ async def run_strict_top_to_bottom_pass(
                     }
                 }
                 try { video.load(); } catch {}
-                // Автозапуск muted видео (muted autoplay разрешён браузером)
-                if (video.muted || !video.getAttribute('src')) {
+
+                // Автозапуск muted видео
+                if (video.muted || video.hasAttribute('muted')) {
                     video.muted = true;
                     video.autoplay = true;
                     try { video.play(); } catch {}
                     count++;
                 }
             }
-            // Форсируем background-image из data-атрибутов
+
+            // ── background-image из data-атрибутов ──
             for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
                 const bg = el.getAttribute('data-bg') || el.getAttribute('data-background');
                 if (bg && el instanceof HTMLElement && !el.style.backgroundImage) {
@@ -3366,7 +3374,7 @@ async def run_strict_top_to_bottom_pass(
         }""")
         if _forced_count > 0:
             logger.info(f"🖼️ Lazy-load forcer: принудительно загружено {_forced_count} медиа-элементов")
-            await page.wait_for_timeout(1500)  # Даём время на загрузку
+            await page.wait_for_timeout(2500)  # Даём время на загрузку
     except Exception as _lazy_exc:
         logger.warning(f"⚠️ Lazy-load forcer ошибка: {_lazy_exc}")
 
@@ -6085,6 +6093,7 @@ async def run_scroll_only_down_pass(
         WHEEL_DELTA = 18  # px — маленькая дельта каждый кадр видео = плавное движение
         WHEEL_INTERVAL_MS = 33  # ~30 Hz — каждый кадр 30fps видео получает своё событие
         JS_SCAN_EVERY = 30  # опрашивать JS-радар каждые ~1с (30 × 33ms)
+        LAZY_FORCE_EVERY = 150  # форсировать lazy-load каждые ~5с (150 × 33ms)
         prev_scroll_y = 0
         stall_counter = 0
 
@@ -6104,6 +6113,30 @@ async def run_scroll_only_down_pass(
                 pass
             await page.wait_for_timeout(WHEEL_INTERVAL_MS)
             wheel_iteration += 1
+
+            # Периодически форсируем lazy-load для новых элементов, попавших в viewport
+            if wheel_iteration % LAZY_FORCE_EVERY == 0:
+                try:
+                    await page.evaluate("""() => {
+                        const imgs = Array.from(document.querySelectorAll('img[loading="lazy"]'));
+                        for (const img of imgs) {
+                            const p = img.parentNode;
+                            if (!p) continue;
+                            const ref = img.nextSibling;
+                            img.removeAttribute('loading');
+                            p.removeChild(img);
+                            p.insertBefore(img, ref);
+                        }
+                        for (const v of document.querySelectorAll('video')) {
+                            if (v.preload !== 'auto') v.preload = 'auto';
+                            if ((v.muted || v.hasAttribute('muted')) && v.paused) {
+                                v.muted = true;
+                                try { v.play(); } catch {}
+                            }
+                        }
+                    }""")
+                except Exception:
+                    pass
 
             # Опрашиваем JS-радар каждые JS_SCAN_EVERY итераций (~0.75с)
             if wheel_iteration % JS_SCAN_EVERY != 0:
@@ -7682,6 +7715,8 @@ async def main():
             # ── Pre-scroll для загрузки lazy-контента (mouse.wheel → работает на Lenis/GSAP) ──
             logger.info("🔄 Pre-scroll: прогреваем lazy-load контент перед записью...")
             try:
+                # Позиционируем мышь в центр для надёжных wheel-событий
+                await page.mouse.move(viewport_width // 2, viewport_height // 2)
                 _doc_h = await page.evaluate("""() => Math.max(
                     document.documentElement.scrollHeight || 0,
                     document.body.scrollHeight || 0
@@ -7723,27 +7758,40 @@ async def main():
             try:
                 _forced = await page.evaluate("""() => {
                     let c = 0;
+
+                    // Lazy images: удаляем из DOM и вставляем обратно без loading="lazy"
+                    const lazyImgs = Array.from(document.querySelectorAll('img[loading="lazy"]'));
+                    for (const img of lazyImgs) {
+                        const parent = img.parentNode;
+                        if (!parent) continue;
+                        const ref = img.nextSibling;
+                        img.removeAttribute('loading');
+                        parent.removeChild(img);
+                        parent.insertBefore(img, ref);
+                        c++;
+                    }
+
+                    // data-src → src
                     for (const img of document.querySelectorAll('img')) {
-                        if (img.loading === 'lazy') {
-                            img.loading = 'eager';
-                            if (img.src && !img.complete) {
-                                const s = img.src;
-                                img.src = '';
-                                img.src = s;
-                            }
+                        const ds = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
+                        if (ds && (!img.src || img.src === window.location.href)) {
+                            img.removeAttribute('loading');
+                            img.src = ds;
                             c++;
                         }
-                        const ds = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
-                        if (ds && !img.src) { img.src = ds; c++; }
                         const dss = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
                         if (dss && !img.srcset) { img.srcset = dss; c++; }
                     }
+
+                    // <picture> <source>
                     for (const s of document.querySelectorAll('picture source')) {
                         const dss = s.getAttribute('data-srcset');
                         if (dss && !s.srcset) { s.srcset = dss; c++; }
                     }
+
+                    // Видео
                     for (const v of document.querySelectorAll('video')) {
-                        if (v.preload !== 'auto') v.preload = 'auto';
+                        v.preload = 'auto';
                         const ds = v.getAttribute('data-src');
                         if (ds && !v.src) { v.src = ds; c++; }
                         for (const s of v.querySelectorAll('source')) {
@@ -7751,13 +7799,15 @@ async def main():
                             if (sd && !s.src) { s.src = sd; c++; }
                         }
                         try { v.load(); } catch {}
-                        if (v.muted || !v.getAttribute('src')) {
+                        if (v.muted || v.hasAttribute('muted')) {
                             v.muted = true;
                             v.autoplay = true;
                             try { v.play(); } catch {}
                             c++;
                         }
                     }
+
+                    // background-image из data-атрибутов
                     for (const el of document.querySelectorAll('[data-bg], [data-background]')) {
                         const bg = el.getAttribute('data-bg') || el.getAttribute('data-background');
                         if (bg && el instanceof HTMLElement && !el.style.backgroundImage) {
