@@ -5883,7 +5883,9 @@ async def run_scroll_only_down_pass(
     # Принудительный фокус: клик по центру страницы для передачи фокуса
     try:
         await page.mouse.click(viewport_width // 2, viewport_height // 2)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
+        # Оставляем мышь в центре — wheel будет идти отсюда
+        await page.mouse.move(viewport_width // 2, viewport_height // 2)
     except Exception:
         pass
 
@@ -5900,8 +5902,8 @@ async def run_scroll_only_down_pass(
         loop_start_time = time.monotonic()
         START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
         wheel_iteration = 0
-        WHEEL_STEP = 20
-        WHEEL_SLEEP = 0.05  # 20 итераций/сек ≈ 400px/сек плавный скролл
+        WHEEL_STEP = 12
+        WHEEL_SLEEP = 0.033  # ~30 итераций/сек ≈ 360px/сек плавный скролл без фризов
         JS_SCAN_EVERY = 10  # опрашивать JS-радар каждые N итераций
         prev_scroll_y = 0
         stall_counter = 0
@@ -5915,9 +5917,8 @@ async def run_scroll_only_down_pass(
                 logger.warning("[WARN] Scroll-only: превышен общий таймаут.")
                 break
 
-            # Нативный скролл: мышь в центре + wheel
+            # Нативный скролл через колёсико мыши (мышь уже в центре)
             try:
-                await page.mouse.move(viewport_width // 2, viewport_height // 2)
                 await page.mouse.wheel(0, WHEEL_STEP)
             except Exception:
                 pass
@@ -7498,7 +7499,7 @@ async def main():
             # ── Запуск FFmpeg прямо из Python ────────────────────────────────────
             # Deep Hydration: ждём появления контента перед записью
             try:
-                for _hydration_check in range(15):  # макс ~7.5с
+                for _hydration_check in range(8):  # макс ~4с
                     _hydrated = await page.evaluate("""() => {
                         const body = document.body;
                         if (!body) return false;
@@ -7516,8 +7517,7 @@ async def main():
                     logger.warning("⚠️ Deep Hydration: контент не обнаружен, продолжаем всё равно")
             except Exception as _he:
                 logger.warning(f"⚠️ Deep Hydration ошибка: {_he}")
-            logger.info("⏳ Дополнительные 4с на догрузку анимаций...")
-            await asyncio.sleep(4)
+            await asyncio.sleep(1)
 
             logger.info("🎥 Запуск FFmpeg записи...")
             ffmpeg_proc = _spawn_ffmpeg()
