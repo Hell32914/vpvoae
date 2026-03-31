@@ -5,6 +5,7 @@ import sys
 import logging
 import math
 import random
+import re
 import signal
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -7509,10 +7510,30 @@ async def main():
                     is_navigation = bool(request.is_navigation_request()) and request.resource_type == "document"
                     frame = request.frame
                     is_top_level = getattr(frame, "parent_frame", None) is None
-                    if is_navigation and is_top_level and not is_same_site_url(request.url, target_url):
-                        logger.warning(f"⛔ Site guard: блокируем внешний top-level переход {request.url}")
-                        await route.abort()
-                        return
+
+                    if is_navigation and is_top_level:
+                        if not is_same_site_url(request.url, target_url):
+                            logger.warning(f"⛔ Site guard: блокируем внешний top-level переход {request.url}")
+                            await route.abort()
+                            return
+
+                        # Перехватываем HTML-ответ и удаляем loading="lazy" / preload="none"
+                        # до того, как браузер начнёт парсить — единственный надёжный способ
+                        # загрузить все изображения на сайтах с transform-scroll (Lenis/GSAP).
+                        try:
+                            response = await route.fetch()
+                            content_type = (response.headers.get("content-type") or "").lower()
+                            if "text/html" in content_type:
+                                body = (await response.body()).decode("utf-8", errors="replace")
+                                body = re.sub(r'\s+loading\s*=\s*["\']lazy["\']', '', body, flags=re.IGNORECASE)
+                                # preload="none" → preload="auto" на видео
+                                body = body.replace('preload="none"', 'preload="auto"')
+                                body = body.replace("preload='none'", "preload='auto'")
+                                await route.fulfill(response=response, body=body)
+                                logger.info(f"🖼️ HTML interceptor: loading=lazy и preload=none удалены из {request.url[:80]}")
+                                return
+                        except Exception as _intercept_exc:
+                            logger.warning(f"⚠️ HTML interceptor ошибка: {_intercept_exc}")
                 except Exception:
                     pass
                 await route.continue_()
