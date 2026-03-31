@@ -7381,7 +7381,7 @@ async def main():
                     if _attempt < 3:
                         await asyncio.sleep(5)
             if not _goto_ok:
-                logger.warning("⚠️ Все 3 попытки goto не удались — продолжаем без загрузки..."
+                logger.warning("⚠️ Все 3 попытки goto не удались — продолжаем без загрузки...")
             else:
                 if visible_cursor_enabled:
                     try:
