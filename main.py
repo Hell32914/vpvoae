@@ -5020,6 +5020,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
         'sign up', 'apply', 'buy', 'shop', 'download', 'try', 'order',
         'view', 'projects', 'services', 'send', 'money', 'our work',
         'open an account', 'open account', 'get account', 'create account',
+        'send money', 'receive money', 'transfer money',
         'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
         'записаться', 'связаться', 'заказать', 'бронировать',
     ];
@@ -5639,12 +5640,17 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             }
         }
 
+        // tick() is now a pure CTA radar — Python drives actual scrolling via mouse.wheel
         function tick(timestamp) {
             state.rafId = 0;
             if (!state.running || state.finished || state.pausedForFocus) {
                 return;
             }
 
+            // Advance virtual odometer (Python sends wheel events, we just track)
+            state.virtualScrollProgress += 6;
+
+            // Run CTA sensor every second
             if (!state.lastSensorAt || (timestamp - state.lastSensorAt) >= 1000) {
                 state.lastSensorAt = timestamp;
                 scanForLife(timestamp);
@@ -5653,49 +5659,15 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 }
             }
 
-            if (state.pauseUntil > timestamp) {
-                state.pausedForHydration = true;
-                schedule();
-                return;
-            }
-
-            state.pausedForHydration = false;
-            const currentScrollY = getScrollY();
-            const bodyScrollHeight = getDocumentHeight();
-            const maxScrollY = Math.max(0, bodyScrollHeight - vh);
-
-            // Virtual odometer: advance virtualScrollProgress every frame
-            state.virtualScrollProgress += 6;
-            // Universal scroll: try window, html, body, detected container, and SPA wrappers
-            try {
-                const _step = 6;
-                window.scrollBy(0, _step);
-                document.documentElement.scrollTop += _step;
-                document.body.scrollTop += _step;
-                const _scrollContainer = findScrollContainer();
-                if (_scrollContainer) {
-                    _scrollContainer.scrollTop += _step;
-                }
-                const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
-                window.dispatchEvent(new WheelEvent('wheel', _weOpts));
-                document.dispatchEvent(new WheelEvent('wheel', _weOpts));
-                document.documentElement.dispatchEvent(new WheelEvent('wheel', _weOpts));
-                if (_scrollContainer) {
-                    _scrollContainer.dispatchEvent(new WheelEvent('wheel', _weOpts));
-                }
-            } catch(e) {}
-
-            // Target locking: if we have a locked CTA, centre it before pausing
+            // Target locking: if we have a locked CTA, check if it reached center
             if (state.lockedTarget && state.lockedElement instanceof HTMLElement) {
                 state.lockedFrames = (state.lockedFrames || 0) + 1;
                 const lockedRect = state.lockedElement.getBoundingClientRect();
-                // Centering criterion: button top edge lands in 38%–65% band of viewport
                 const topRatio = lockedRect.top / vh;
                 if (
                     lockedRect.width > 0 && lockedRect.height > 0 &&
-                    topRatio >= 0.38 && topRatio <= 0.65
+                    topRatio >= 0.30 && topRatio <= 0.65
                 ) {
-                    // Element is centred — trigger focus pause
                     state.focusTarget = state.lockedTarget;
                     state.focusElement = state.lockedElement;
                     state.lockedTarget = null;
@@ -5707,48 +5679,26 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                     clearFrame();
                     return;
                 }
-                // Give up centering if element hasn't moved into band within ~120 frames (~2s)
-                if (state.lockedFrames > 120) {
+                if (state.lockedFrames > 180) {
                     state.lockedTarget = null;
                     state.lockedElement = null;
                     state.lockedFrames = 0;
                 }
-                // Not yet centred: keep scrolling to pull element into center
             }
 
-            // Native scroll: advance when page supports it
-            if (maxScrollY > 2 && currentScrollY < maxScrollY - 2) {
-                const pxPerFrame = currentScrollY < state.slowUntilScrollY
-                    ? state.slowPxPerFrame
-                    : state.basePxPerFrame;
-                const nextScrollY = Math.min(maxScrollY, currentScrollY + pxPerFrame);
-                window.scrollTo(0, nextScrollY);
-
-                if (nextScrollY >= (maxScrollY - 2)) {
-                    // Reached apparent bottom — start grace timer for lazy-load
-                    if (!state.atBottomSince) state.atBottomSince = timestamp;
-                    if (timestamp - state.atBottomSince >= 3000) {
-                        window.scrollTo(0, maxScrollY);
-                        finish('bottom');
-                        return;
-                    }
-                }
-
-                if (nextScrollY >= state.nextHydrationPauseAt) {
-                    state.pauseUntil = timestamp + state.hydrationPauseMs;
-                    state.pausedForHydration = true;
-                    state.nextHydrationPauseAt = nextScrollY + state.hydrationDistancePx;
-                }
-            } else if (maxScrollY > 2 && currentScrollY >= maxScrollY - 2) {
-                // At bottom — start grace timer for lazy-load
+            // Check for bottom (native scroll sites only)
+            const currentScrollY = getScrollY();
+            const bodyScrollHeight = getDocumentHeight();
+            const maxScrollY = Math.max(0, bodyScrollHeight - vh);
+            if (maxScrollY > 2 && currentScrollY >= maxScrollY - 2) {
                 if (!state.atBottomSince) state.atBottomSince = timestamp;
                 if (timestamp - state.atBottomSince >= 3000) {
                     finish('bottom');
                     return;
                 }
+            } else {
+                state.atBottomSince = 0;
             }
-            // else: maxScrollY <= 2 (pinned/GSAP) — WheelEvents drive animation;
-            // stagnation detector in scanForLife() decides when to finish.
 
             schedule();
         }
@@ -5929,9 +5879,9 @@ async def run_scroll_only_down_pass(
                 raise
         return result if isinstance(result, dict) else {}
 
-    # Принудительный старт: передаём фокус окну через клик
+    # Принудительный фокус: клик по центру страницы для передачи фокуса
     try:
-        await page.mouse.click(50, 50)
+        await page.mouse.click(viewport_width // 2, viewport_height // 2)
         await asyncio.sleep(0.5)
     except Exception:
         pass
@@ -5940,22 +5890,41 @@ async def run_scroll_only_down_pass(
         await controller_call("start", scroll_config)
         controller_started = True
         logger.info(
-            "[INFO] Scroll-only: startSmoothScroll() запущен "
-            f"(requestAnimationFrame, {px_per_frame:.2f}px/frame, hydration pause {hydration_pause_ms}ms "
-            f"every {hydration_distance_px}px, focus gap {focus_min_gap_px}px, slowdown x{section_slowdown_factor:.2f} "
-            f"for {slowdown_distance_px}px)."
+            f"[INFO] Scroll-only: Native Wheel Engine запущен (mouse.wheel driven, JS radar only)."
         )
 
         last_logged_scroll_y: Optional[int] = None
         last_phase = ""
         MAX_VIRTUAL_DISTANCE = 15_000
         loop_start_time = time.monotonic()
-        START_IMMUNITY_SEC = 15.0  # ignore stagnation for the first N seconds
+        START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
+        wheel_iteration = 0
+        WHEEL_STEP = 15
+        WHEEL_SLEEP = 0.04  # 25 итераций/сек ≈ 375px/сек плавный скролл
+        JS_SCAN_EVERY = 10  # опрашивать JS-радар каждые N итераций
+        prev_scroll_y = 0
+        stall_counter = 0
 
         while True:
-            if time.monotonic() >= hard_deadline:
-                logger.warning("[WARN] Scroll-only: превышен общий таймаут автономного JS-скролла.")
+            now = time.monotonic()
+            _elapsed = now - loop_start_time
+            is_immune = _elapsed < START_IMMUNITY_SEC
+
+            if now >= hard_deadline:
+                logger.warning("[WARN] Scroll-only: превышен общий таймаут.")
                 break
+
+            # Нативный скролл через колёсико мыши
+            try:
+                await page.mouse.wheel(0, WHEEL_STEP)
+            except Exception:
+                pass
+            await asyncio.sleep(WHEEL_SLEEP)
+            wheel_iteration += 1
+
+            # Опрашиваем JS-радар каждые JS_SCAN_EVERY итераций (~0.4с)
+            if wheel_iteration % JS_SCAN_EVERY != 0:
+                continue
 
             state = await controller_call("state")
             current_scroll_y = max(0, int(state.get("currentScrollY", state.get("scrollY", 0))))
@@ -5963,57 +5932,57 @@ async def run_scroll_only_down_pass(
             body_scroll_height = max(viewport_height, int(state.get("bodyScrollHeight", document_height)))
             finished = bool(state.get("finished", False))
             paused_for_focus = bool(state.get("pausedForFocus", False))
-            paused_for_hydration = bool(state.get("pausedForHydration", False))
             reason = str(state.get("reason", "")).strip() or "running"
             raw_focus_target = state.get("focusTarget")
             focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
-            is_loading = bool(state.get("isLoading", False))
             virtual_progress = int(state.get("virtualScrollProgress", 0))
             stagnant_dom_rounds = int(state.get("stagnantDomRounds", 0))
             no_content_since = int(state.get("noContentSinceScrollY", 0))
             dist_since_content = virtual_progress - no_content_since
 
-            phase = "finished" if finished else "focus" if paused_for_focus else "hydration" if paused_for_hydration else "scrolling"
-            if phase != last_phase or last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) >= 500:
+            # Детектор застоя по реальной позиции скролла
+            if current_scroll_y <= prev_scroll_y + 5:
+                stall_counter += 1
+            else:
+                stall_counter = 0
+                prev_scroll_y = current_scroll_y
+
+            phase = "finished" if finished else "focus" if paused_for_focus else "scrolling"
+            if phase != last_phase or last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) >= 300:
                 logger.info(
-                    f"[Scroll-only] phase={phase} | scrollY={current_scroll_y} | virtual={virtual_progress}/{MAX_VIRTUAL_DISTANCE} "
-                    f"| Пробег: {virtual_progress}px | CTA последний раз на {no_content_since}px (дельта {dist_since_content}px) "
-                    f"| domStagnant={stagnant_dom_rounds} | bodyHeight={body_scroll_height} | reason={reason}"
+                    f"[Wheel] phase={phase} | scrollY={current_scroll_y} | virtual={virtual_progress}/{MAX_VIRTUAL_DISTANCE} "
+                    f"| stall={stall_counter} | domStagnant={stagnant_dom_rounds} "
+                    f"| bodyHeight={body_scroll_height} | elapsed={_elapsed:.1f}s | reason={reason}"
                 )
                 last_phase = phase
                 last_logged_scroll_y = current_scroll_y
 
-            if finished:
+            # Завершение — но не в период иммунитета
+            if finished and not is_immune:
                 logger.info("[INFO] Scroll-only: JS сообщил finished=true, завершаем проход.")
                 reached_bottom = True
                 break
 
-            if virtual_progress >= MAX_VIRTUAL_DISTANCE:
+            if virtual_progress >= MAX_VIRTUAL_DISTANCE and not is_immune:
                 logger.info(
-                    f"[Scroll-only] virtualScrollProgress={virtual_progress} >= {MAX_VIRTUAL_DISTANCE}px "
-                    "— виртуальный конец страницы, завершаем проход."
+                    f"[Scroll-only] virtual={virtual_progress} >= {MAX_VIRTUAL_DISTANCE} — конец, завершаем."
                 )
                 reached_bottom = True
                 break
 
-            _elapsed_since_start = time.monotonic() - loop_start_time
-            if stagnant_dom_rounds >= 10 and _elapsed_since_start >= START_IMMUNITY_SEC:
+            # Застой: 25 опросов без движения (×10 итераций × 0.04с = ~10с)
+            if stall_counter >= 25 and not is_immune:
                 logger.info(
-                    f"[Scroll-only] DOM не менялся {stagnant_dom_rounds} сенсорных тиков (~{stagnant_dom_rounds}с) "
-                    "— страница не реагирует, завершаем."
+                    f"[Wheel] scrollY не менялся {stall_counter} раундов, завершаем."
                 )
                 reached_bottom = True
                 break
-            elif stagnant_dom_rounds >= 10:
-                logger.info(
-                    f"[Scroll-only] DOM stagnant={stagnant_dom_rounds} но иммунитет старта ({_elapsed_since_start:.1f}s < {START_IMMUNITY_SEC}s), ждём."
-                )
 
+            # CTA найден — пауза + hover
             if paused_for_focus:
                 if not focus_target:
-                    logger.warning("[WARN] Scroll-only: JS поставил scroll на паузу без focusTarget, продолжаем.")
+                    logger.warning("[WARN] JS пауза без focusTarget, продолжаем.")
                     await controller_call("resume", {})
-                    await asyncio.sleep(0.1)
                     continue
 
                 focus_x = clamp(float(focus_target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
@@ -6024,10 +5993,10 @@ async def run_scroll_only_down_pass(
                 focus_heading = str(focus_target.get("headingText", "")).strip()
                 if focus_heading:
                     logger.info(
-                        f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}' в секции '{focus_heading[:36]}', выполняем hover."
+                        f"🎯 CTA '{focus_text[:30]}' в секции '{focus_heading[:36]}', hover."
                     )
                 else:
-                    logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
+                    logger.info(f"🎯 CTA '{focus_text[:30]}', hover.")
                 try:
                     await page.mouse.move(focus_x, focus_y, steps=25)
                     cursor_pos = (focus_x, focus_y)
@@ -6038,7 +6007,7 @@ async def run_scroll_only_down_pass(
                     else:
                         raise
 
-                # Safe-zone reset before resuming scroll
+                # Safe-zone reset перед возобновлением
                 try:
                     await page.mouse.move(50, 50, steps=5)
                 except Exception:
@@ -6051,16 +6020,10 @@ async def run_scroll_only_down_pass(
                         "sectionKey": str(focus_target.get("sectionKey", "")).strip(),
                     },
                 )
-                logger.info("[INFO] Scroll-only: JS-скролл возобновлен после hover.")
-                await asyncio.sleep(0.1)
+                logger.info("[INFO] Wheel: скролл возобновлен после hover.")
                 continue
 
-            if is_loading:
-                logger.info("[Scroll-only] isLoading=true — preloader active, ожидаем...")
-                await asyncio.sleep(0.5)
-                continue
-
-            await asyncio.sleep(poll_interval_s)
+            # Никаких пауз.  Продолжаем крутить.
     finally:
         if controller_started:
             try:
