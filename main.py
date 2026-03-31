@@ -5009,9 +5009,9 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
     const controllerKey = '__vpvoaeHunterSmoothScrollController';
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.70;
-    const focusTopMax = vh * 1.00;
-    const focusCenterY = vh * 0.85;
+    const focusTopMin = vh * 0.30;
+    const focusTopMax = vh * 0.90;
+    const focusCenterY = vh * 0.60;
     const CTA_WORDS = [
         'invest', 'get started', 'start free', 'start now', 'free trial', 'trial',
         'book a demo', 'request demo', 'schedule demo', 'contact sales',
@@ -5439,6 +5439,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             stagnantDomRounds: 0,
             lastDomHash: -1,
             virtualScrollProgress: 0,
+            lastVirtualProgress: 0,
+            lockedFrames: 0,
             lockedTarget: null,
             lockedElement: null,
             noContentSinceScrollY: 0,
@@ -5524,6 +5526,12 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.stagnantScrollRounds = 0;
             } else {
                 state.stagnantScrollRounds += 1;
+            }
+
+            // Also treat virtual-scroll advancement as real progress (for custom-container sites)
+            if (state.virtualScrollProgress > state.lastVirtualProgress + 30) {
+                state.lastVirtualProgress = state.virtualScrollProgress;
+                state.lastProgressAt = timestamp;
             }
 
             // Content stall: if no CTA/h1-h2 in last 3000px of virtual scroll, finish early
@@ -5622,23 +5630,31 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 
             // Target locking: if we have a locked CTA, centre it before pausing
             if (state.lockedTarget && state.lockedElement instanceof HTMLElement) {
+                state.lockedFrames = (state.lockedFrames || 0) + 1;
                 const lockedRect = state.lockedElement.getBoundingClientRect();
-                // Centering criterion: button top edge lands in 45%–55% band of viewport
+                // Centering criterion: button top edge lands in 38%–65% band of viewport
                 const topRatio = lockedRect.top / vh;
                 if (
                     lockedRect.width > 0 && lockedRect.height > 0 &&
-                    topRatio >= 0.45 && topRatio <= 0.55
+                    topRatio >= 0.38 && topRatio <= 0.65
                 ) {
                     // Element is centred — trigger focus pause
                     state.focusTarget = state.lockedTarget;
                     state.focusElement = state.lockedElement;
                     state.lockedTarget = null;
                     state.lockedElement = null;
+                    state.lockedFrames = 0;
                     state.pausedForFocus = true;
                     state.running = false;
                     state.reason = 'focus';
                     clearFrame();
                     return;
+                }
+                // Give up centering if element hasn't moved into band within ~120 frames (~2s)
+                if (state.lockedFrames > 120) {
+                    state.lockedTarget = null;
+                    state.lockedElement = null;
+                    state.lockedFrames = 0;
                 }
                 // Not yet centred: keep scrolling to pull element into center
             }
@@ -5704,8 +5720,9 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.stagnantScrollRounds = 0;
                 state.stagnantDomRounds = 0;
                 state.lastDomHash = getDomHash();
+                state.lockedFrames = 0;
                 state.wheelFrameCounter = 0;
-                state.stallTimeoutMs = Math.max(2200, Math.round(Number(config && config.stallTimeoutMs) || 5000));
+                state.stallTimeoutMs = Math.max(5000, Math.round(Number(config && config.stallTimeoutMs) || 10000));
                 state.nextHydrationPauseAt = getScrollY() + state.hydrationDistancePx;
                 schedule();
                 return snapshot();
