@@ -1246,13 +1246,11 @@ async def wait_for_deep_page_ready(
 
 
 async def perform_prerender_scroll(page: Any) -> None:
-    """Прогревает базовые стили/шрифты колёсом мыши, затем возвращает к началу."""
-    logger.info("🔄 Pre-render warmup: wheel(5000) → sleep 2s → scrollTo(0,0)")
+    """Мягкий толчок для инициализации нативных scroll-скриптов без прыжка страницы."""
+    logger.info("🔄 Pre-render soft init: wheel(150) → sleep 1.5s")
     try:
-        await page.mouse.wheel(0, 5000)
-        await asyncio.sleep(2)
-        await page.evaluate("""() => window.scrollTo(0, 0)""")
-        await page.wait_for_timeout(300)
+        await page.mouse.wheel(0, 150)
+        await asyncio.sleep(1.5)
     except Exception as exc:
         logger.warning(f"⚠️ Pre-render scroll: {exc}")
 
@@ -5011,15 +5009,16 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
     const controllerKey = '__vpvoaeHunterSmoothScrollController';
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.40;
-    const focusTopMax = vh * 0.95;
-    const focusCenterY = vh * 0.70;
+    const focusTopMin = vh * 0.70;
+    const focusTopMax = vh * 1.00;
+    const focusCenterY = vh * 0.85;
     const CTA_WORDS = [
         'invest', 'get started', 'start free', 'start now', 'free trial', 'trial',
         'book a demo', 'request demo', 'schedule demo', 'contact sales',
         'learn more', 'discover', 'explore', 'pricing', 'book', 'schedule',
         'contact', 'talk', 'demo', 'quote', 'request', 'join', 'subscribe',
         'sign up', 'apply', 'buy', 'shop', 'download', 'try', 'order',
+        'view', 'projects', 'services', 'send', 'money', 'our work',
         'начать', 'попробовать', 'купить', 'скачать', 'подписаться',
         'записаться', 'связаться', 'заказать', 'бронировать',
     ];
@@ -5313,6 +5312,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
         let bestCta = null;
         for (const el of ctaPool) {
             if (!(el instanceof HTMLElement)) continue;
+            if (el.dataset.seen === 'true') continue;  // already processed in queue
             const style = window.getComputedStyle(el);
             if (style.position === 'fixed' || style.position === 'sticky') continue;
             if (hasFixedOrStickyAncestor(el.parentElement)) continue;
@@ -5510,27 +5510,6 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             return false;
         }
 
-        // Render Guard: returns true when the central viewport band has no visible text/image
-        function isCenterZoneEmpty() {
-            try {
-                const checkY = vh * 0.45;
-                const els = document.elementsFromPoint(vw / 2, checkY);
-                for (const el of els) {
-                    if (el === document.documentElement || el === document.body) continue;
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 20 || r.height < 10) continue;
-                    const s = window.getComputedStyle(el);
-                    if (s.display === 'none' || s.visibility === 'hidden') continue;
-                    const opacity = parseFloat(s.opacity || '1');
-                    if (opacity < 0.15) continue;
-                    const hasText = (el.textContent || '').trim().length > 2;
-                    const hasImg = el.tagName === 'IMG' || !!(el.querySelector && el.querySelector('img'));
-                    if (hasText || hasImg) return false;
-                }
-            } catch(e) {}
-            return true;
-        }
-
         function scanForLife(timestamp) {
             const currentHeight = getDocumentHeight();
             const currentScrollY = getScrollY();
@@ -5568,6 +5547,10 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             );
             if (candidate && candidate.payload) {
                 state.noContentSinceScrollY = state.virtualScrollProgress;
+                // Queue: mark element as seen immediately so it won't be picked again
+                if (candidate.element instanceof HTMLElement) {
+                    candidate.element.dataset.seen = 'true';
+                }
                 // Don't pause immediately — lock and let tick() centre the element first
                 state.lockedTarget = candidate.payload;
                 state.lockedElement = candidate.element || null;
@@ -5616,16 +5599,12 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
 
-            // Render Guard: slow to 1px/frame when center zone is blank (lazy-load not yet rendered)
-            const _renderEmpty = isCenterZoneEmpty();
-            const _adaptiveStep = _renderEmpty ? 1 : state.basePxPerFrame;
-
-            // Virtual odometer: advance virtualScrollProgress and kick GSAP/Lenis/Locomotive every frame
-            state.virtualScrollProgress += _renderEmpty ? 1 : 7;
-            // Hybrid drive: scrollBy for normal sites + WheelEvent for GSAP/Lenis pinned sites
+            // Virtual odometer: advance virtualScrollProgress every frame
+            state.virtualScrollProgress += 6;
+            // Stable scroll: constant 6px/frame via scrollBy + WheelEvents for GSAP/Lenis
             try {
-                const _step = _adaptiveStep;
-                window.scrollBy(0, _step);
+                window.scrollBy(0, 6);
+                const _step = state.basePxPerFrame;
                 const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
                 window.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.dispatchEvent(new WheelEvent('wheel', _weOpts));
