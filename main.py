@@ -5257,18 +5257,72 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
         } catch (e) {}
     }
 
+    // Detect the real scroll container (for Wise, Revolut, etc. that use overflow:hidden on body)
+    let _cachedScrollContainer = null;
+    let _containerCheckAt = 0;
+    function findScrollContainer() {
+        const now = Date.now();
+        if (_cachedScrollContainer && (now - _containerCheckAt) < 3000) {
+            // Verify it's still valid
+            if (_cachedScrollContainer.scrollHeight > _cachedScrollContainer.clientHeight + 20) {
+                return _cachedScrollContainer;
+            }
+            _cachedScrollContainer = null;
+        }
+        _containerCheckAt = now;
+        // Check common SPA wrappers first
+        for (const sel of ['#__next', '#root', '#app', 'main', '[data-scroll-container]', '.page-wrapper', '.main-wrapper', '.site-wrapper']) {
+            try {
+                const el = document.querySelector(sel);
+                if (el && el.scrollHeight > el.clientHeight + 20) {
+                    const s = window.getComputedStyle(el);
+                    const ov = s.overflowY || '';
+                    if (ov === 'auto' || ov === 'scroll') {
+                        _cachedScrollContainer = el;
+                        return el;
+                    }
+                }
+            } catch(e) {}
+        }
+        // Walk top-level children of body — find the largest scrollable one
+        try {
+            let best = null;
+            let bestHeight = 0;
+            for (const el of document.body.children) {
+                if (!(el instanceof HTMLElement)) continue;
+                if (el.scrollHeight <= el.clientHeight + 20) continue;
+                const s = window.getComputedStyle(el);
+                const ov = s.overflowY || '';
+                if (ov !== 'auto' && ov !== 'scroll') continue;
+                if (el.scrollHeight > bestHeight) {
+                    bestHeight = el.scrollHeight;
+                    best = el;
+                }
+            }
+            if (best) {
+                _cachedScrollContainer = best;
+                return best;
+            }
+        } catch(e) {}
+        return null;
+    }
+
     function getScrollY() {
+        const container = findScrollContainer();
         return Math.round(Math.max(
             Number(window.scrollY || window.pageYOffset || 0),
             Number(document.documentElement?.scrollTop || 0),
             Number(document.body?.scrollTop || 0),
+            container ? Number(container.scrollTop || 0) : 0,
         ));
     }
 
     function getDocumentHeight() {
+        const container = findScrollContainer();
         return Math.round(Math.max(
             document.body?.scrollHeight || 0,
             document.documentElement?.scrollHeight || 0,
+            container ? (container.scrollHeight || 0) : 0,
             getScrollY() + vh,
         ));
     }
@@ -5612,22 +5666,23 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
 
             // Virtual odometer: advance virtualScrollProgress every frame
             state.virtualScrollProgress += 6;
-            // Universal scroll: try window, html, body, and common SPA wrappers
+            // Universal scroll: try window, html, body, detected container, and SPA wrappers
             try {
                 const _step = 6;
                 window.scrollBy(0, _step);
                 document.documentElement.scrollTop += _step;
                 document.body.scrollTop += _step;
-                for (const sel of ['#__next', '#root', '#app', 'main', '[data-scroll-container]']) {
-                    try {
-                        const _el = document.querySelector(sel);
-                        if (_el && _el.scrollHeight > _el.clientHeight + 10) _el.scrollTop += _step;
-                    } catch(e) {}
+                const _scrollContainer = findScrollContainer();
+                if (_scrollContainer) {
+                    _scrollContainer.scrollTop += _step;
                 }
                 const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
                 window.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.dispatchEvent(new WheelEvent('wheel', _weOpts));
                 document.documentElement.dispatchEvent(new WheelEvent('wheel', _weOpts));
+                if (_scrollContainer) {
+                    _scrollContainer.dispatchEvent(new WheelEvent('wheel', _weOpts));
+                }
             } catch(e) {}
 
             // Target locking: if we have a locked CTA, centre it before pausing
