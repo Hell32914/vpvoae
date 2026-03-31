@@ -7854,6 +7854,49 @@ async def main():
                 except Exception:
                     pass
 
+            # ── Фиктивный клик для разблокировки медиа-потоков ──
+            # Даёт браузеру сигнал "user gesture", разблокирует autoplay
+            try:
+                await page.mouse.click(10, 10)
+                logger.info("🖱️ User gesture: фиктивный клик для разблокировки autoplay")
+            except Exception:
+                pass
+
+            # ── Принудительный запуск всех видео ──
+            try:
+                _video_count = await page.evaluate("""
+                    async () => {
+                        const videos = Array.from(document.querySelectorAll('video'));
+                        let started = 0;
+                        await Promise.all(videos.map(async (v) => {
+                            v.muted = true;
+                            v.setAttribute('playsinline', '');
+                            v.setAttribute('autoplay', '');
+                            if (v.preload !== 'auto') v.preload = 'auto';
+                            // Форсируем загрузку source
+                            for (const s of v.querySelectorAll('source')) {
+                                const ds = s.getAttribute('data-src');
+                                if (ds && !s.src) s.src = ds;
+                            }
+                            const ds = v.getAttribute('data-src');
+                            if (ds && !v.src) v.src = ds;
+                            try { v.load(); } catch {}
+                            try {
+                                await v.play();
+                                started++;
+                            } catch (e) {}
+                        }));
+                        return started;
+                    }
+                """)
+                if _video_count > 0:
+                    logger.info(f"▶️ Video autoplay: запущено {_video_count} видео")
+            except Exception as _vp_e:
+                logger.warning(f"⚠️ Video autoplay ошибка: {_vp_e}")
+
+            # Буфер ожидания — даём видео время наполнить буфер
+            await asyncio.sleep(3)
+
             # ── Запуск FFmpeg прямо из Python ────────────────────────────────────
             # Deep Hydration: ждём появления контента перед записью
             try:
