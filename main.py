@@ -3358,7 +3358,7 @@ async def run_strict_top_to_bottom_pass(
                 if (video.muted || video.hasAttribute('muted')) {
                     video.muted = true;
                     video.autoplay = true;
-                    try { video.play(); } catch {}
+                    try { video.play().catch(() => {}); } catch {}
                     count++;
                 }
             }
@@ -6132,7 +6132,7 @@ async def run_scroll_only_down_pass(
                             if (v.preload !== 'auto') v.preload = 'auto';
                             if ((v.muted || v.hasAttribute('muted')) && v.paused) {
                                 v.muted = true;
-                                try { v.play(); } catch {}
+                                try { v.play().catch(() => {}); } catch {}
                             }
                         }
                     }""")
@@ -7823,7 +7823,7 @@ async def main():
                         if (v.muted || v.hasAttribute('muted')) {
                             v.muted = true;
                             v.autoplay = true;
-                            try { v.play(); } catch {}
+                            try { v.play().catch(() => {}); } catch {}
                             c++;
                         }
                     }
@@ -7865,13 +7865,12 @@ async def main():
             # ── Принудительный запуск всех видео ──
             try:
                 _video_count = await page.evaluate("""
-                    async () => {
+                    () => {
                         const videos = Array.from(document.querySelectorAll('video'));
                         let started = 0;
-                        await Promise.all(videos.map(async (v) => {
+                        for (const v of videos) {
                             v.muted = true;
                             v.setAttribute('playsinline', '');
-                            v.setAttribute('autoplay', '');
                             if (v.preload !== 'auto') v.preload = 'auto';
                             // Форсируем загрузку source
                             for (const s of v.querySelectorAll('source')) {
@@ -7880,12 +7879,14 @@ async def main():
                             }
                             const ds = v.getAttribute('data-src');
                             if (ds && !v.src) v.src = ds;
-                            try { v.load(); } catch {}
-                            try {
-                                await v.play();
-                                started++;
-                            } catch (e) {}
-                        }));
+                            // Только если есть реальный src — пробуем запустить
+                            const hasSrc = !!(v.src || v.querySelector('source[src]'));
+                            if (hasSrc) {
+                                try { v.load(); } catch {}
+                                // play() возвращает Promise — не await-им, чтобы не зависнуть
+                                try { v.play().catch(() => {}); started++; } catch {}
+                            }
+                        }
                         return started;
                     }
                 """)
