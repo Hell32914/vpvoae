@@ -5444,6 +5444,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             lockedTarget: null,
             lockedElement: null,
             noContentSinceScrollY: 0,
+            atBottomSince: 0,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
@@ -5519,6 +5520,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             if (currentHeight !== state.lastScrollHeight) {
                 state.lastScrollHeight = currentHeight;
                 state.lastLifeAt = timestamp;
+                state.atBottomSince = 0;  // page grew — reset bottom grace timer
             }
             if (currentScrollY >= state.lastObservedScrollY + 40) {
                 state.lastObservedScrollY = currentScrollY;
@@ -5668,9 +5670,13 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 window.scrollTo(0, nextScrollY);
 
                 if (nextScrollY >= (maxScrollY - 2)) {
-                    window.scrollTo(0, maxScrollY);
-                    finish('bottom');
-                    return;
+                    // Reached apparent bottom — start grace timer for lazy-load
+                    if (!state.atBottomSince) state.atBottomSince = timestamp;
+                    if (timestamp - state.atBottomSince >= 3000) {
+                        window.scrollTo(0, maxScrollY);
+                        finish('bottom');
+                        return;
+                    }
                 }
 
                 if (nextScrollY >= state.nextHydrationPauseAt) {
@@ -5679,8 +5685,12 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                     state.nextHydrationPauseAt = nextScrollY + state.hydrationDistancePx;
                 }
             } else if (maxScrollY > 2 && currentScrollY >= maxScrollY - 2) {
-                finish('bottom');
-                return;
+                // At bottom — start grace timer for lazy-load
+                if (!state.atBottomSince) state.atBottomSince = timestamp;
+                if (timestamp - state.atBottomSince >= 3000) {
+                    finish('bottom');
+                    return;
+                }
             }
             // else: maxScrollY <= 2 (pinned/GSAP) — WheelEvents drive animation;
             // stagnation detector in scanForLife() decides when to finish.
