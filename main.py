@@ -1246,28 +1246,13 @@ async def wait_for_deep_page_ready(
 
 
 async def perform_prerender_scroll(page: Any) -> None:
-    """Прогревает lazy-load секции ступенчатым пролётом до старта записи."""
-    logger.info("🔄 Pre-render scroll: 5 ступеней по 2000px перед записью")
+    """Прогревает базовые стили/шрифты колёсом мыши, затем возвращает к началу."""
+    logger.info("🔄 Pre-render warmup: wheel(5000) → sleep 2s → scrollTo(0,0)")
     try:
-        for _ in range(5):
-            await page.evaluate(
-                """(delta) => {
-                    const docHeight = Math.max(
-                        document.body?.scrollHeight || 0,
-                        document.documentElement?.scrollHeight || 0,
-                        window.innerHeight || 0,
-                    );
-                    const maxTop = Math.max(0, docHeight - (window.innerHeight || 0));
-                    const currentTop = Math.max(0, window.scrollY || window.pageYOffset || 0);
-                    const nextTop = Math.min(maxTop, currentTop + delta);
-                    window.scrollTo(0, nextTop);
-                    return nextTop;
-                }""",
-                2000,
-            )
-            await page.wait_for_timeout(500)
+        await page.mouse.wheel(0, 5000)
+        await asyncio.sleep(2)
         await page.evaluate("""() => window.scrollTo(0, 0)""")
-        await page.wait_for_timeout(150)
+        await page.wait_for_timeout(300)
     except Exception as exc:
         logger.warning(f"⚠️ Pre-render scroll: {exc}")
 
@@ -5026,8 +5011,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
     const controllerKey = '__vpvoaeHunterSmoothScrollController';
     const vh = window.innerHeight || document.documentElement?.clientHeight || 0;
     const vw = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const focusTopMin = vh * 0.50;
-    const focusTopMax = vh * 0.90;
+    const focusTopMin = vh * 0.40;
+    const focusTopMax = vh * 0.95;
     const focusCenterY = vh * 0.70;
     const CTA_WORDS = [
         'invest', 'get started', 'start free', 'start now', 'free trial', 'trial',
@@ -5525,6 +5510,27 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             return false;
         }
 
+        // Render Guard: returns true when the central viewport band has no visible text/image
+        function isCenterZoneEmpty() {
+            try {
+                const checkY = vh * 0.45;
+                const els = document.elementsFromPoint(vw / 2, checkY);
+                for (const el of els) {
+                    if (el === document.documentElement || el === document.body) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 20 || r.height < 10) continue;
+                    const s = window.getComputedStyle(el);
+                    if (s.display === 'none' || s.visibility === 'hidden') continue;
+                    const opacity = parseFloat(s.opacity || '1');
+                    if (opacity < 0.15) continue;
+                    const hasText = (el.textContent || '').trim().length > 2;
+                    const hasImg = el.tagName === 'IMG' || !!(el.querySelector && el.querySelector('img'));
+                    if (hasText || hasImg) return false;
+                }
+            } catch(e) {}
+            return true;
+        }
+
         function scanForLife(timestamp) {
             const currentHeight = getDocumentHeight();
             const currentScrollY = getScrollY();
@@ -5610,11 +5616,15 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
 
+            // Render Guard: slow to 1px/frame when center zone is blank (lazy-load not yet rendered)
+            const _renderEmpty = isCenterZoneEmpty();
+            const _adaptiveStep = _renderEmpty ? 1 : state.basePxPerFrame;
+
             // Virtual odometer: advance virtualScrollProgress and kick GSAP/Lenis/Locomotive every frame
-            state.virtualScrollProgress += 7;
+            state.virtualScrollProgress += _renderEmpty ? 1 : 7;
             // Hybrid drive: scrollBy for normal sites + WheelEvent for GSAP/Lenis pinned sites
             try {
-                const _step = state.basePxPerFrame;
+                const _step = _adaptiveStep;
                 window.scrollBy(0, _step);
                 const _weOpts = { deltaY: _step, bubbles: true, cancelable: true };
                 window.dispatchEvent(new WheelEvent('wheel', _weOpts));
@@ -5625,11 +5635,11 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             // Target locking: if we have a locked CTA, centre it before pausing
             if (state.lockedTarget && state.lockedElement instanceof HTMLElement) {
                 const lockedRect = state.lockedElement.getBoundingClientRect();
-                const lockedCenterY = lockedRect.top + lockedRect.height / 2;
-                const targetCenterY = vh / 2;
+                // Centering criterion: button top edge lands in 45%–55% band of viewport
+                const topRatio = lockedRect.top / vh;
                 if (
                     lockedRect.width > 0 && lockedRect.height > 0 &&
-                    lockedCenterY <= targetCenterY + 20
+                    topRatio >= 0.45 && topRatio <= 0.55
                 ) {
                     // Element is centred — trigger focus pause
                     state.focusTarget = state.lockedTarget;
@@ -5942,14 +5952,20 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=15)
+                    await page.mouse.move(focus_x, focus_y, steps=25)
                     cursor_pos = (focus_x, focus_y)
-                    await page.wait_for_timeout(1000)
+                    await asyncio.sleep(1.2)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
                     else:
                         raise
+
+                # Safe-zone reset before resuming scroll
+                try:
+                    await page.mouse.move(50, 50, steps=5)
+                except Exception:
+                    pass
 
                 await controller_call(
                     "resume",
