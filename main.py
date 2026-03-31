@@ -5386,20 +5386,25 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             : Date.now();
     }
 
-    function findMainScrollContainer() {
-        // Returns the largest visible child container (for GSAP/Lenis/transform-based scroll sites
-        // where native window.scrollY stays near 0 because body/html is overflow:hidden).
-        let best = null;
-        let bestH = 0;
-        const pool = Array.from(document.body.children)
-            .concat(Array.from(document.body.children).flatMap(c => Array.from(c.children)));
-        for (const el of pool) {
-            if (!(el instanceof HTMLElement)) continue;
-            const h = Math.max(el.scrollHeight || 0, el.offsetHeight || 0);
-            if (h < vh * 1.5) continue;
-            if (h > bestH) { bestH = h; best = el; }
-        }
-        return best;
+    function getDomHash() {
+        try { return document.querySelectorAll('*').length; } catch(e) { return -1; }
+    }
+
+    function isPageLoading() {
+        try {
+            const bodyStyle = window.getComputedStyle(document.body);
+            if (parseFloat(bodyStyle.opacity || '1') < 0.05) return true;
+            for (const el of Array.from(document.body.children)) {
+                if (!(el instanceof HTMLElement)) continue;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden') continue;
+                if (s.position !== 'fixed' && s.position !== 'absolute') continue;
+                if (parseFloat(s.opacity || '1') < 0.5) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width >= vw * 0.9 && r.height >= vh * 0.9) return true;
+            }
+        } catch(e) {}
+        return false;
     }
 
     function createController() {
@@ -5414,8 +5419,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             seenSectionKeys: new Set(),
             rafId: 0,
             pauseUntil: 0,
-            basePxPerFrame: 6.0,
-            slowPxPerFrame: 4.4,
+            basePxPerFrame: 7.0,
+            slowPxPerFrame: 5.2,
             hydrationDistancePx: 2800,
             hydrationPauseMs: 325,
             nextHydrationPauseAt: 0,
@@ -5423,7 +5428,10 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             slowdownDistancePx: 0,
             slowUntilScrollY: 0,
             lastFocusScrollY: -100000,
-            noProgressFrames: 0,
+            stagnantScrollRounds: 0,
+            stagnantDomRounds: 0,
+            lastDomHash: -1,
+            wheelFrameCounter: 0,
             lastSensorAt: 0,
             lastLifeAt: 0,
             lastProgressAt: 0,
@@ -5449,6 +5457,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 bodyScrollHeight,
                 reason: state.reason,
                 elapsedMs: Math.max(0, Math.round(nowMs() - state.startedAt)),
+                isLoading: isPageLoading(),
             };
         }
 
@@ -5488,6 +5497,17 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             if (currentScrollY >= state.lastObservedScrollY + 40) {
                 state.lastObservedScrollY = currentScrollY;
                 state.lastProgressAt = timestamp;
+                state.stagnantScrollRounds = 0;
+            } else {
+                state.stagnantScrollRounds += 1;
+            }
+
+            const currentDomHash = getDomHash();
+            if (currentDomHash === state.lastDomHash) {
+                state.stagnantDomRounds += 1;
+            } else {
+                state.stagnantDomRounds = 0;
+                state.lastDomHash = currentDomHash;
             }
 
             const candidate = findBestTarget(
@@ -5508,16 +5528,15 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 return;
             }
 
+            // Hybrid stagnation: pinned/GSAP sites have frozen scrollY + stable DOM
+            // Only declare bottom after 15s elapsed + 5 consecutive stagnant sensor rounds
+            const elapsed = timestamp - state.startedAt;
+            if (elapsed >= 15000 && state.stagnantScrollRounds >= 5 && state.stagnantDomRounds >= 5) {
+                finish('bottom');
+                return;
+            }
+
             if ((timestamp - Math.max(state.lastLifeAt, state.lastProgressAt)) >= state.stallTimeoutMs) {
-                // Before declaring idle, check if a container's bottom is in view
-                const container = findMainScrollContainer();
-                if (container) {
-                    const rect = container.getBoundingClientRect();
-                    if (rect.bottom <= window.innerHeight + 10) {
-                        finish('bottom');
-                        return;
-                    }
-                }
                 finish('idle');
             }
         }
@@ -5547,67 +5566,39 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
             const bodyScrollHeight = getDocumentHeight();
             const maxScrollY = Math.max(0, bodyScrollHeight - vh);
 
-            if (maxScrollY <= 2) {
-                // Native scroll exhausted — check for GSAP/Lenis transform container
-                const container = findMainScrollContainer();
-                if (container) {
-                    const rect = container.getBoundingClientRect();
-                    if (rect.bottom <= window.innerHeight + 10) {
-                        finish('bottom');
-                        return;
-                    }
-                    // Container still scrolling via transform — keep polling
-                    schedule();
+            // Force-wheel: kick GSAP/Lenis/Locomotive runners every 10 frames
+            state.wheelFrameCounter += 1;
+            if (state.wheelFrameCounter % 10 === 0) {
+                try {
+                    window.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true }));
+                } catch(e) {}
+            }
+
+            // Native scroll: advance when page supports it
+            if (maxScrollY > 2 && currentScrollY < maxScrollY - 2) {
+                const pxPerFrame = currentScrollY < state.slowUntilScrollY
+                    ? state.slowPxPerFrame
+                    : state.basePxPerFrame;
+                const nextScrollY = Math.min(maxScrollY, currentScrollY + pxPerFrame);
+                window.scrollTo(0, nextScrollY);
+
+                if (nextScrollY >= (maxScrollY - 2)) {
+                    window.scrollTo(0, maxScrollY);
+                    finish('bottom');
                     return;
                 }
-                finish('bottom');
-                return;
-            }
 
-            if (currentScrollY >= (maxScrollY - 2)) {
-                finish('bottom');
-                return;
-            }
-
-            const pxPerFrame = currentScrollY < state.slowUntilScrollY
-                ? state.slowPxPerFrame
-                : state.basePxPerFrame;
-            const nextScrollY = Math.min(maxScrollY, currentScrollY + pxPerFrame);
-            window.scrollTo(0, nextScrollY);
-
-            // Detect when window.scrollTo is overridden by GSAP/Lenis (page doesn't actually move)
-            const actualScrollY = getScrollY();
-            if (actualScrollY < currentScrollY + 1 && nextScrollY > currentScrollY + 1) {
-                state.noProgressFrames += 1;
-                if (state.noProgressFrames >= 30) {
-                    const container = findMainScrollContainer();
-                    if (container) {
-                        const rect = container.getBoundingClientRect();
-                        if (rect.bottom <= window.innerHeight + 10) {
-                            finish('bottom');
-                            return;
-                        }
-                    }
-                    if (state.noProgressFrames >= 60) {
-                        finish('bottom');
-                        return;
-                    }
+                if (nextScrollY >= state.nextHydrationPauseAt) {
+                    state.pauseUntil = timestamp + state.hydrationPauseMs;
+                    state.pausedForHydration = true;
+                    state.nextHydrationPauseAt = nextScrollY + state.hydrationDistancePx;
                 }
-            } else {
-                state.noProgressFrames = 0;
-            }
-
-            if (nextScrollY >= (maxScrollY - 2)) {
-                window.scrollTo(0, maxScrollY);
+            } else if (maxScrollY > 2 && currentScrollY >= maxScrollY - 2) {
                 finish('bottom');
                 return;
             }
-
-            if (nextScrollY >= state.nextHydrationPauseAt) {
-                state.pauseUntil = timestamp + state.hydrationPauseMs;
-                state.pausedForHydration = true;
-                state.nextHydrationPauseAt = nextScrollY + state.hydrationDistancePx;
-            }
+            // else: maxScrollY <= 2 (pinned/GSAP) — WheelEvents drive animation;
+            // stagnation detector in scanForLife() decides when to finish.
 
             schedule();
         }
@@ -5625,7 +5616,7 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.seenKeys = new Set();
                 state.seenSectionKeys = new Set();
                 state.reason = 'running';
-                state.basePxPerFrame = Math.max(4.8, Math.min(9.0, Number(config && config.pxPerFrame) || 6.0));
+                state.basePxPerFrame = Math.max(5.6, Math.min(9.5, Number(config && config.pxPerFrame) || 7.0));
                 const slowdownFactor = Math.max(0.45, Math.min(1.0, Number(config && config.slowdownFactor) || 0.74));
                 state.slowPxPerFrame = Math.max(1.1, Math.min(state.basePxPerFrame, state.basePxPerFrame * slowdownFactor));
                 state.hydrationDistancePx = Math.max(1200, Math.round(Number(config && config.hydrationDistancePx) || 2800));
@@ -5641,7 +5632,10 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.startedAt = timestamp;
                 state.lastScrollHeight = getDocumentHeight();
                 state.lastObservedScrollY = getScrollY();
-                state.noProgressFrames = 0;
+                state.stagnantScrollRounds = 0;
+                state.stagnantDomRounds = 0;
+                state.lastDomHash = getDomHash();
+                state.wheelFrameCounter = 0;
                 state.stallTimeoutMs = Math.max(2200, Math.round(Number(config && config.stallTimeoutMs) || 5000));
                 state.nextHydrationPauseAt = getScrollY() + state.hydrationDistancePx;
                 schedule();
@@ -5684,6 +5678,8 @@ _JS_HUNTER_SMOOTH_SCROLL_CONTROLLER = r"""
                 state.lastSensorAt = 0;
                 state.lastObservedScrollY = getScrollY();
                 state.lastFocusScrollY = state.lastObservedScrollY;
+                state.stagnantScrollRounds = 0;
+                state.stagnantDomRounds = 0;
                 if (state.slowdownDistancePx > 0 && state.slowPxPerFrame < state.basePxPerFrame) {
                     state.slowUntilScrollY = Math.max(
                         state.slowUntilScrollY,
@@ -5743,7 +5739,7 @@ async def run_scroll_only_down_pass(
     section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.74), 0.45, 1.0)
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 1), 4))
     base_speed_factor = clamp(scroll_speed_factor if math.isfinite(scroll_speed_factor) else 1.0, 0.80, 2.40)
-    px_per_frame = clamp(6.8 * base_speed_factor, 4.8, 9.0)
+    px_per_frame = clamp(7.0 * base_speed_factor, 5.6, 9.5)
     hydration_distance_px = max(1600, int(viewport_height * 2.4 * clamp(base_speed_factor, 0.9, 1.7)))
     hydration_pause_ms = max(130, min(int(320 / clamp(base_speed_factor, 0.9, 2.0)), 475))
     focus_min_gap_px = max(int(viewport_height * 0.90), int(viewport_height * (0.72 + 0.16 * section_slowdown_rounds)))
@@ -5815,6 +5811,7 @@ async def run_scroll_only_down_pass(
             reason = str(state.get("reason", "")).strip() or "running"
             raw_focus_target = state.get("focusTarget")
             focus_target = raw_focus_target if isinstance(raw_focus_target, dict) else None
+            is_loading = bool(state.get("isLoading", False))
 
             phase = "finished" if finished else "focus" if paused_for_focus else "hydration" if paused_for_hydration else "scrolling"
             if phase != last_phase or last_logged_scroll_y is None or abs(current_scroll_y - last_logged_scroll_y) >= 500:
@@ -5850,9 +5847,9 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 Scroll-only: сильный {focus_kind} '{focus_text[:30]}', выполняем hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=30)
+                    await page.mouse.move(focus_x, focus_y, steps=15)
                     cursor_pos = (focus_x, focus_y)
-                    await page.wait_for_timeout(1100)
+                    await page.wait_for_timeout(800)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
@@ -5868,6 +5865,11 @@ async def run_scroll_only_down_pass(
                 )
                 logger.info("[INFO] Scroll-only: JS-скролл возобновлен после hover.")
                 await asyncio.sleep(0.1)
+                continue
+
+            if is_loading:
+                logger.info("[Scroll-only] isLoading=true — preloader active, ожидаем...")
+                await asyncio.sleep(0.5)
                 continue
 
             await asyncio.sleep(poll_interval_s)
