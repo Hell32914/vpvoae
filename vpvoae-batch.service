@@ -1,0 +1,27 @@
+[Unit]
+Description=VPVoAe Batch Orchestrator (queue + parallel renderers)
+Documentation=https://example.invalid/vpvoae
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/vpvoae
+# Подгружаем переменные (WORKERS, RETRIES, IMAGE, OUTPUT_ROOT и т.п.)
+EnvironmentFile=-/srv/projects/vpvoae/.env.batch
+ExecStart=/usr/bin/env bash /srv/projects/vpvoae/run_batch.sh /srv/projects/vpvoae/urls.txt --resume
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=120s
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+# Изоляция (опционально — раскомментировать при необходимости)
+# User=vpvoae
+# Group=docker
+# NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
