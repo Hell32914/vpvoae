@@ -36,5 +36,4 @@ RUN mkdir -p /app/output
 # Делаем entrypoint.sh исполняемым
 RUN chmod +x /entrypoint.sh
 
-# Команда запуска переопределяется в docker-compose.yml через entrypoint.sh
-CMD ["python", "main.py"]
+ENTRYPOINT ["/entrypoint.sh"]
