@@ -7179,8 +7179,13 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
         screen_height -= 1
 
     framerate_raw = env_int('FFMPEG_FRAMERATE', 30)
-    framerate  = min(30, max(24, framerate_raw))
-    preset     = 'superfast'
+    framerate  = min(60, max(1, framerate_raw))
+    preset_raw = (os.getenv('FFMPEG_PRESET', 'superfast') or 'superfast').strip().lower()
+    allowed_presets = {
+        'ultrafast', 'superfast', 'veryfast', 'faster', 'fast',
+        'medium', 'slow', 'slower', 'veryslow', 'placebo'
+    }
+    preset = preset_raw if preset_raw in allowed_presets else 'superfast'
     crf        = env_int('FFMPEG_CRF', 24)
     threads_raw = env_int('FFMPEG_THREADS', 8)
     threads     = min(8, max(1, threads_raw))
@@ -7227,6 +7232,7 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
         '-crf', str(crf),
         '-threads', str(threads),
         '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
         '-y',
         video_file,
     ])
@@ -7258,19 +7264,21 @@ async def _stop_ffmpeg_process(ffmpeg_process: Optional[subprocess.Popen]) -> No
     except Exception as exc:
         logger.warning(f"⚠️ Не удалось отправить SIGINT в FFmpeg: {exc}")
 
-    await asyncio.sleep(3)
-
-    if ffmpeg_process.poll() is None:
-        try:
-            ffmpeg_process.kill()
-        except Exception as exc:
-            logger.warning(f"⚠️ Не удалось принудительно завершить FFmpeg: {exc}")
-
     try:
-        ffmpeg_process.wait(timeout=5)
-        logger.info("✅ FFmpeg остановлен")
+        await asyncio.to_thread(ffmpeg_process.wait, 30)
+        logger.info("✅ FFmpeg остановлен корректно")
     except Exception as exc:
-        logger.warning(f"⚠️ Ошибка финализации FFmpeg: {exc}")
+        logger.warning(f"⚠️ FFmpeg не завершился после SIGINT, принудительно останавливаем: {exc}")
+        if ffmpeg_process.poll() is None:
+            try:
+                ffmpeg_process.kill()
+            except Exception as kill_exc:
+                logger.warning(f"⚠️ Не удалось принудительно завершить FFmpeg: {kill_exc}")
+        try:
+            await asyncio.to_thread(ffmpeg_process.wait, 10)
+            logger.info("✅ FFmpeg остановлен принудительно")
+        except Exception as final_exc:
+            logger.warning(f"⚠️ Ошибка финализации FFmpeg: {final_exc}")
 
 
 async def _run_preload_mode() -> None:
