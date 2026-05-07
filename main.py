@@ -7189,7 +7189,7 @@ def _spawn_ffmpeg() -> Optional[subprocess.Popen]:
     crf        = env_int('FFMPEG_CRF', 24)
     threads_raw = env_int('FFMPEG_THREADS', 8)
     threads     = min(8, max(1, threads_raw))
-    nice_level = max(-20, min(-5, env_int('FFMPEG_NICE_LEVEL', -5)))
+    nice_level = max(-20, min(19, env_int('FFMPEG_NICE_LEVEL', 10)))
     _dm_raw    = os.getenv('FFMPEG_DRAW_MOUSE', '0')
     draw_mouse = _dm_raw if _dm_raw in ('0', '1') else '0'
     display    = os.getenv('DISPLAY', ':99')
