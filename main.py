@@ -6028,7 +6028,7 @@ async def run_scroll_only_down_pass(
 ) -> Tuple[bool, Tuple[float, float]]:
     """CTA-Analyzer mode: autonomous JS smooth scroll with Python CTA hovers."""
     reached_bottom = False
-    section_pause_ms = max(225, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 550), 2000))
+    section_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_PAUSE_MS", 250), 2000))
     section_slowdown_factor = clamp(env_float("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_FACTOR", 0.74), 0.45, 1.0)
     section_slowdown_rounds = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_SECTION_SLOWDOWN_ROUNDS", 1), 4))
     base_speed_factor = clamp(scroll_speed_factor if math.isfinite(scroll_speed_factor) else 1.0, 0.80, 2.40)
@@ -6037,7 +6037,7 @@ async def run_scroll_only_down_pass(
     hydration_pause_ms = max(130, min(int(320 / clamp(base_speed_factor, 0.9, 2.0)), 475))
     focus_min_gap_px = max(int(viewport_height * 0.90), int(viewport_height * (0.72 + 0.16 * section_slowdown_rounds)))
     slowdown_distance_px = int(viewport_height * 0.78 * section_slowdown_rounds)
-    hover_pause_ms = section_pause_ms
+    hover_pause_ms = max(0, min(env_int("SMART_CURSOR_SCROLL_ONLY_FOCUS_PAUSE_MS", max(80, section_pause_ms)), 1500))
     poll_interval_s = 0.22
     scroll_config = {
         "pxPerFrame": px_per_frame,
@@ -6091,10 +6091,10 @@ async def run_scroll_only_down_pass(
         loop_start_time = time.monotonic()
         START_IMMUNITY_SEC = 20.0  # запрещено прерывать цикл первые 20 секунд
         wheel_iteration = 0
-        WHEEL_DELTA = 18  # px — маленькая дельта каждый кадр видео = плавное движение
-        WHEEL_INTERVAL_MS = 33  # ~30 Hz — каждый кадр 30fps видео получает своё событие
-        JS_SCAN_EVERY = 30  # опрашивать JS-радар каждые ~1с (30 × 33ms)
-        LAZY_FORCE_EVERY = 150  # форсировать lazy-load каждые ~5с (150 × 33ms)
+        WHEEL_DELTA = max(8, min(16, env_int("SMART_CURSOR_SCROLL_ONLY_WHEEL_DELTA", 12)))
+        WHEEL_INTERVAL_MS = max(12, min(40, env_int("SMART_CURSOR_SCROLL_ONLY_WHEEL_INTERVAL_MS", 20)))
+        JS_SCAN_EVERY = max(10, min(60, env_int("SMART_CURSOR_SCROLL_ONLY_JS_SCAN_EVERY", 30)))
+        LAZY_FORCE_EVERY = max(60, min(300, env_int("SMART_CURSOR_SCROLL_ONLY_LAZY_FORCE_EVERY", 180)))
         prev_scroll_y = 0
         stall_counter = 0
 
@@ -6226,9 +6226,10 @@ async def run_scroll_only_down_pass(
                 else:
                     logger.info(f"🎯 CTA '{focus_text[:30]}', hover.")
                 try:
-                    await page.mouse.move(focus_x, focus_y, steps=20)
+                    await page.mouse.move(focus_x, focus_y, steps=12)
                     cursor_pos = (focus_x, focus_y)
-                    await asyncio.sleep(1.2)
+                    if hover_pause_ms > 0:
+                        await asyncio.sleep(hover_pause_ms / 1000.0)
                 except Exception as focus_exc:
                     if _is_nav_error(focus_exc):
                         await _recover_after_nav(page)
