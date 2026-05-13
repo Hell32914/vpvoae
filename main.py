@@ -6206,41 +6206,23 @@ async def run_scroll_only_down_pass(
                     reached_bottom = True
                     break
 
-            # CTA найден — пауза + hover
+            # В чистом scroll_only режиме не останавливаемся на CTA/секциях:
+            # сразу возобновляем контроллер, чтобы скролл оставался непрерывным.
             if paused_for_focus:
                 if not focus_target:
                     logger.warning("[WARN] JS пауза без focusTarget, продолжаем.")
                     await controller_call("resume", {})
                     continue
 
-                focus_x = clamp(float(focus_target.get("x", viewport_width * 0.5)), 2, viewport_width - 2)
-                focus_y = clamp(float(focus_target.get("y", viewport_height * 0.5)), 2, viewport_height - 2)
                 focus_text = str(focus_target.get("text", "")).strip()
-                focus_kind = str(focus_target.get("kind", "object")).strip() or "object"
                 focus_key = str(focus_target.get("dedupKey", "")).strip()
                 focus_heading = str(focus_target.get("headingText", "")).strip()
                 if focus_heading:
                     logger.info(
-                        f"🎯 CTA '{focus_text[:30]}' в секции '{focus_heading[:36]}', hover."
+                        f"🎯 CTA '{focus_text[:30]}' в секции '{focus_heading[:36]}', пропускаем без паузы."
                     )
                 else:
-                    logger.info(f"🎯 CTA '{focus_text[:30]}', hover.")
-                try:
-                    await page.mouse.move(focus_x, focus_y, steps=12)
-                    cursor_pos = (focus_x, focus_y)
-                    if hover_pause_ms > 0:
-                        await asyncio.sleep(hover_pause_ms / 1000.0)
-                except Exception as focus_exc:
-                    if _is_nav_error(focus_exc):
-                        await _recover_after_nav(page)
-                    else:
-                        raise
-
-                # Safe-zone reset перед возобновлением
-                try:
-                    await page.mouse.move(50, 50, steps=5)
-                except Exception:
-                    pass
+                    logger.info(f"🎯 CTA '{focus_text[:30]}', пропускаем без паузы.")
 
                 await controller_call(
                     "resume",
